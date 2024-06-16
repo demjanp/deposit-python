@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "setuptools_scm[toml]>=6.0"]
+requires = ["setuptools>=66.1.0", "wheel", "setuptools_scm[toml]>=6.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -20,15 +20,14 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Operating System :: Microsoft :: Windows :: Windows 10"
 ]
-dependencies = [
-]
+dynamic = ["version"]
+dependencies = []
 
 [project.urls]
 homepage = "https://github.com/demjanp/deposit-python"
 
 [tool.setuptools]
 packages = ["deposit"]
-package_dir = {"" = "src"}
 
 [tool.setuptools_scm]
 write_to = "src/deposit/_version.py"
