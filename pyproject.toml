@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deposit"
-description = "Python driver for Deposit - Graph database for scientific data collection."
+description = "Python driver for Deposit - Graph database for scientific data collection"
 readme = "README.md"
 requires-python = ">=3.10, <4"
 license = {text = "GNU General Public License v3 (GPLv3)"}
@@ -31,3 +31,7 @@ packages = ["deposit"]
 
 [tool.setuptools_scm]
 write_to = "src/deposit/_version.py"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

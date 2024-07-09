@@ -1,6 +1,8 @@
 # <img src="dep_cube.svg" width="32">Deposit
 Python driver for Deposit - Graph database for scientific data collection.
 
+This repository is part of the [Deposit Hub](https://github.com/demjanp/deposit-hub).
+
 Deposit was created on 29. 4. 2013
 
 <details>
