@@ -29,7 +29,7 @@ acceptance.
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
 Allowed states: Not started; Planning; Implementing; Verification incomplete;
-Review corrections; Finalized; Finalized;
+Review corrections; Verified and reviewed (finalization pending); Finalized;
 Interrupted (with exact reason and resumption criteria). A finalized stage needs
 all acceptance evidence, no blocking review findings, a tracker update and all
 required commits. Preserve completed cross-repository commits if later
