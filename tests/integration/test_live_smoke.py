@@ -43,7 +43,6 @@ def test_fresh_runtime_discovery_bootstrap_auth_session_and_logout():
             saved = DeploymentIdentity.from_dict(json.loads(identity_record_path.read_text(encoding="utf-8")))
             current = read_deployment_identity(
                 driver,
-                endpoint=uri,
                 database=saved.database_name,
                 actor_id=saved.actor_id,
                 namespace_id=saved.namespace_id,
@@ -53,6 +52,7 @@ def test_fresh_runtime_discovery_bootstrap_auth_session_and_logout():
 
         profile = client.bootstrap("stage1-admin", password)
         assert profile.get("username") == "stage1-admin"
+        os.environ["DEPOSIT_STAGE2_ADMIN_PASSWORD"] = password
         token = client.login("stage1-admin", password)
         session = client.get_session(token)
         user = session.get("user")
@@ -68,7 +68,7 @@ def test_fresh_runtime_discovery_bootstrap_auth_session_and_logout():
             {"namespace": namespace_name, "token": token},
         )
         identity = read_deployment_identity(
-            driver, endpoint=uri, database="neo4j", actor_id=user["id"], namespace_id=namespace_id
+            driver, database="neo4j", actor_id=user["id"], namespace_id=namespace_id
         )
         identity_record_path.parent.mkdir(parents=True, exist_ok=True)
         identity_record_path.write_text(json.dumps(identity.to_dict(), sort_keys=True), encoding="utf-8")

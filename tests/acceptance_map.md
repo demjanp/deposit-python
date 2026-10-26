@@ -1,4 +1,4 @@
-# Stage 1 acceptance assertion map
+# Stage 1-2 acceptance assertion map
 
 This map separates declaration parity, Python behavior, and live integration
 evidence. Server catalog parity or Java tests alone do not establish Python
@@ -32,3 +32,66 @@ connection but is not identity proof. A copied/restored store may retain these
 native IDs and therefore cannot be distinguished from the source by this
 mechanism; this limitation is accepted and no server deployment-generation
 field is added.
+
+## Stage 2 acceptance map
+
+Stage 2 uses the cumulative `-Stage 2 -Group core` selection. It rebuilds and
+installs the wheel and sdist, runs the Stage 1 foundation checks and the Stage 2
+core unit tests against both installed artifacts, then invokes the existing
+server-owned Python Core hook. The hook runs Stage 1 Smoke plus the Stage 2
+process-death, authority and cancellation scenarios; the existing lifecycle
+owner performs the selected Restart or KillRestart transition between Seed and
+Verify. Only retained successful run records establish these gates.
+
+| ID | Assertion and concrete test | Command/group | Current evidence / limit |
+|---|---|---|---|
+| 2A | Unit `test_two_stores_are_independent_and_create_read_is_portable`, `test_store_rejects_public_token_and_namespace_substitution`, plus Client driver-ownership tests; installed Core renames a Namespace and reads a previously created Class by UUID. | Full cumulative runs `20261026T161936350Z-c10e1603` (Restart) and `20261026T162540049Z-b609525c` (KillRestart) | Passed. Unit tests verify separate sessions, caller/internal driver ownership, rejection of token/Namespace arguments and actor/scope mismatch before action calls. Live rename verifies UUID binding. Live six-Namespace recovery also verifies that opening/recovering one Store leaves other Namespace journal/server states unchanged and checks result/entity Namespace UUIDs; it does not claim a caller-supplied live retarget request. |
+| 2B | Unit lost prepare/execute/status/release reply tests, including a successful server release with a dropped reply, exact saved-result recovery from committed status, and unexpected `NOT_FOUND` preservation without replay; installed child terminates at six action boundaries (before/after prepare, before/after execute, after durable result, after release). Seed asserts each unresolved local/server pre-state before transition; Verify checks states before recovery, one effect, distinct entity IDs and original portable results. | Both final cumulative runs above | Passed under both owner-managed Restart and KillRestart. Seed/Verify each run installed Core as `2 passed, 2 skipped` / `4 passed`. A successful lost release reply is reconciled against the durable committed record; unexpected `NOT_FOUND` retains the pending record and result without asserting release. Actual client process death and committed receipts crossing both server transitions are live. |
+| 2C | Unit `test_conflict_preserves_pending_inputs_and_refresh_allows_explicit_reapplication`, `test_missing_preparation_with_changed_revision_is_never_recreated`; Store reads preserve the observed baseline. Installed Core retrieves the original Class result after later Class deletion and Namespace deletion. | Both final cumulative runs; wheel/sdist Core tests and installed Core Verify | Passed for conflict preservation, no fresh key after changed preconditions, polling/read baseline behavior, explicit refresh/reapply, and retained result after deletion. |
+| 2D | Live authority test covers wrong/old credentials, password revocation and reauthentication, disabled user/restore, permission downgrade/restore, and a valid wrong actor against a pending handle. Unit `test_coordinator_identity_or_credential_mismatch_preserves_pending_without_action_calls` and `test_recovery_rejects_configured_database_mismatch_before_auth_or_action` exercise identity mismatches, including an accessible recorded database while the Client targets another. Unit deletion-receipt tests resolve a completed Namespace deletion without selecting that Namespace. | Both final cumulative runs; supporting server classes `PreparedActionReplayIT` and `AccountAuthorizationIT` passed | Passed for the listed cases. The live six-Namespace fixture verifies journal/server states and result/entity UUIDs remain bound during scoped recovery; the API has no Namespace target selector, so no live retarget request is claimed. Endpoint/database/native-ID replacement cases are unit call-spy evidence only. Completed Namespace deletion receipt is unit-covered. Prior-epoch committed/uncommitted server-scope checks pass live under both transitions; old token is invalidated. |
+| 2E | Unit journal corruption, duplicate/nonstandard JSON, unknown version, invalid UUID and retention preservation, lossless nested-map input, combined-root byte/unresolved quotas, concurrent cross-root writes, quota-index failures, outcome-write failure and process-lock owner-death tests; a separate-process lock holder blocks Namespace-deletion receipt status calls; live two-process race recovers the same committed handle; live close/cancel blocks the reply after independently confirming the server effect. | Both final cumulative runs | Passed. The Class race had one process recover the original result and one receive expected fail-fast lock contention; one Class existed. The deletion-receipt test used an independent OS process holding the same action lock and proved no status/resume/release calls by the loser. Live close/cancel joined both threads, preserved the original result and observed one effect. Unsupported/corrupt records remain intact across enumeration, accounting and write-triggered pruning. Non-string nested map keys fail before journal/server calls. |
+| 2F | Installed Core crosses real Python child termination with owner-managed Restart and KillRestart. Verify checks native identity, expired old token, prior-epoch committed receipt/result and uncommitted prepared action conflict with no new Namespace effect. | Both final cumulative runs; server action-recovery seed/transition/verifier also ran under both transitions | Passed for both transition modes. Each cumulative run recorded Seed `2 passed, 2 skipped`, Verify `4 passed`; independent live queries verified committed result, preserved prepared state on `REVISION_CONFLICT`, and zero effect for the uncommitted old-epoch action. Supporting server `ActionReplayRecoveryIT#seed` and `#verify` each passed under Restart and KillRestart. |
+
+The final installed-package gates ran through
+`stage2-tagged-core-wrapper.ps1 -Mode Full -Transition Restart|KillRestart`,
+which invokes `Invoke-PythonTests.ps1 -Stage 2 -Group core` with the verified
+clean-tag server bundle and owner-managed live transition. Both runs completed
+21 commands with zero failures or timeouts. Restart run
+`20261026T161936350Z-c10e1603` has result-record SHA-256
+`60EDD22ECF5534B5757DCFE93CC0F70ABC218677EB1B0A49196026038A884E3E`;
+KillRestart run `20261026T162540049Z-b609525c` has result-record SHA-256
+`C662CF857C4778E856783526C3BC6A114DAED36B0FAC267025A0C908FBB4373E`. Both
+wheel and sdist package checks passed (24 each); wheel manifest passed (3),
+storage passed (14), identity passed (6), and wheel/sdist core passed (68 each).
+Live Seed/Verify each reported `2 passed, 2 skipped` / `4 passed`. Final result
+records and nested logs are retained under
+`test_harness/tools/python-tests/stage2-server-evidence-20261026-01/Final-Restart-20261026T161936350Z-c10e1603/`
+and `Final-KillRestart-20261026T162540049Z-b609525c/`; the protected
+`python-stage2-recovery` runtime directory was excluded.
+
+Focused source-tree verification after corrections: quota/release regressions
+passed (12); strict journal/input selection passed (63, with one ACL subprocess
+case deselected); the added invalid-key matrix passed all four access paths.
+An earlier broad direct three-file pytest attempt had 41 passed and 8 ACL failures
+because the workspace ACL also exposed SYSTEM, Administrators and OWNER RIGHTS;
+the unchanged owner-only validator rejected these entries. The owner-managed
+wheel/sdist Stage 2 selections passed the corresponding official storage, package
+and core tests. Focused logs and that exploratory failure log are retained in
+`test_harness/tools/python-tests/stage2-server-evidence-20261026-01/python-focused-evidence/`.
+
+The selected supporting server tests also passed and are preserved under
+`test_harness/tools/python-tests/stage2-server-evidence-20261026-01/`:
+`PreparedActionReplayIT` (27 tests), `AccountAuthorizationIT` (15 tests), and
+`ActionReplayRecoveryIT#seed`/`#verify` (one test each under both Restart and
+KillRestart). The quota-index cleanup audit is in `quota-registry-cleanup.json`.
+
+All runs used the verified `2.0.0-dev.77` bundle at source tag
+`c1489c18b72c4a98d8bfb46a3926fe8195b3e2e6` (bundle SHA-256
+`75f78b4d3ef57d2b03c201906a6be2826dee4bc7f308e60d00ef5fff59163044`). The
+reversible 22-file overlay manifests are under
+`test_harness/tools/python-tests/stage2-tagged-overlay-audit/Full-20261026T161936350Z-c10e1603/`
+and `Full-20261026T162540049Z-b609525c/`. Each restoration audit verified
+the complete 56-file script baseline, exact HEAD/tag, clean Git status, absent
+overlay-only paths and unchanged bundle hash, with zero restoration failures.
+Both restoration report SHA-256 values are
+`9329C69D0CDA0E5618FE35793A3C29ED5C9D9152D92B32D313A427356FD1C17A`.

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 import os
 import re
 import secrets
+import stat
 import subprocess
+import threading
 import time
 from ctypes import wintypes
 from pathlib import Path
@@ -15,6 +18,10 @@ from typing import BinaryIO
 
 class ProtectedStorageError(RuntimeError):
     """Protected persistence is unavailable or a record cannot be read safely."""
+
+
+_quota_lock_state = threading.local()
+_quota_thread_lock = threading.Lock()
 
 
 class _DataBlob(ctypes.Structure):
@@ -193,6 +200,9 @@ class ProtectedStore:
     """Atomic, DPAPI-protected named byte records in a current-user directory."""
 
     _MAGIC = b"DEPOSIT-DPAPI-1\0"
+    MAX_RECORD_BYTES = 16 * 1024 * 1024
+    MAX_PROTECTED_BYTES = MAX_RECORD_BYTES + 64 * 1024
+    MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 
     def __init__(self, root: str | Path):
         if os.name != "nt":
@@ -200,6 +210,114 @@ class ProtectedStore:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         _secure_acl(self.root, directory=True)
+        self._register_root()
+
+    @staticmethod
+    def _coordinator_root() -> Path:
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            raise ProtectedStorageError("Windows current-user recovery directory is unavailable")
+        root = (Path(local) / "Deposit" / "recovery").resolve()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            _secure_acl(root, directory=True)
+        except Exception as exc:
+            raise ProtectedStorageError("Per-user recovery quota coordinator is unavailable") from exc
+        return root
+
+    @contextmanager
+    def user_quota_lock(self):
+        """Serialize quota and root-index operations across every recovery root."""
+        depth = getattr(_quota_lock_state, "depth", 0)
+        if depth:
+            _quota_lock_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                _quota_lock_state.depth -= 1
+            return
+        if not _quota_thread_lock.acquire(blocking=False):
+            raise ProtectedStorageError("Per-user recovery storage is locked by another process")
+        try:
+            lock = FileLock(self._coordinator_root() / "user-quota.lock", timeout=0.0)
+            with lock:
+                _quota_lock_state.depth = 1
+                try:
+                    yield
+                finally:
+                    _quota_lock_state.depth = 0
+        finally:
+            _quota_thread_lock.release()
+
+    def _registry_path(self) -> Path:
+        return self._coordinator_root() / "quota-roots.dpapi"
+
+    def _read_roots_locked(self) -> tuple[Path, ...]:
+        path = self._registry_path()
+        try:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                return ()
+            if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+                raise ProtectedStorageError("Per-user recovery root index is not a regular file")
+            payload = path.read_bytes()
+            if not payload.startswith(self._MAGIC):
+                raise ProtectedStorageError("Per-user recovery root index is corrupt")
+            raw = _crypt(payload[len(self._MAGIC):], protect=False)
+            import json
+            values = json.loads(raw.decode("utf-8"))
+            if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+                raise ValueError("Invalid root list")
+            roots = tuple(Path(value).resolve(strict=True) for value in values)
+            if len(set(roots)) != len(roots):
+                raise ValueError("Duplicate roots")
+            return roots
+        except ProtectedStorageError:
+            raise
+        except Exception as exc:
+            raise ProtectedStorageError("Per-user recovery root index cannot be assessed") from exc
+
+    def _write_roots_locked(self, roots: tuple[Path, ...]) -> None:
+        import json
+        path = self._registry_path()
+        plaintext = json.dumps(sorted(str(root) for root in roots), separators=(",", ":")).encode("utf-8")
+        if len(plaintext) > self.MAX_RECORD_BYTES:
+            raise ProtectedStorageError("Per-user recovery root index exceeds the 16 MiB limit")
+        payload = self._MAGIC + _crypt(plaintext, protect=True)
+        if len(payload) > self.MAX_PROTECTED_BYTES:
+            raise ProtectedStorageError("Protected recovery root index exceeds the 16 MiB limit")
+        if self._usage_bytes_for_roots_locked(roots) + len(payload) > self.MAX_TOTAL_BYTES:
+            raise ProtectedStorageError("Per-user recovery storage quota (1 GiB) is exhausted")
+        temporary = path.with_name(f".{secrets.token_hex(16)}.tmp")
+        try:
+            with temporary.open("xb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            _secure_acl(temporary, directory=False)
+            os.replace(temporary, path)
+        except Exception as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ProtectedStorageError("Per-user recovery root index cannot be updated") from exc
+
+    def _register_root(self) -> None:
+        with self.user_quota_lock():
+            roots = self._read_roots_locked()
+            coordinator = self._coordinator_root().resolve(strict=True)
+            registered = tuple(dict.fromkeys((*roots, coordinator, self.root)))
+            if len(registered) != len(roots):
+                self._write_roots_locked(registered)
+
+    def registered_roots(self) -> tuple[Path, ...]:
+        with self.user_quota_lock():
+            roots = self._read_roots_locked()
+            if self.root not in roots:
+                raise ProtectedStorageError("Current recovery root is missing from the per-user index")
+            return roots
 
     def _path(self, name: str) -> Path:
         if not name or Path(name).name != name or name in {".", ".."}:
@@ -209,29 +327,103 @@ class ProtectedStore:
     def write(self, name: str, plaintext: bytes) -> Path:
         if not isinstance(plaintext, bytes):
             raise TypeError("ProtectedStore writes bytes")
+        if len(plaintext) > self.MAX_RECORD_BYTES:
+            raise ProtectedStorageError("Recovery record exceeds the 16 MiB limit")
         path = self._path(name)
         payload = self._MAGIC + _crypt(plaintext, protect=True)
         temporary = self.root / f".{secrets.token_hex(16)}.tmp"
-        try:
-            with temporary.open("xb") as output:
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-            _secure_acl(temporary, directory=False)
-            os.replace(temporary, path)
-        except Exception:
+        if len(payload) > self.MAX_PROTECTED_BYTES:
+            raise ProtectedStorageError("Protected recovery record exceeds the 16 MiB limit")
+        # A shared per-user coordinator counts all registered custom roots and
+        # serializes the complete write, including its encrypted temporary copy.
+        with self.user_quota_lock():
+            projected = self._usage_bytes_locked() + len(payload)
+            if projected > self.MAX_TOTAL_BYTES:
+                raise ProtectedStorageError("Per-user recovery storage quota (1 GiB) is exhausted")
             try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+                with temporary.open("xb") as output:
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+                _secure_acl(temporary, directory=False)
+                os.replace(temporary, path)
+            except Exception:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
         return path
 
     def read(self, name: str) -> bytes:
-        payload = self._path(name).read_bytes()
+        path = self._path(name)
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise ProtectedStorageError("Recovery record is unavailable") from exc
+        if size > self.MAX_PROTECTED_BYTES:
+            raise ProtectedStorageError("Recovery record exceeds the 16 MiB limit")
+        payload = path.read_bytes()
         if not payload.startswith(self._MAGIC):
             raise ProtectedStorageError("Recovery record format is invalid")
         return _crypt(payload[len(self._MAGIC):], protect=False)
+
+    def list_records(self) -> tuple[str, ...]:
+        """List protected record names without decrypting their contents."""
+        names = []
+        try:
+            with os.scandir(self.root) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".dpapi"):
+                        continue
+                    details = entry.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(details.st_mode):
+                        raise ProtectedStorageError("Unexpected link in recovery storage")
+                    names.append(entry.name[:-len(".dpapi")])
+        except ProtectedStorageError:
+            raise
+        except OSError as exc:
+            raise ProtectedStorageError("Recovery journal records cannot be listed safely") from exc
+        return tuple(sorted(names))
+
+    def delete(self, name: str) -> None:
+        """Delete one protected record after its retention policy permits cleanup."""
+        path = self._path(name)
+        with self.user_quota_lock():
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise ProtectedStorageError("Recovery record cleanup failed") from exc
+
+    def usage_bytes(self) -> int:
+        """Return per-user physical bytes across all registered roots."""
+        with self.user_quota_lock():
+            return self._usage_bytes_locked()
+
+    def _usage_bytes_locked(self) -> int:
+        roots = self._read_roots_locked()
+        if self.root not in roots:
+            raise ProtectedStorageError("Current recovery root is missing from the per-user index")
+        return self._usage_bytes_for_roots_locked(roots)
+
+    def _usage_bytes_for_roots_locked(self, roots: tuple[Path, ...]) -> int:
+        total = 0
+        for root in roots:
+            try:
+                if not root.is_dir() or root.resolve(strict=True) != root:
+                    raise OSError("Registered recovery root is unavailable")
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        name = entry.name
+                        if not (name.endswith(".dpapi") or (name.startswith(".") and name.endswith(".tmp"))):
+                            continue
+                        details = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(details.st_mode):
+                            raise OSError("Unexpected link in recovery storage")
+                        total += details.st_size
+            except OSError as exc:
+                raise ProtectedStorageError("Recovery storage usage cannot be determined") from exc
+        return total
 
     def lock(self, name: str = "journal", *, timeout: float = 0.0) -> FileLock:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):

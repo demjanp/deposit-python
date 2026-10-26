@@ -4,6 +4,8 @@ import multiprocessing
 import os
 import hashlib
 import ctypes
+import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from ctypes import wintypes
@@ -12,6 +14,12 @@ import pytest
 
 from deposit._recovery import storage
 from deposit._recovery.storage import ProtectedStorageError, ProtectedStore
+
+
+@pytest.fixture(autouse=True)
+def isolate_per_user_quota_index(tmp_path, monkeypatch):
+    """Keep disk-backed tests from registering roots in the real user profile."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
 
 
 class _NativeFunction:
@@ -225,10 +233,14 @@ def test_acl_backend_failure_preserves_existing_record(tmp_path, monkeypatch):
     target = store.write("record", b"owner-only-secret")
     before = target.read_bytes()
 
-    def unavailable(*_args, **_kwargs):
-        raise OSError("simulated icacls backend unavailable")
+    original_secure_acl = storage._secure_acl
 
-    monkeypatch.setattr(storage.subprocess, "run", unavailable)
+    def unavailable(path, *, directory):
+        if not directory and path.name.endswith(".tmp"):
+            raise ProtectedStorageError("Could not apply the current-user-only recovery ACL")
+        return original_secure_acl(path, directory=directory)
+
+    monkeypatch.setattr(storage, "_secure_acl", unavailable)
     with pytest.raises(ProtectedStorageError, match="current-user-only"):
         store.write("record", b"replacement-secret")
     assert target.read_bytes() == before
@@ -315,3 +327,95 @@ def test_cross_process_lock_contention_and_release(tmp_path):
     assert output.get(timeout=5) == "acquired"
     child.join(timeout=5)
     assert child.exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Protected storage requires Windows DPAPI and byte-range locks")
+def test_default_root_is_registered_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "_secure_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(storage, "_crypt", lambda data, *, protect: bytes(data))
+    root = tmp_path / "default-recovery"
+    monkeypatch.setattr(ProtectedStore, "_coordinator_root", staticmethod(lambda: root))
+
+    store = ProtectedStore(root)
+
+    assert store.registered_roots() == (root.resolve(),)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Protected storage requires Windows DPAPI and byte-range locks")
+def test_root_index_quota_counts_existing_index_and_replacement_temp_before_replace(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "_secure_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(storage, "_crypt", lambda data, *, protect: bytes(data))
+    coordinator = tmp_path / "coordinator"
+    monkeypatch.setattr(ProtectedStore, "_coordinator_root", staticmethod(lambda: coordinator))
+    store = ProtectedStore(tmp_path / "first")
+    index = store._registry_path()
+    previous_index = index.read_bytes()
+    previous_roots = store.registered_roots()
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    occupied = second_root / "existing.dpapi"
+    occupied.write_bytes(b"already registered-root data")
+    next_roots = (*previous_roots, second_root.resolve())
+    next_plaintext = json.dumps(sorted(str(root) for root in next_roots), separators=(",", ":")).encode()
+    next_payload = store._MAGIC + next_plaintext
+    monkeypatch.setattr(
+        ProtectedStore,
+        "MAX_TOTAL_BYTES",
+        store.usage_bytes() + occupied.stat().st_size + len(next_payload) - 1,
+    )
+
+    with pytest.raises(ProtectedStorageError, match="1 GiB"):
+        ProtectedStore(second_root)
+
+    assert index.read_bytes() == previous_index
+    assert store.registered_roots() == previous_roots
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Protected storage requires Windows DPAPI and byte-range locks")
+def test_quota_scandir_error_on_registered_root_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "_secure_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(storage, "_crypt", lambda data, *, protect: bytes(data))
+    monkeypatch.setattr(ProtectedStore, "_coordinator_root", staticmethod(lambda: tmp_path / "coordinator"))
+    first = ProtectedStore(tmp_path / "first")
+    second = ProtectedStore(tmp_path / "second")
+    real_scandir = os.scandir
+
+    def denied(path):
+        if Path(path) == second.root:
+            raise PermissionError("simulated inaccessible registered root")
+        return real_scandir(path)
+
+    monkeypatch.setattr(storage.os, "scandir", denied)
+    with pytest.raises(ProtectedStorageError, match="usage cannot be determined"):
+        first.usage_bytes()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Protected storage requires Windows DPAPI and byte-range locks")
+def test_user_quota_lock_is_reentrant_and_thread_contention_is_nonblocking(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "_secure_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(storage, "_crypt", lambda data, *, protect: bytes(data))
+    monkeypatch.setattr(ProtectedStore, "_coordinator_root", staticmethod(lambda: tmp_path / "coordinator"))
+    store = ProtectedStore(tmp_path / "recovery")
+    with store.user_quota_lock():
+        with store.user_quota_lock():
+            pass
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with store.user_quota_lock():
+            entered.set()
+            assert release.wait(5)
+
+    worker = threading.Thread(target=hold_lock)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(ProtectedStorageError, match="locked by another process"):
+            with store.user_quota_lock():
+                pass
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()

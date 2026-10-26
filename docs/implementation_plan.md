@@ -1,6 +1,7 @@
 # Deposit Python 2 implementation plan
 
-Date: 2026-10-25. State: implementation not started.
+Date: 2026-10-25. Stage progress is recorded in
+[`implementation_status.md`](implementation_status.md).
 
 ## Authority, scope and starting point
 
@@ -281,10 +282,23 @@ Ordered work:
    these for client reconstruction. Resume them by the retained key. Handle lost replies at
    every boundary, interrupted local writes, corrupt/unsupported journal versions,
    lock-owner death and release failure without blind replay or lost results.
+   If a local intent survives reconnect but no server preparation exists, never
+   create a fresh key under a new baseline. Preserve the intent and require explicit
+   refresh/reapply unless original preconditions are proven unchanged. The direct
+   changed-precondition case is covered by
+   `test_missing_preparation_with_changed_revision_is_never_recreated`.
 3. Implement protected reauthentication and a public way to inspect pending work
    and retrieve recovered results without exposing recovery keys as application
-   responsibility. Unavailable credentials/permissions preserve work and return
-   actionable safe conditions. Credential rotation does not change original actor.
+   responsibility. Implement the approved Client-owned API:
+   `Client.pending_operations(*, recovery_directory=None) -> tuple[PendingOperation, ...]`,
+   `Client.recover(operation, *, username, password) -> RecoveredOperation`, and
+   `Client.recovered_operations(*, recovery_directory=None) -> tuple[RecoveredOperation, ...]`.
+   References are immutable and expose no recovery key, exact arguments or credentials.
+   Reauthentication uses fresh credentials through `open_store` or `Client.recover`;
+   do not add `Store.reauthenticate`. Unavailable credentials/permissions preserve
+   work and return actionable safe conditions. Credential rotation does not change
+   original actor. `Client.recover` must use the original durable receipt to retrieve
+   a completed Namespace deletion without selecting the deleted Namespace.
 4. Add minimal portable Class/Object reads and create methods through that core.
    Capture declaration/value snapshots together; implement explicit refresh and
    conflict preservation without completing the full Stage 4 handle surface.
@@ -307,8 +321,11 @@ Acceptance:
   A recovered UUID/result remains retrievable after later entity change/deletion.
 - **2D:** Changed permissions, disabled account, password-change session revocation,
   unavailable credentials and wrong server/database/actor/Namespace prevent unsafe
-  continuation and preserve pending work. Completed Namespace deletion and prior-
-  epoch server actions follow the public recovery contract rather than retargeting.
+  continuation and preserve pending work. Reauthentication uses fresh credentials
+  with `Client.recover` or by reopening through `Client.open_store`; no Store-level
+  reauthentication method is exposed. `Client.recover` retrieves a completed
+  Namespace deletion through its original receipt without selecting that Namespace.
+  Prior-epoch server actions follow the public recovery contract rather than retargeting.
   An uncommitted server-scope preparation from an earlier server epoch preserves
   pending work on REVISION_CONFLICT and requires explicit refresh/reapply; never
   automatically generate a new key or reinterpret it as a replayable action.
@@ -532,11 +549,9 @@ to PyPI, pushes, deployment or changing existing installations.
 
 ## Project-run execution and status contract
 
-Example future request from this repository (not an execution instruction now):
-
-> Use $project-run for Deposit Python, Stages 1 through 2, with implementation
-> plan `docs/implementation_plan.md` and implementation status
-> `docs/implementation_status.md`. Execute the selected stages.
+The authorized project run executes Stages 1 through 6 in the order defined
+here. The selected tracker records verified progress and commits; this plan
+remains the source for stage scope, dependencies and acceptance criteria.
 
 Select an explicit bounded sequence or next-N request. The plan and tracker are
 independent explicit inputs; do not substitute the hub's server status. Cross-repo
@@ -549,8 +564,7 @@ separate implementation dispatch, independent architect review, protected baseli
 tracker updates and stage commits. Use a common run ID and exact stage ID in each
 commit; preserve unrelated/index changes. Commit each changed implementation repo
 then any separate tracker repo; here plan/tracker share deposit-python. Do not make
-empty commits or push. The current documentation task creates no run checkpoint
-or stage commits and marks no implementation stage complete.
+empty commits or push.
 
 Resolve local checkpoint via `git rev-parse --git-path project-run/state.json`.
 Store selected file hashes, baselines, current phase, decisions, acceptance evidence,

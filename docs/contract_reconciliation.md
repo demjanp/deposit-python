@@ -11,9 +11,9 @@ replacement for those sources.
 
 The prior hub token-injected `Store(driver, ..., token)` sketch is superseded.
 The Client signatures below reflect the implemented synchronous facade. The
-Store factory row records the Stage 1 approved contract; it is not implemented
-yet. Auth tokens are explicit arguments and are never part of the driver or
-Namespace identity.
+Store factory row records the Stage 1 approved contract, implemented and
+verified in Stage 2. Auth tokens are explicit arguments and are never part of
+the driver or Namespace identity.
 
 | Proposal/hub point | Reconciled signature | Result/lifetime and owner | Errors and gate |
 |---|---|---|---|
@@ -24,12 +24,45 @@ Namespace identity.
 | Session inspection | `Client.get_session(token: str) -> dict[str, Any]` | Returns detached sanitized profile/expiry. Client operation for an authenticated session. | `DepositError` or `TransportError`; 1C. |
 | Logout | `Client.logout(token: str) -> None` | Revokes that Deposit session; does not close driver. | `DepositError` or `TransportError`; 1C. |
 | Close/context | `Client.close() -> None`; `Client.__enter__() -> Client`; `Client.__exit__(exc_type, exc, traceback) -> None` | Idempotent close; closes only an owned driver. Context manager owns Client lifetime. | Requests after close are wrapped as `TransportError` by `_single`; entering a closed Client context raises `RuntimeError`. Package/lifecycle tests. |
-| Store factory | `Client.open_store(namespace, *, username, password, recovery_directory=None) -> Store` | Stage 1 approved public signature. Every call authenticates a fresh Store session; selects Namespace once and resolves its UUID. Caller-authenticated Neo4j driver ownership stays with Client. Store construction is internal. | Credentials are used only for fresh authentication and never persisted/logged; `Client.login` token is not reused. `None` uses current-user protected `%LOCALAPPDATA%\Deposit\recovery`. Stage 2 implements/tests lifecycle. |
+| Store factory | `Client.open_store(namespace, *, username, password, recovery_directory=None) -> Store` | Stage 1 approved public signature, implemented and verified in Stage 2. Every call authenticates a fresh Store session; selects Namespace once and resolves its UUID. Caller-authenticated Neo4j driver ownership stays with Client. Store construction is internal. | Credentials are used only for fresh authentication and never persisted/logged; `Client.login` token is not reused. `None` uses current-user protected `%LOCALAPPDATA%\Deposit\recovery`. |
 
-The accepted `namespace` selector input forms are not further typed in the chosen
-signature; implementation must resolve it once and retain the UUID. `Store`
-construction is internal. `Store.reauthenticate` is only a proposed Stage 2 API,
-not an approved public method.
+The accepted `namespace` selector is a name string or explicit `{"id": UUID}`
+map; implementation resolves it once and retains the UUID. `Store` construction
+is internal. Reauthentication uses fresh credentials with `Client.open_store` or
+`Client.recover`; no `Store.reauthenticate` method is approved.
+
+## Approved Client-owned recovery API
+
+The Stage 2 recovery-inspection and result signatures are approved:
+
+```python
+Client.pending_operations(*, recovery_directory=None) -> tuple[PendingOperation, ...]
+Client.recover(operation, *, username, password) -> RecoveredOperation
+Client.recovered_operations(*, recovery_directory=None) -> tuple[RecoveredOperation, ...]
+```
+
+`PendingOperation` and `RecoveredOperation` are immutable safe references. Their
+public random reference IDs are distinct from server recovery keys. They expose no
+recovery key, exact operation arguments, credentials, token or journal path.
+`pending_operations` lists unresolved work in the protected current-user journal;
+`recovered_operations` lists retained results after durable outcome persistence
+and confirmed server release. Result payloads are immutable portable values.
+Recovered payloads expose maps as immutable mappings and JSON arrays as ordered
+tuples; the protected journal retains the original portable map/list structure.
+`Client.recover` accepts a reference returned by `pending_operations` on that
+Client, authenticates with fresh caller-supplied credentials, checks the original
+actor and full deployment identity, and resolves by the stored key and arguments.
+For a completed Namespace deletion it reads the original server receipt and
+releases the preparation without attempting to select the deleted Namespace.
+Custom recovery directories are associated with references enumerated by that
+Client; credentials and journal inputs are never stored in a reference.
+
+If a local intent survives reconnect but the server reports no preparation, the
+client must not create a fresh recovery key under a new baseline. It preserves
+the original intent and requires explicit refresh/reapply unless the original
+preconditions are proven unchanged. `test_missing_preparation_with_changed_revision_is_never_recreated`
+in `tests/unit/test_store.py` verifies that changed preconditions fail closed
+without a second prepare.
 
 | Contract | Hub design target | Proposal / resolved Python contract | Required fields and owner | Stage owner |
 |---|---|---|---|---|
@@ -37,7 +70,7 @@ not an approved public method.
 | Store session and driver | One independent Deposit session per Store; shared caller driver remains open unless Client owns it. | Same. | Session/token scope, driver close rule, reader cleanup, Namespace UUID binding and Store close behavior. Client owns driver policy; each Store owns its session. | Stage 2. |
 | Procedure dispatch | Hub describes direct procedure-named conveniences and advanced routing. | Proposal maps procedure verbs to Python names and routes procedures through a shared coordinator. No unrestricted generic call may retarget a Store. | Ordered positional args, server defaults, registration token placement, named output columns, route owner, scope, action classification and failure mapping. Coordinator owns the reviewed dispatch path; Client/Store own convenience methods. | Stage 1 manifest; Stage 3 full gateway. |
 | Prepared recovery | Hub requires server-prepared exact arguments and no client-generated replay after uncertainty. | Proposal places pending/recovered work behind the coordinator, not application recovery keys. | Immutable normalized input, identity bindings, versioned serialization, durable state, result fidelity, release confirmation, fail-closed corruption/unknown-version handling. RecoveryCoordinator owns state transitions and retained outcomes. | Stage 1 contract; Stage 2 implementation. |
-| Identity proof | Hub's prior sketch left deployment identity open. | Approved Stage 1 policy binds to target Neo4j `db.info` ID and system-store `dbms.info` ID, plus resolved endpoint/database, Deposit actor and immutable Namespace UUID. URI constrains the endpoint but does not prove identity. Missing/denied/changed IDs or endpoint/database retargeting fail closed. | Persist and compare both native IDs and the resolved endpoint/database, actor UUID and Namespace UUID before recovery. A copied/restored store may retain IDs; that accepted limitation is explicit. | Stage 1 identity contract/live smoke; Stage 2 enforcement. |
+| Identity proof | Hub's prior sketch left deployment identity open. | Approved Stage 1 policy binds to target Neo4j `db.info` ID and system-store `dbms.info` ID, plus the contacted endpoint/database from Neo4j 6.4 `ResultSummary.server.address` and `.database`, Deposit actor and immutable Namespace UUID. Do not treat the configured routing URI as the contacted endpoint or as a reconnection URI. Missing/denied/changed IDs or endpoint/database retargeting fail closed. | Persist and compare both native IDs and the resolved contacted host/port and database, actor UUID and Namespace UUID before recovery. A copied/restored store may retain IDs; that accepted limitation is explicit. | Stage 1 identity contract/live smoke; Stage 2 enforcement. |
 | Protected journal | Hub calls for protected, crash-safe recovery storage. | Proposal requires current-user OS protection, exclusive cross-process coordination and lossless exact inputs/results. | Versioned lossless envelope; JSON-compatible typed tags only; no pickle or `default=str`; reject unsupported/corrupt records and retain them. DPAPI current-user encryption plus current-user-only ACL. | Stage 1 storage primitives/contract; Stage 2 journal. |
 | Durability and resource bounds | Hub does not define journal quota/retention internals. | Approved finite defaults: per-user 1 GiB total quota, 16 MiB maximum encoded record, 1,024 unresolved operations, 30-day resolved retention only after durable outcome and confirmed release, and zero-second fail-fast lock acquisition. Defaults can be configured before new work begins. | Include encoded records, spools and peak temporary copies in quota accounting. Never prune unresolved work or work with uncertain release. Flush+fsync protected temp before atomic replace; lock journal across processes. On disk/write failure preserve pending/server preparation and never release or claim success. | Stage 1 contract; Stage 2 tests and implementation. |
 | Versioned serialization | The hub requires exact recovery inputs and portable outcomes. | Proposal requires original normalized arguments and identity; results preserve public fidelity. | Explicit schema version and tagged typed values; preserve list/map order and distinctions needed by Python; reject unknown tags, duplicate fields, unsupported versions and malformed records. No lossy fallback. | Stage 1 contract; Stage 2 implementation/tests. |

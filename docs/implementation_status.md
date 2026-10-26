@@ -6,8 +6,8 @@ Updated: 2026-10-26.
 
 Plan: [implementation_plan.md](implementation_plan.md).
 Design input: [implementation_proposal.md](implementation_proposal.md).
-This tracker covers the Python wrapper and its coordinated Stage 1 server/hub
-changes; it is not the server implementation status in the Deposit Hub. Stage
+This tracker covers the Python wrapper and its coordinated Stage 1/2
+server/hub changes; it is not the server implementation status in the Deposit Hub. Stage
 order is 1, 2, 3, 4, 5, 6.
 
 Initial inspected repository before implementation: `main` at
@@ -22,7 +22,7 @@ acceptance.
 | Stage | Scope | State | Acceptance | Verification/review | Finalization |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Contracts, package and live test infrastructure | Finalized | 1A-1E complete | Foundation gate passed; independent architect PASS, no blocking findings | All three Stage 1 commits verified; commit IDs recorded below |
-| 2 | Safe core and durable recovery | Not started | 2A-2F pending | Not run / no implementation review | No stage commits |
+| 2 | Safe core and durable recovery | Verified and reviewed (finalization pending) | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Stage commits pending in Python, server and hub |
 | 3 | Complete procedure gateway | Not started | 3A-3E pending | Not run / no implementation review | No stage commits |
 | 4 | Typed domain, queries and batches | Not started | 4A-4E pending | Not run / no implementation review | No stage commits |
 | 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
@@ -155,7 +155,7 @@ Tracker update state: Finalized with all acceptance evidence and the completed r
 - Hub contract: `0cc09a5b34ccb83861f005d53e9797ce7df11124`; completed-commit status follow-up: `240dc999d341cd7d7cf3ae7f507cd92214e8888a`.
 - Python source and this tracker are included in the tracker-bearing Stage 1 commit; its full hash is recorded in the local project-run checkpoint and Git history.
 
-Stage 2 is now unblocked.
+Stage 2 is verified and reviewed; its tracker finalization and repository commits are pending.
 
 ## Planning record
 
@@ -181,3 +181,84 @@ preserved.
 Stage 1 resolved deployment identity without expanding the public server
 contract. Restart replay remains disabled until Stage 2 implements durable
 recovery checks against the accepted identity policy.
+
+### Stage 2 / `deposit-python-20261025-01` / verified and reviewed (finalization pending)
+
+Scope and prerequisites checked: Stage 1 is finalized in Python, server and hub.
+Captured Stage 2 baselines: Python `e930e004888d2196fdf6a29de5f69e27de60e735`,
+server `20d15ee708c797f17e29ec6782d017b101eae828`, and hub
+`240dc999d341cd7d7cf3ae7f507cd92214e8888a`; all repositories use `main`.
+User-approved decisions retained: `Client.open_store(namespace, *, username,
+password, recovery_directory=None)`; Client-owned immutable pending/recover/
+recovered references; native identity policy and its copied-store limitation.
+
+Implemented: independent Store sessions bound to immutable Namespace UUIDs;
+minimal portable Class/Object create/read and conflict refresh/reapply; protected
+versioned recovery journal; strict JSON decoding, exact portable input validation,
+current-user protected root registry, aggregate quota and unresolved limits,
+fail-fast cross-process/action locking; identity-bound Client recovery including
+deleted-Namespace receipts; process-death/restart acceptance in the existing
+suite owner. Unexpected `NOT_FOUND` with saved outcome remains unresolved;
+successful lost release replies recover from the durable committed receipt.
+Shared hub Client recovery contract and server-owned Python acceptance hooks were
+updated. No server runtime behavior or public server procedure changed.
+
+Acceptance ID -> assertion -> evidence: all 2A-2F are recorded in
+[`tests/acceptance_map.md`](../tests/acceptance_map.md). The final cumulative
+Restart run `20261026T161936350Z-c10e1603` and KillRestart run
+`20261026T162540049Z-b609525c` each used Python 3.14.4 and the clean tagged
+Deposit Server `2.0.0-dev.77` bundle. Each runner recorded 21 commands, all exit
+0 with zero timeouts. Wheel/sdist package checks: 24 each; wheel manifest: 3;
+storage: 14; identity: 6; wheel/sdist core: 68 each. Both live Seed phases were
+2 passed / 2 skipped and Verify phases 4 passed. Each exact-tag overlay restored
+56/56 script paths and the clean HEAD/tag with zero restoration failures.
+Result-record SHA-256 values: Restart
+`60EDD22ECF5534B5757DCFE93CC0F70ABC218677EB1B0A49196026038A884E3E`; KillRestart
+`C662CF857C4778E856783526C3BC6A114DAED36B0FAC267025A0C908FBB4373E`. Evidence
+is retained under
+`../test_harness/tools/python-tests/stage2-server-evidence-20261026-01/Final-Restart-20261026T161936350Z-c10e1603/`
+and `Final-KillRestart-20261026T162540049Z-b609525c/`.
+
+Focused checks after corrections: quota/release selection 12 passed; strict
+journal/input selection 63 passed with one ACL subprocess test deselected; the
+later non-UUID key preservation matrix passed 4/4 access paths. Server support
+selection `PreparedActionReplayIT,AccountAuthorizationIT` passed 42 tests;
+`ActionReplayRecoveryIT#seed/#verify` passed one test each under both Restart and
+KillRestart. Logs and a quota-registry cleanup audit are retained under
+`../test_harness/tools/python-tests/stage2-server-evidence-20261026-01/`.
+
+Failure/correction record: an exploratory direct three-file pytest run reported
+41 passed and 8 ACL-dependent failures. The workspace ACL retained SYSTEM,
+Administrators and OWNER RIGHTS entries after `icacls /inheritance:r`; the
+unchanged owner-only validator correctly rejected them. This direct invocation
+was not the owner-managed acceptance command; the final wheel/sdist storage,
+package and core gates passed. Its output and the later focused outputs are
+retained in the `python-focused-evidence` subdirectory. Earlier cumulative runs
+were superseded by the final runs after architect findings were corrected.
+
+Supported matrix exercised: Windows x64, Python 3.14.4, Neo4j driver 6.x and
+Deposit Server `2.0.0-dev.77`. No other operating systems, interpreter versions
+or server versions are claimed. Endpoint/database/native-ID replacement checks
+are unit call-spy evidence; the live recovery fixture verifies server identity
+and Namespace binding across both transitions.
+
+Independent architect review: PASS, no remaining blocking findings. Follow-up
+review checked the corrected strict journal validation and portable input
+fidelity against the current diffs, verified final result hashes and acceptance
+counts, and confirmed clean `git diff --check` in all three repositories. The
+architect did not execute tests. Corrections preserved the approved APIs and
+server contract.
+
+Shared contract/documentation consistency: stale Store-factory implementation
+wording and acceptance-map run references were corrected after review. Stage 2
+adds no new architectural decision requiring a contract change.
+
+Tracker update state: verified/reviewed; commit finalization pending. Intended
+separate commits:
+
+- Python: `project-run deposit-python-20261025-01: Stage 2 - safe core and durable recovery`
+- Server: `project-run deposit-python-20261025-01: Stage 2 - Python acceptance harness integration`
+- Hub: `project-run deposit-python-20261025-01: Stage 2 - approved Client recovery contract`
+
+After these commits, update the Stage 2 state to Finalized and record each commit
+ID in the tracker-bearing follow-up commit.
