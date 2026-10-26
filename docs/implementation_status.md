@@ -152,7 +152,7 @@ tagged bundle, not a rebuilt artifact containing the catalog correction.
 Tracker update state: Finalized with all acceptance evidence and the completed review. Stage 1 commits:
 
 - Server: `20d15ee708c797f17e29ec6782d017b101eae828`.
-- Hub: `0cc09a5b34ccb83861f005d53e9797ce7df11124`.
+- Hub contract: `0cc09a5b34ccb83861f005d53e9797ce7df11124`; completed-commit status follow-up: `240dc999d341cd7d7cf3ae7f507cd92214e8888a`.
 - Python source and this tracker are included in the tracker-bearing Stage 1 commit; its full hash is recorded in the local project-run checkpoint and Git history.
 
 Stage 2 is now unblocked.
