@@ -1,5 +1,9 @@
-# <img src="dep_cube.svg" width="32">Deposit
-Python driver for Deposit - Graph database for scientific data collection.
+# <img src="dep_cube.svg" width="32">Deposit Python
+
+Synchronous Python client for Deposit Server 2. The distribution and import are
+named `deposit`; the 2.x generation is distinct from Deposit 1.x and does not
+promise API compatibility. Applications that use both generations should use
+separate environments.
 
 This repository is part of the [Deposit Hub](https://github.com/demjanp/deposit-hub).
 
@@ -28,10 +32,21 @@ It serves as a backend for the following applications:
 
 ## Installation <a name="installation"></a>
 
-To install the latest version of Deposit from the Python package index, use the following command:
+Planned release installation commands (available after Stage 6 and publication):
 ```
-pip install deposit
+pip install "deposit>=2,<3"
 ```
+
+NetworkX graph conversion is planned for Stage 6; its optional extra will be:
+
+```
+pip install "deposit[networkx]>=2,<3"
+```
+
+The initial integration support matrix targets Windows x64, Python 3.14.x,
+Neo4j Python driver 6.x, and the exact Deposit Server build recorded in the
+installed package's procedure manifest. Unsupported server builds fail before
+Deposit API calls.
 
 For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/deposit_gui/releases/latest)
 

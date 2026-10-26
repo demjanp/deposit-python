@@ -1,0 +1,2997 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "deposit-server",
+    "files_sha256": {
+      "runtime/public-api.json": "d8afdd5cce6ef3aa17503d548caf3881edc53b026d9e3e783770f45179997a4d",
+      "plugin/src/main/java/deposit/api/DepositAPI.java": "6b897e5d97b6abc503388238afe7f30763e8290a44ae9980eb90b98be65727bb",
+      "plugin/src/main/java/org/deposit/runtime/Discovery.java": "a8e183bb8fdd3c7feea9ad1c975399e30755e0eca793200a8e738a1f41531df0",
+      "plugin/src/main/java/deposit/common/ProcedureCatalog.java": "3b5bbdf04a452f52161f8cce751ad9b1028d3855d13d72fa3869a7aa3752014e",
+      "plugin/src/main/java/deposit/common/PublicResults.java": "50b67a8f6af32f5385e052d9b7edaeb7070bef9401311617807a265cd3ad8a9c",
+      "plugin/src/main/java/deposit/service/DomainService.java": "7ca61bb9be8e7ea14455cbc9744997f015bab3d34705b85c73d9ab517f8dc90c"
+    },
+    "catalog_entries": 123,
+    "discovery_entry": "deposit.get.info",
+    "server_project_version": "0.0.0-dev",
+    "neo4j_version": "2026.05.0"
+  },
+  "support": {
+    "target_server_version": "2.0.0-dev.77",
+    "target_neo4j_version": "2026.05.0",
+    "target_python": "3.14.x (Windows x64)",
+    "supported_python": ">=3.14,<3.15",
+    "neo4j_driver": ">=6.0,<7"
+  },
+  "procedures": [
+    {
+      "name": "deposit.create.class",
+      "args": [
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.class",
+      "args": [
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.class",
+      "args": [
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.class",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Class"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Class"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.create.object",
+      "args": [
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:classId"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.object",
+      "args": [
+        {
+          "name": "objectId",
+          "type": "String",
+          "binding": "id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.object",
+      "args": [
+        {
+          "name": "objectId",
+          "type": "String",
+          "binding": "id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.object",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Object"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.objectPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Object"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.create.descriptor",
+      "args": [
+        {
+          "name": "objectId",
+          "type": "String",
+          "binding": "objectId"
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "value",
+          "type": "Object",
+          "binding": "value"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.descriptor",
+      "args": [
+        {
+          "name": "objectId",
+          "type": "String",
+          "binding": "objectId"
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "value",
+          "type": "Object",
+          "binding": "value"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.descriptor",
+      "args": [
+        {
+          "name": "descriptor",
+          "type": "Object",
+          "binding": "@Descriptor:id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.descriptor",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Descriptor"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.descriptorPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Descriptor"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.create.classDescriptor",
+      "args": [
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:classId"
+        },
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "type",
+          "type": "String",
+          "binding": "type"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.classDescriptor",
+      "args": [
+        {
+          "name": "classDescriptor",
+          "type": "Object",
+          "binding": "@ClassDescriptor:id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.classDescriptor",
+      "args": [
+        {
+          "name": "classDescriptor",
+          "type": "Object",
+          "binding": "@ClassDescriptor:id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classDescriptor",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?ClassDescriptor"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classDescriptorPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?ClassDescriptor"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.create.userTool",
+      "args": [
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.userTool",
+      "args": [
+        {
+          "name": "userTool",
+          "type": "Object",
+          "binding": "@UserTool:id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.userTool",
+      "args": [
+        {
+          "name": "userTool",
+          "type": "Object",
+          "binding": "@UserTool:id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.userTool",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?UserTool"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.userToolPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?UserTool"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.create.relationship",
+      "args": [
+        {
+          "name": "sourceId",
+          "type": "String",
+          "binding": "sourceId"
+        },
+        {
+          "name": "targetId",
+          "type": "String",
+          "binding": "targetId"
+        },
+        {
+          "name": "label",
+          "type": "String",
+          "binding": "label"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.relationship",
+      "args": [
+        {
+          "name": "relationshipId",
+          "type": "String",
+          "binding": "id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.relationship",
+      "args": [
+        {
+          "name": "relationshipId",
+          "type": "String",
+          "binding": "id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.relationship",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Relationship"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.relationshipPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Relationship"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.create.classRelationship",
+      "args": [
+        {
+          "name": "source",
+          "type": "Object",
+          "binding": "@Class:sourceId"
+        },
+        {
+          "name": "target",
+          "type": "Object",
+          "binding": "@Class:targetId"
+        },
+        {
+          "name": "label",
+          "type": "String",
+          "binding": "label"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.classRelationship",
+      "args": [
+        {
+          "name": "classRelationshipId",
+          "type": "String",
+          "binding": "id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.classRelationship",
+      "args": [
+        {
+          "name": "classRelationshipId",
+          "type": "String",
+          "binding": "id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classRelationship",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?ClassRelationship"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classRelationshipPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?ClassRelationship"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.membership",
+      "args": [
+        {
+          "name": "objectId",
+          "type": "String",
+          "binding": "objectId"
+        },
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:classId"
+        }
+      ],
+      "columns": [
+        "rel"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.apply.batch",
+      "args": [
+        {
+          "name": "commands",
+          "type": "List<Object>",
+          "binding": "commands"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.all",
+      "args": [
+        {
+          "name": "confirmNamespaceName",
+          "type": "String",
+          "binding": "confirmNamespaceName"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.utils.bootstrap",
+      "args": [
+        {
+          "name": "username",
+          "type": "String",
+          "binding": "username"
+        },
+        {
+          "name": "password",
+          "type": "String",
+          "binding": "password"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": false,
+      "action": false,
+      "admin": true,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.utils.login",
+      "args": [
+        {
+          "name": "username",
+          "type": "String",
+          "binding": "username"
+        },
+        {
+          "name": "password",
+          "type": "String",
+          "binding": "password"
+        }
+      ],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": false,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.utils.logout",
+      "args": [],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.create.user",
+      "args": [
+        {
+          "name": "username",
+          "type": "String",
+          "binding": "username"
+        },
+        {
+          "name": "password",
+          "type": "String",
+          "binding": "password"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.create.namespace",
+      "args": [
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.set.user",
+      "args": [
+        {
+          "name": "user",
+          "type": "Object",
+          "binding": "@User:userId"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.set.password",
+      "args": [
+        {
+          "name": "oldPassword",
+          "type": "String",
+          "binding": "oldPassword"
+        },
+        {
+          "name": "newPassword",
+          "type": "String",
+          "binding": "newPassword"
+        }
+      ],
+      "columns": [
+        "value"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.set.namespace",
+      "args": [
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.namespace",
+      "args": [
+        {
+          "name": "confirmNamespaceName",
+          "type": "String",
+          "binding": "confirmNamespaceName"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.set.namespaceRole",
+      "args": [
+        {
+          "name": "user",
+          "type": "Object",
+          "binding": "@User:userId"
+        },
+        {
+          "name": "role",
+          "type": "String",
+          "binding": "role"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.activeNamespace",
+      "args": [
+        {
+          "name": "namespace",
+          "type": "Object",
+          "binding": "?Namespace"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.activeNamespace",
+      "args": [],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.set.administrativeMode",
+      "args": [
+        {
+          "name": "enabled",
+          "type": "Boolean",
+          "binding": "enabled"
+        }
+      ],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.administrativeMode",
+      "args": [],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.user",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?User"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.userPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?User"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.namespace",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Namespace"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.namespacePage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Namespace"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.objectClass",
+      "args": [
+        {
+          "name": "objectId",
+          "type": "String",
+          "binding": "objectId"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classMembers",
+      "args": [
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:classId"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.classMembersPage",
+      "args": [
+        {
+          "name": "class",
+          "type": "Object",
+          "binding": "@Class:classId"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.objectByDescriptorId",
+      "args": [
+        {
+          "name": "descriptorId",
+          "type": "String",
+          "binding": "descriptorId"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.namespaceRoles",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.namespaceRolesPage",
+      "args": [
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.operation",
+      "args": [
+        {
+          "name": "operationId",
+          "type": "String",
+          "binding": "operationId"
+        },
+        {
+          "name": "scope",
+          "type": "String",
+          "binding": "scope"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.get.revision",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.history",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.historyPage",
+      "args": [
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.restorePreview",
+      "args": [
+        {
+          "name": "targetRevisionId",
+          "type": "String",
+          "binding": "targetRevisionId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.utils.undo",
+      "args": [
+        {
+          "name": "revisionId",
+          "type": "String",
+          "binding": "~revisionId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.utils.redo",
+      "args": [
+        {
+          "name": "undoRevisionId",
+          "type": "String",
+          "binding": "undoRevisionId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.utils.restore",
+      "args": [
+        {
+          "name": "targetRevisionId",
+          "type": "String",
+          "binding": "targetRevisionId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.utils.canUndo",
+      "args": [
+        {
+          "name": "revisionId",
+          "type": "String",
+          "binding": "~revisionId"
+        }
+      ],
+      "columns": [
+        "value",
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.utils.isRestored",
+      "args": [],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.versioningType",
+      "args": [
+        {
+          "name": "mode",
+          "type": "String",
+          "binding": "mode"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.versionTag",
+      "args": [
+        {
+          "name": "revisionId",
+          "type": "String",
+          "binding": "revisionId"
+        },
+        {
+          "name": "tag",
+          "type": "String",
+          "binding": "tag"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.query",
+      "args": [
+        {
+          "name": "query",
+          "type": "String",
+          "binding": "query"
+        },
+        {
+          "name": "parameters",
+          "type": "Map<String,Object>",
+          "binding": "parameters"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data",
+        "columns",
+        "presence"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.queryPage",
+      "args": [
+        {
+          "name": "query",
+          "type": "String",
+          "binding": "query"
+        },
+        {
+          "name": "parameters",
+          "type": "Map<String,Object>",
+          "binding": "parameters"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.resource.beginUpload",
+      "args": [
+        {
+          "name": "filename",
+          "type": "String",
+          "binding": "filename"
+        },
+        {
+          "name": "bytes",
+          "type": "Long",
+          "binding": "bytes"
+        },
+        {
+          "name": "sha256",
+          "type": "String",
+          "binding": "sha256"
+        },
+        {
+          "name": "mediaType",
+          "type": "String",
+          "binding": "mediaType"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.resource.uploadChunk",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        },
+        {
+          "name": "offset",
+          "type": "Long",
+          "binding": "offset"
+        },
+        {
+          "name": "bytesBase64",
+          "type": "String",
+          "binding": "bytesBase64"
+        },
+        {
+          "name": "chunkSha256",
+          "type": "String",
+          "binding": "chunkSha256"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.resource.finishUpload",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.resource.abortUpload",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.resource.info",
+      "args": [
+        {
+          "name": "resourceId",
+          "type": "String",
+          "binding": "resourceId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.resource.downloadChunk",
+      "args": [
+        {
+          "name": "resourceId",
+          "type": "String",
+          "binding": "resourceId"
+        },
+        {
+          "name": "offset",
+          "type": "Long",
+          "binding": "offset"
+        },
+        {
+          "name": "length",
+          "type": "Long",
+          "binding": "length"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.admin.pruneResources",
+      "args": [
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "prune",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.admin.pruneResourcesStatus",
+      "args": [
+        {
+          "name": "pruneId",
+          "type": "String",
+          "binding": "pruneId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.utils.coordinatesToWKT",
+      "args": [
+        {
+          "name": "type",
+          "type": "String",
+          "binding": "type"
+        },
+        {
+          "name": "coordinates",
+          "type": "Object",
+          "binding": "coordinates"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.utils.wktToCoordinates",
+      "args": [
+        {
+          "name": "wkt",
+          "type": "String",
+          "binding": "wkt"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.utils.toData",
+      "args": [
+        {
+          "name": "entity",
+          "type": "Object",
+          "binding": "entity"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.session",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.utils.refresh",
+      "args": [
+        {
+          "name": "scope",
+          "type": "String",
+          "binding": "scope"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.get.lastOperation",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.get.requests",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.utils.cancel",
+      "args": [],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.utils.cancelRequest",
+      "args": [
+        {
+          "name": "requestId",
+          "type": "String",
+          "binding": "requestId"
+        }
+      ],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.action.prepare",
+      "args": [
+        {
+          "name": "recoveryKey",
+          "type": "String",
+          "binding": "recoveryKey"
+        },
+        {
+          "name": "procedure",
+          "type": "String",
+          "binding": "procedure"
+        },
+        {
+          "name": "arguments",
+          "type": "List<Object>",
+          "binding": "arguments"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.action.status",
+      "args": [
+        {
+          "name": "recoveryKey",
+          "type": "String",
+          "binding": "recoveryKey"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.action.resume",
+      "args": [
+        {
+          "name": "recoveryKey",
+          "type": "String",
+          "binding": "recoveryKey"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.action.release",
+      "args": [],
+      "columns": [
+        "value"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "RecoveryCoordinator"
+    },
+    {
+      "name": "deposit.create.pattern",
+      "args": [
+        {
+          "name": "name",
+          "type": "String",
+          "binding": "name"
+        },
+        {
+          "name": "definition",
+          "type": "Map<String,Object>",
+          "binding": "definition"
+        },
+        {
+          "name": "properties",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.delete.pattern",
+      "args": [
+        {
+          "name": "pattern",
+          "type": "Object",
+          "binding": "@Pattern:id"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.data",
+      "args": [
+        {
+          "name": "rootIds",
+          "type": "List<String>",
+          "binding": "rootIds"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.namespaceData",
+      "args": [
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.objectsByPattern",
+      "args": [
+        {
+          "name": "pattern",
+          "type": "Object",
+          "binding": "pattern"
+        },
+        {
+          "name": "values",
+          "type": "Map<String,Object>",
+          "binding": "values"
+        },
+        {
+          "name": "rules",
+          "type": "Map<String,Object>",
+          "binding": "rules"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.objectsByPatternPage",
+      "args": [
+        {
+          "name": "pattern",
+          "type": "Object",
+          "binding": "pattern"
+        },
+        {
+          "name": "values",
+          "type": "Map<String,Object>",
+          "binding": "values"
+        },
+        {
+          "name": "rules",
+          "type": "Map<String,Object>",
+          "binding": "rules"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.pattern",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Pattern"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.patternPage",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Object",
+          "binding": "?Pattern"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.load.data",
+      "args": [
+        {
+          "name": "resourceId",
+          "type": "String",
+          "binding": "resourceId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.import.analyze",
+      "args": [
+        {
+          "name": "source",
+          "type": "Object",
+          "binding": "source"
+        },
+        {
+          "name": "rules",
+          "type": "Map<String,Object>",
+          "binding": "rules"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.importPlan",
+      "args": [
+        {
+          "name": "planId",
+          "type": "String",
+          "binding": "planId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.import.apply",
+      "args": [
+        {
+          "name": "planId",
+          "type": "String",
+          "binding": "planId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.import.dataByPattern",
+      "args": [
+        {
+          "name": "pattern",
+          "type": "Object",
+          "binding": "pattern"
+        },
+        {
+          "name": "values",
+          "type": "Map<String,Object>",
+          "binding": "values"
+        },
+        {
+          "name": "rules",
+          "type": "Map<String,Object>",
+          "binding": "rules"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.import.namespaceData",
+      "args": [
+        {
+          "name": "packageResourceId",
+          "type": "String",
+          "binding": "packageResourceId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.import.rows",
+      "args": [
+        {
+          "name": "source",
+          "type": "Map<String,Object>",
+          "binding": "source"
+        },
+        {
+          "name": "targets",
+          "type": "Map<String,Object>",
+          "binding": "targets"
+        },
+        {
+          "name": "relationships",
+          "type": "List<Object>",
+          "binding": "relationships"
+        },
+        {
+          "name": "rules",
+          "type": "Map<String,Object>",
+          "binding": "rules"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.load.csv",
+      "args": [
+        {
+          "name": "resourceId",
+          "type": "String",
+          "binding": "resourceId"
+        },
+        {
+          "name": "formatOptions",
+          "type": "Map<String,Object>",
+          "binding": "formatOptions"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.load.xlsx",
+      "args": [
+        {
+          "name": "resourceId",
+          "type": "String",
+          "binding": "resourceId"
+        },
+        {
+          "name": "formatOptions",
+          "type": "Map<String,Object>",
+          "binding": "formatOptions"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.load.gpkg",
+      "args": [
+        {
+          "name": "resourceId",
+          "type": "String",
+          "binding": "resourceId"
+        },
+        {
+          "name": "formatOptions",
+          "type": "Map<String,Object>",
+          "binding": "formatOptions"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.table",
+      "args": [
+        {
+          "name": "tableId",
+          "type": "String",
+          "binding": "tableId"
+        }
+      ],
+      "columns": [
+        "data",
+        "columns",
+        "presence"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.tablePage",
+      "args": [
+        {
+          "name": "tableId",
+          "type": "String",
+          "binding": "tableId"
+        },
+        {
+          "name": "page",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.layout",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Map<String,Object>",
+          "binding": "selection"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "options"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.save.csv",
+      "args": [
+        {
+          "name": "source",
+          "type": "Map<String,Object>",
+          "binding": "source"
+        },
+        {
+          "name": "parameters",
+          "type": "Map<String,Object>",
+          "binding": "parameters"
+        },
+        {
+          "name": "formatOptions",
+          "type": "Map<String,Object>",
+          "binding": "formatOptions"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.save.xlsx",
+      "args": [
+        {
+          "name": "source",
+          "type": "Map<String,Object>",
+          "binding": "source"
+        },
+        {
+          "name": "parameters",
+          "type": "Map<String,Object>",
+          "binding": "parameters"
+        },
+        {
+          "name": "formatOptions",
+          "type": "Map<String,Object>",
+          "binding": "formatOptions"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.save.gpkg",
+      "args": [
+        {
+          "name": "source",
+          "type": "Map<String,Object>",
+          "binding": "source"
+        },
+        {
+          "name": "parameters",
+          "type": "Map<String,Object>",
+          "binding": "parameters"
+        },
+        {
+          "name": "formatOptions",
+          "type": "Map<String,Object>",
+          "binding": "formatOptions"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.save.data",
+      "args": [
+        {
+          "name": "selection",
+          "type": "Map<String,Object>",
+          "binding": "selection"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.set.pattern",
+      "args": [
+        {
+          "name": "pattern",
+          "type": "Object",
+          "binding": "@Pattern:id"
+        },
+        {
+          "name": "patch",
+          "type": "Map<String,Object>",
+          "binding": "+"
+        }
+      ],
+      "columns": [
+        "node"
+      ],
+      "mode": "WRITE",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": true,
+      "batch_exclusion": null,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.info",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "discovery",
+      "requires_token": false,
+      "action": false,
+      "batch_eligible": false,
+      "batch_exclusion": "discovery lifecycle route",
+      "invocation_owner": "Client"
+    }
+  ]
+}
