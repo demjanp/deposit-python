@@ -5,13 +5,20 @@ from __future__ import annotations
 import json
 from importlib.metadata import version as distribution_version
 from importlib.resources import files
-import re
 from pathlib import Path
 from typing import Any
 
 from neo4j import Driver
 from neo4j.exceptions import Neo4jError
 
+from ._gateway import (
+    bind_client_arguments,
+    build_query,
+    client_procedure,
+    map_driver_error,
+    prune_dry_run_procedure,
+    recovery_read_procedure,
+)
 from .errors import CompatibilityError, DepositError, TransportError
 from .recovery import PendingOperation, RecoveredOperation
 
@@ -54,21 +61,7 @@ class Client:
                 summary = consume() if consume is not None else None
                 return dict(record), summary
         except Neo4jError as exc:
-            code = getattr(exc, "code", "NEO4J_ERROR")
-            message = getattr(exc, "message", None) or "Deposit request failed"
-            details = None
-            request_id = None
-            envelope = re.search(r"\{[^\r\n]*\}", message)
-            if envelope:
-                try:
-                    value = json.loads(envelope.group(0))
-                    code = value.get("code", code)
-                    message = value.get("message", message)
-                    details = value.get("details")
-                    request_id = value.get("requestId")
-                except (TypeError, ValueError):
-                    pass
-            raise DepositError(code, message, details, request_id) from exc
+            raise map_driver_error(exc) from exc
         except DepositError:
             raise
         except Exception as exc:
@@ -142,6 +135,174 @@ class Client:
         """Revoke a Deposit session without closing a caller-owned driver."""
         self.discover()
         self._single("CYPHER 25 CALL deposit.utils.logout($token) YIELD value RETURN value", {"token": token})
+
+    def _invoke_client_procedure(self, procedure: str, token: str, *arguments: Any) -> Any:
+        entry = client_procedure(procedure)
+        bound = bind_client_arguments(entry, arguments)
+        query, parameters = build_query(entry, bound, token, portable=True)
+        self.discover()
+        record = self._single(query, parameters)
+        column = entry["columns"][0]
+        if column not in record:
+            raise DepositError("INVALID_RESPONSE", f"{procedure} returned no {column} result")
+        value = record[column]
+        if column in {"node", "rel"} and not isinstance(value, dict):
+            raise DepositError("INVALID_RESPONSE", f"{procedure} returned no portable entity")
+        return value
+
+    def _invoke_client_rows(self, procedure: str, token: str, *arguments: Any) -> tuple[dict[str, Any], ...]:
+        """Read portable entity rows, preserving zero/one/many cardinality."""
+        entry = client_procedure(procedure)
+        bound = bind_client_arguments(entry, arguments)
+        query, parameters = build_query(entry, bound, token, portable=True)
+        self.discover()
+        try:
+            with self._session() as session:
+                result = session.run(query, parameters)
+                column = entry["columns"][0]
+                rows = []
+                for record in result:
+                    if column not in record:
+                        raise DepositError("INVALID_RESPONSE", f"{procedure} returned no {column} result")
+                    value = record[column]
+                    if not isinstance(value, dict):
+                        raise DepositError("INVALID_RESPONSE", f"{procedure} returned no portable entity")
+                    rows.append(dict(value))
+                consume = getattr(result, "consume", None)
+                if consume is not None:
+                    consume()
+                return tuple(rows)
+        except Neo4jError as exc:
+            raise map_driver_error(exc) from exc
+        except DepositError:
+            raise
+        except Exception as exc:
+            raise TransportError("Neo4j request failed") from exc
+
+    def _invoke_recovery_read(self, procedure: str, token: str, *arguments: Any) -> Any:
+        entry = recovery_read_procedure(procedure)
+        bound = bind_client_arguments(entry, arguments)
+        query, parameters = build_query(entry, bound, token)
+        self.discover()
+        record = self._single(query, parameters)
+        column = entry["columns"][0]
+        if column not in record:
+            raise DepositError("INVALID_RESPONSE", f"{procedure} returned no {column} result")
+        return record[column]
+
+    def get_operation(self, token: str, operation_id: str, *, scope: str = "server") -> Any:
+        """Inspect a server operation without changing session selection."""
+        if not isinstance(scope, str) or scope not in {"server", "namespace"}:
+            raise ValueError("scope must be 'server' or 'namespace'")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        return self._invoke_recovery_read("deposit.get.operation", token, operation_id, scope)
+
+    def get_last_operation(self, token: str) -> Any:
+        """Return the last operation observed by this authenticated session."""
+        return self._invoke_recovery_read("deposit.get.lastOperation", token)
+
+    def get_active_namespace(self, token: str) -> dict[str, Any] | None:
+        """Return the active Namespace as portable data, or None if unselected."""
+        self.discover()
+        query = (
+            "CYPHER 25 CALL deposit.get.activeNamespace($token) YIELD node "
+            "CALL { WITH node WITH node WHERE node IS NOT NULL "
+            "CALL deposit.utils.toData(node, $token) YIELD data RETURN data "
+            "UNION ALL WITH node WITH node WHERE node IS NULL RETURN null AS data } "
+            "RETURN data"
+        )
+        data = self._single(query, {"token": token}).get("data")
+        if data is not None and not isinstance(data, dict):
+            raise DepositError("INVALID_RESPONSE", "Active Namespace lookup returned invalid data")
+        return dict(data) if isinstance(data, dict) else None
+
+    def set_active_namespace(self, token: str, namespace: Any = None) -> dict[str, Any]:
+        """Set and return the active Namespace as portable data."""
+        return self._invoke_client_procedure("deposit.set.activeNamespace", token, namespace)
+
+    def get_administrative_mode(self, token: str) -> Any:
+        """Return the authenticated session's administrative mode value."""
+        return self._invoke_client_procedure("deposit.get.administrativeMode", token)
+
+    def set_administrative_mode(self, token: str, enabled: bool) -> Any:
+        """Set and return the authenticated session's administrative mode value."""
+        return self._invoke_client_procedure("deposit.set.administrativeMode", token, enabled)
+
+    def get_user(self, token: str, selection: Any) -> Any:
+        """Read a user record using an explicit manifest-defined selector."""
+        if selection is None or (isinstance(selection, dict) and not selection):
+            raise ValueError("selection must identify one user; use get_users for unfiltered results")
+        return self._invoke_client_procedure("deposit.get.user", token, selection)
+
+    def get_users(self, token: str, selection: Any = None) -> tuple[dict[str, Any], ...]:
+        """Read zero or more selected users as detached portable dictionaries."""
+        return self._invoke_client_rows("deposit.get.user", token, selection)
+
+    def get_user_page(self, token: str, selection: Any = None, page: dict[str, Any] | None = None) -> Any:
+        """Read a page of user records."""
+        return self._invoke_client_procedure(
+            "deposit.get.userPage", token, selection, {} if page is None else page
+        )
+
+    def get_namespace(self, token: str, selection: Any) -> dict[str, Any]:
+        """Read a Namespace using an explicit selector as portable data."""
+        if selection is None or (isinstance(selection, dict) and not selection):
+            raise ValueError("selection must identify one Namespace; use get_namespaces for unfiltered results")
+        return self._invoke_client_procedure("deposit.get.namespace", token, selection)
+
+    def get_namespaces(self, token: str, selection: Any = None) -> tuple[dict[str, Any], ...]:
+        """Read zero or more selected Namespaces as detached portable dictionaries."""
+        return self._invoke_client_rows("deposit.get.namespace", token, selection)
+
+    def get_namespace_page(
+        self, token: str, selection: Any = None, page: dict[str, Any] | None = None
+    ) -> Any:
+        """Read a page of Namespace records."""
+        return self._invoke_client_procedure(
+            "deposit.get.namespacePage", token, selection, {} if page is None else page
+        )
+
+    def prune_resources_status(self, token: str, prune_id: str) -> Any:
+        """Read status for an existing resource-pruning operation."""
+        return self._invoke_client_procedure("deposit.admin.pruneResourcesStatus", token, prune_id)
+
+    def prune_resources(self, token: str, options: dict[str, Any]) -> Any:
+        """Inspect resource pruning without starting an execution action.
+
+        Stage 3 exposes only the server-authorized dry-run branch. Executing
+        pruning remains deferred until Client-owned action recovery is designed.
+        """
+        entry = prune_dry_run_procedure(options)
+        bound = bind_client_arguments(entry, (options,))
+        query, parameters = build_query(entry, bound, token)
+        self.discover()
+        record = self._single(query, parameters)
+        value = record.get("data")
+        if not isinstance(value, dict):
+            raise DepositError("INVALID_RESPONSE", "Resource-pruning dry run returned no data")
+        return value
+
+    def coordinates_to_wkt(
+        self,
+        token: str,
+        geometry_type: str,
+        coordinates: Any,
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Convert coordinates to WKT using the server's geometry rules."""
+        return self._invoke_client_procedure(
+            "deposit.utils.coordinatesToWKT", token, geometry_type, coordinates,
+            {} if options is None else options,
+        )
+
+    def wkt_to_coordinates(
+        self, token: str, wkt: str, options: dict[str, Any] | None = None
+    ) -> Any:
+        """Convert WKT to coordinates using the server's geometry rules."""
+        return self._invoke_client_procedure(
+            "deposit.utils.wktToCoordinates", token, wkt, {} if options is None else options
+        )
 
     def open_store(
         self,

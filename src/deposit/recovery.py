@@ -7,6 +7,8 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from ._recovery.journal import RESULT_FORMAT_NAMED_ROWS_V1, valid_named_rows_result
+
 
 @dataclass(frozen=True, slots=True)
 class PendingOperation:
@@ -43,12 +45,17 @@ def pending_operation(record: dict[str, Any]) -> PendingOperation:
 def recovered_operation(record: dict[str, Any]) -> RecoveredOperation:
     if record["state"] != "released" or record["resolved_at"] is None:
         raise ValueError("Only released operations have a recovered result")
+    result = record["outcome"]
+    result_format = record.get("result_format")
+    if result_format is not None:
+        if result_format != RESULT_FORMAT_NAMED_ROWS_V1 or not valid_named_rows_result(result):
+            raise ValueError("Advanced recovered operation has an invalid named result")
     return RecoveredOperation(
         id=record["public_id"],
         procedure=record["procedure"],
         namespace_id=record["identity"]["namespace_id"],
         completed_at=datetime.fromisoformat(record["resolved_at"]),
-        result=_freeze(record["outcome"]),
+        result=_freeze(result),
     )
 
 

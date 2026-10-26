@@ -68,9 +68,13 @@ Recompute this inventory against the selected server snapshot in Stage 1.
 6. Ordinary methods detach values/records or return stable-ID handles. Advanced
    calls expose actual named columns in closable results; native values remain
    inside their transaction lifetime. Both paths enforce the same safeguards.
-7. Public portable conversion and declaration reads share a checked snapshot.
-   Never decode native private properties. Polling/reads do not advance existing
-   edit baselines. Conflicts retain user inputs and require explicit refresh/reapply.
+7. Public portable conversion and declaration reads remain in the owning checked
+   transaction and reapply server scope/authorization checks. Native Node and
+   Relationship conversion uses a parameterized element-ID match; Paths are not
+   convertible. Neo4j read-committed isolation does not promise a frozen snapshot
+   across concurrent commits. Never decode native private properties. Polling/reads
+   do not advance existing edit baselines. Conflicts retain user inputs and require
+   explicit refresh/reapply.
 8. Every action requiring preparation is classified from explicit server metadata,
    including operational exports/analysis. Persist immutable exact arguments and
    identity bindings before preparation. Persist resolved portable results before
@@ -342,8 +346,22 @@ and action recovery seed/transition/verifier when the harness boundary changes.
 
 ## Stage 3 - Complete procedure gateway and controlled advanced access
 
-**Dependency:** Stage 2. **Outcome:** every public server procedure has a supported
-route, with correct binding, scope, output lifetime and recovery classification.
+**Dependency:** Stage 2. **Outcome:** every non-deferred public server procedure has
+a supported route, with correct binding, scope, output lifetime and recovery
+classification. The explicit deferrals below remain pending and are not counted as
+implemented routes.
+
+**Approved scope decisions for this run:** durable recovery for Client-owned
+`action=true` server-scope mutations is deferred until a separate server-scope
+identity design is approved. This covers `deposit.create.user`,
+`deposit.create.namespace`, `deposit.set.user`, `deposit.set.password`,
+`deposit.delete.namespace` and `deposit.import.namespaceData`; do not use a fake or
+anchor Namespace to route them. For `deposit.admin.pruneResources`, allow a direct
+call only when `dryRun` is explicitly true. Defer execution for both Namespace and
+server-wide scopes. Preserve read-only `pruneResourcesStatus` support.
+For Client reads, require explicit selectors on singular `get_user` and
+`get_namespace`; add `get_users` and `get_namespaces`, which always return tuples
+for zero, one or many selected rows.
 
 Ordered work:
 
@@ -357,12 +375,15 @@ Ordered work:
    must cooperate with coordinator state. Do not require every public procedure
    to appear as an unrestricted `Store.call` method to claim coverage.
    Include argument-dependent classification: prune dry runs cannot be prepared;
-   executing prunes can be. Release detaches rather than deletes durable server
+   executing prunes are rejected before network access under the approved scope
+   decision. Release detaches rather than deletes durable server
    preparation records. Selection and session/action controls use separate transactions.
 3. Implement named-column closable advanced results, native lifetime checks,
    portable conversion in the owning transaction and deterministic exhaustion/
    exception/early-close cleanup. Retain multi-column query and `canUndo` shapes,
    empty rows/pages and actual column names; never invent generic metadata columns.
+   Convert only owned native Nodes/Relationships through parameterized `elementId`
+   matches on the same transaction; reject Paths and preserve server authorization.
 4. Complete safe server error mapping with diagnostic request IDs, unknown driver
    errors and bounded diagnostics. Implement authorized request listing/cancellation
    through the parallel control path and explicit administrative-mode lifecycle.
@@ -374,18 +395,22 @@ Acceptance:
 
 - **3A:** Every catalog entry plus discovery has exact binding, owner, named output,
   scope, recovery and batch policy tests; additions/removals fail parity checks.
-  Assert prune dry-run/executing branches and operational analysis/export actions.
+  Assert prune dry-run and both deferred execution branches, plus operational
+  analysis/export actions.
 - **3B:** Real family representatives verify token-free discovery, pre-binding and
   scoped routing, parameter order, empty results, safe errors and permission denial.
   Both convenience and advanced calls use the same protection and journal paths.
-- **3C:** Advanced results preserve real columns and native lifetime; early close,
+- **3C:** Advanced results preserve real columns and native lifetime; Node and
+  dynamically typed Relationship conversion, Path rejection, early close,
   conversion failure, iteration failure and Store close release transactions and
-  readers. No native result is usable outside its valid lifetime.
+  readers. Conversion uses the owning transaction and server authorization; no
+  native result is usable outside its valid lifetime.
 - **3D:** Cancellation reaches an active long-running request while the Store is
   busy, respects actor permissions and resolves ambiguous action completion.
   Administrative mode is explicit and isolated per session.
 - **3E:** Coverage ledger lists each specialized unverified scenario, its owning
-  later stage and test target; no procedure lacks a supported invocation path.
+  later stage and test target. Every non-deferred procedure has a supported path;
+  the approved deferred action procedures remain explicitly listed as pending.
 
 **Gate:** runner `-Stage 3`; all-entry parity/binding tests and installed live
 family representatives. Include relevant server authorization/cancellation/replay

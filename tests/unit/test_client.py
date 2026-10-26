@@ -9,11 +9,27 @@ import threading
 from collections.abc import Mapping
 
 import pytest
+from neo4j.exceptions import Neo4jError
 
 from deposit import Client, CompatibilityError, DepositError, TransportError
-from deposit.recovery import PendingOperation
+from deposit.recovery import PendingOperation, RecoveredOperation
 from deposit._recovery.identity import DeploymentIdentity
 from deposit._recovery.journal import ProtectedJournal
+
+
+class _EncodedNeo4jError(Neo4jError):
+    def __init__(self, message, code="Neo.ClientError.Procedure.ProcedureCallFailed"):
+        super().__init__()
+        self._test_message = message
+        self._test_code = code
+
+    @property
+    def message(self):
+        return self._test_message
+
+    @property
+    def code(self):
+        return self._test_code
 
 
 class _Record(dict):
@@ -29,6 +45,9 @@ class _Result:
             raise ValueError("Expected exactly one record")
         return self.records[0] if self.records else None
 
+    def __iter__(self):
+        return iter(self.records)
+
 
 class _Session:
     def __init__(self, driver):
@@ -43,6 +62,8 @@ class _Session:
     def run(self, query, parameters):
         self.driver.calls.append((query, parameters))
         records = self.driver.responses.pop(0)
+        if isinstance(records, Exception):
+            raise records
         if "dbms.components()" in query and isinstance(records, list):
             records = [
                 _Record(version=record["versions"][0])
@@ -112,6 +133,284 @@ def test_discovery_login_session_logout_and_driver_ownership():
     assert login_call[1] == {"username": "alice", "password": "correct-horse"}
 
 
+def test_client_manifest_gateway_binds_allowlisted_non_action_calls_and_converts_native_values():
+    client_methods = [
+        ("set_active_namespace", (), "deposit.set.activeNamespace", (None,), "node", {"id": "active-id"}),
+        ("set_active_namespace", ({"id": "target-id"},), "deposit.set.activeNamespace", ({"id": "target-id"},), "node", {"id": "target-id"}),
+        ("get_administrative_mode", (), "deposit.get.administrativeMode", (), "value", True),
+        ("set_administrative_mode", (False,), "deposit.set.administrativeMode", (False,), "value", False),
+        ("get_user", ({"userId": "alice-id"},), "deposit.get.user", ({"userId": "alice-id"},), "data", {"username": "alice"}),
+        ("get_user_page", (), "deposit.get.userPage", (None, {}), "data", {"items": []}),
+        ("get_namespace", ("Research",), "deposit.get.namespace", ("Research",), "node", {"id": "ns-id"}),
+        ("get_namespace_page", (None, {"limit": 10}), "deposit.get.namespacePage", (None, {"limit": 10}), "data", {"items": []}),
+        ("prune_resources_status", ("prune-id",), "deposit.admin.pruneResourcesStatus", ("prune-id",), "data", {"state": "complete"}),
+        ("coordinates_to_wkt", ("Point", [1, 2]), "deposit.utils.coordinatesToWKT", ("Point", [1, 2], {}), "data", {"wkt": "POINT (1 2)"}),
+        ("wkt_to_coordinates", ("POINT (1 2)",), "deposit.utils.wktToCoordinates", ("POINT (1 2)", {}), "data", {"coordinates": [1, 2]}),
+    ]
+    responses = []
+    for _, _, _, _, column, result in client_methods:
+        responses.append(_Record(**{column: result}))
+    driver = _Driver(responses)
+    client = Client(driver)
+    client.discover = lambda: {"version": "tested"}
+
+    for method_name, call_args, procedure, bound_args, column, result in client_methods:
+        assert getattr(client, method_name)("session-token", *call_args) == result
+        query, parameters = driver.calls[-1]
+        expected_arguments = {
+            **{f"a{index}": value for index, value in enumerate(bound_args)},
+            "token": "session-token",
+        }
+        assert procedure in query
+        assert query.endswith(f"RETURN {column}")
+        assert parameters == expected_arguments
+        if column == "node":
+            assert "CALL deposit.utils.toData(node, $token)" in query
+            assert "YIELD data AS __deposit_portable_node" in query
+
+
+def test_get_active_namespace_preserves_legitimate_absence_without_to_data_null():
+    driver = _Driver([_Record(data=None)])
+    client = Client(driver)
+    client.discover = lambda: {"version": "tested"}
+
+    assert client.get_active_namespace("session-token") is None
+    query, parameters = driver.calls[-1]
+    assert "WHERE node IS NOT NULL" in query
+    assert "WHERE node IS NULL RETURN null AS data" in query
+    assert "CALL deposit.utils.toData(node, $token)" in query
+    assert parameters == {"token": "session-token"}
+
+
+@pytest.mark.parametrize("method,procedure", [("get_user", "deposit.get.user"), ("get_namespace", "deposit.get.namespace")])
+def test_entity_singular_methods_require_an_explicit_selector(method, procedure):
+    client = Client(_Driver([]))
+    with pytest.raises(TypeError):
+        getattr(client, method)("session-token")
+    with pytest.raises(ValueError, match="selection must identify"):
+        getattr(client, method)("session-token", None)
+    with pytest.raises(ValueError, match="selection must identify"):
+        getattr(client, method)("session-token", {})
+    assert client._driver.calls == []
+
+
+@pytest.mark.parametrize(
+    "method,procedure,column",
+    [("get_users", "deposit.get.user", "data"), ("get_namespaces", "deposit.get.namespace", "node")],
+)
+@pytest.mark.parametrize("rows", [[], [{"id": "one"}], [{"id": "one"}, {"id": "two"}]])
+def test_entity_plural_methods_preserve_cardinality_and_detach_dicts(method, procedure, column, rows):
+    driver = _Driver([[_Record(**{column: row}) for row in rows]])
+    client = Client(driver)
+    client.discover = lambda: {"version": "tested"}
+
+    result = getattr(client, method)("session-token")
+    assert result == tuple(rows)
+    assert isinstance(result, tuple)
+    if result:
+        assert result[0] is not rows[0]
+        result[0]["changed"] = True
+        assert "changed" not in rows[0]
+    query, parameters = driver.calls[-1]
+    assert procedure in query and "RETURN " + column in query
+    assert parameters == {"a0": None, "token": "session-token"}
+
+
+def test_client_manifest_gateway_rejects_actions_and_unreviewed_routes_before_network():
+    from deposit._gateway import client_procedure
+
+    client = Client(_Driver([]))
+    for procedure in (
+        "deposit.create.user",
+        "deposit.set.user",
+        "deposit.delete.namespace",
+        "deposit.import.namespaceData",
+        "deposit.admin.pruneResources",
+        "deposit.get.info",
+        "deposit.get.session",
+        "deposit.utils.login",
+        "deposit.notReviewed",
+    ):
+        with pytest.raises(ValueError, match="allowlisted Client procedure"):
+            client_procedure(procedure)
+        with pytest.raises(ValueError, match="allowlisted Client procedure"):
+            client._invoke_client_procedure(procedure, "session-token")
+    with pytest.raises(TypeError, match="missing required argument 'pruneId'"):
+        client._invoke_client_procedure("deposit.admin.pruneResourcesStatus", "session-token")
+    assert client._driver.calls == []
+
+
+def test_client_prune_resources_allows_only_direct_dry_run():
+    from deposit._gateway import prune_dry_run_procedure
+
+    driver = _Driver([_Record(data={"dryRun": True, "resources": []})])
+    client = Client(driver)
+    client.discover = lambda: {"version": "tested"}
+
+    assert client.prune_resources("session-token", {"dryRun": True, "scope": "all"}) == {
+        "dryRun": True,
+        "resources": [],
+    }
+    query, parameters = driver.calls[-1]
+    assert "CALL deposit.admin.pruneResources($a0, $token) YIELD data RETURN data" in query
+    assert "deposit.action.prepare" not in query
+    assert parameters == {"a0": {"dryRun": True, "scope": "all"}, "token": "session-token"}
+    assert prune_dry_run_procedure({"dryRun": True})["scope"] == "prune"
+
+    previous_count = len(driver.calls)
+    with pytest.raises(DepositError, match="Prune execution is deferred"):
+        client.prune_resources("session-token", {"dryRun": False})
+    with pytest.raises(DepositError, match="Prune execution is deferred"):
+        client.prune_resources("session-token", {})
+    assert len(driver.calls) == previous_count
+
+
+def test_driver_error_mapping_exposes_only_structured_server_errors():
+    from deposit._gateway import map_driver_error
+    request_id = "9cd08e5a-7ad5-4b0c-9e58-50de7e0412bc"
+
+    safe = _EncodedNeo4jError(
+        'DEPOSIT_ERROR {"code":"VALIDATION_FAILED","message":"Invalid option",'
+        f'"requestId":"{request_id}","retryable":false,"details":{{"field":"options"}}}}'
+    )
+    mapped = map_driver_error(safe)
+    assert isinstance(mapped, DepositError)
+    assert mapped.code == "VALIDATION_FAILED"
+    assert mapped.message == "Invalid option"
+    assert mapped.request_id == request_id
+    assert mapped.details == {"field": "options"}
+
+    raw = _EncodedNeo4jError("Syntax error near private query text")
+    transport = map_driver_error(raw)
+    assert isinstance(transport, TransportError)
+    assert "private query text" not in str(transport)
+
+
+def test_driver_error_mapping_accepts_only_the_deposit_procedure_wrapper():
+    from deposit._gateway import map_driver_error
+
+    request_id = "9cd08e5a-7ad5-4b0c-9e58-50de7e0412bc"
+    payload = (
+        '{"code":"AUTH_FAILED","details":{},"message":"Invalid credentials",'
+        f'"requestId":"{request_id}","retryable":false}}'
+    )
+    wrapped = _EncodedNeo4jError(
+        "Failed to invoke procedure `deposit.utils.login`: Caused by: "
+        "deposit.common.ExceptionHandler$DepositException: DEPOSIT_ERROR " + payload
+    )
+    mapped = map_driver_error(wrapped)
+    assert isinstance(mapped, DepositError)
+    assert mapped.code == "AUTH_FAILED"
+    assert mapped.message == "Invalid credentials"
+    assert mapped.request_id == request_id
+
+    rejected = (
+        _EncodedNeo4jError(
+            "Failed to invoke procedure `deposit.utils.login`: Caused by: "
+            "foreign.Exception: DEPOSIT_ERROR " + payload
+        ),
+        _EncodedNeo4jError(
+            "Failed to invoke procedure `deposit.notRegistered`: Caused by: "
+            "deposit.common.ExceptionHandler$DepositException: DEPOSIT_ERROR " + payload
+        ),
+        _EncodedNeo4jError(
+            "Driver diagnostic containing DEPOSIT_ERROR " + payload
+        ),
+        _EncodedNeo4jError(
+            "Failed to invoke procedure `deposit.utils.login`: Caused by: "
+            "deposit.common.ExceptionHandler$DepositException: DEPOSIT_ERROR "
+            + payload + " trailing text"
+        ),
+        _EncodedNeo4jError(
+            "Failed to invoke procedure `deposit.utils.login`: Caused by: "
+            "deposit.common.ExceptionHandler$DepositException: DEPOSIT_ERROR " + payload,
+            code="Neo.ClientError.Statement.SyntaxError",
+        ),
+    )
+    for error in rejected:
+        assert isinstance(map_driver_error(error), TransportError)
+
+
+def test_driver_error_mapping_requires_bounded_exact_server_envelope():
+    from deposit._gateway import map_driver_error
+
+    valid_id = "9cd08e5a-7ad5-4b0c-9e58-50de7e0412bc"
+    envelope = (
+        '{{"code":"VALIDATION_FAILED","message":"{message}","requestId":"{request_id}",'
+        '"retryable":false,"details":{details}}}'
+    )
+    oversized_details = "{" + '"value":"' + ("x" * 17000) + '"}'
+    safe = map_driver_error(_EncodedNeo4jError(
+        "DEPOSIT_ERROR " + envelope.format(message="m" * 3000, request_id="invalid", details=oversized_details)
+    ))
+    assert isinstance(safe, DepositError)
+    assert len(safe.message) == 2048 and safe.message.endswith("...")
+    assert safe.request_id is None
+    assert safe.details is None
+
+    not_envelope = map_driver_error(_EncodedNeo4jError(
+        'Driver text {"code":"INJECTED","message":"wrong source"}'
+    ))
+    invalid_shape = map_driver_error(_EncodedNeo4jError(
+        'DEPOSIT_ERROR {"code":"VALIDATION_FAILED","message":"Bad",'
+        f'"requestId":"{valid_id}","details":{{}}}}'
+    ))
+    invalid_code = map_driver_error(_EncodedNeo4jError(
+        'DEPOSIT_ERROR {"code":"bad code","message":"Bad",'
+        f'"requestId":"{valid_id}","retryable":false,"details":null}}'
+    ))
+    huge_raw = map_driver_error(_EncodedNeo4jError("DEPOSIT_ERROR " + (" " * (64 * 1024))))
+    for value in (not_envelope, invalid_shape, invalid_code, huge_raw):
+        assert isinstance(value, TransportError)
+
+
+def test_operation_inspection_uses_only_narrow_recovery_reads_and_preserves_payloads():
+    operation = {"operationId": "operation-1", "state": "committed", "outcome": None, "extra": {"value": 3}}
+    last = {"operationId": None, "state": "none", "outcome": None, "scope": None}
+    driver = _Driver([_Record(data=operation), _Record(data=operation), _Record(data=last)])
+    client = Client(driver)
+    client.discover = lambda: {"version": "tested"}
+
+    assert client.get_operation("session-token", "operation-1", scope="server") == operation
+    assert client.get_operation("session-token", "operation-1", scope="namespace") == operation
+    assert client.get_last_operation("session-token") == last
+    assert driver.calls == [
+        (
+            "CYPHER 25 CALL deposit.get.operation($a0, $a1, $token) YIELD data RETURN data",
+            {"a0": "operation-1", "a1": "server", "token": "session-token"},
+        ),
+        (
+            "CYPHER 25 CALL deposit.get.operation($a0, $a1, $token) YIELD data RETURN data",
+            {"a0": "operation-1", "a1": "namespace", "token": "session-token"},
+        ),
+        (
+            "CYPHER 25 CALL deposit.get.lastOperation($token) YIELD data RETURN data",
+            {"token": "session-token"},
+        ),
+    ]
+    assert all("deposit.action." not in query for query, _ in driver.calls)
+
+
+def test_operation_inspection_rejects_invalid_scope_before_network_and_propagates_authorization():
+    client = Client(_Driver([]))
+    client.discover = lambda: {"version": "tested"}
+    with pytest.raises(ValueError, match="scope must"):
+        client.get_operation("session-token", "operation-1", scope="active")
+    with pytest.raises(ValueError, match="operation_id"):
+        client.get_operation("session-token", "")
+    assert client._driver.calls == []
+
+    denied = _EncodedNeo4jError(
+        'DEPOSIT_ERROR {"code":"ACCESS_DENIED","message":"Not authorized",'
+        '"requestId":null,"retryable":false,"details":null}'
+    )
+    denied_client = Client(_Driver([denied]))
+    denied_client.discover = lambda: {"version": "tested"}
+    with pytest.raises(DepositError) as error:
+        denied_client.get_operation("session-token", "operation-1", scope="namespace")
+    assert error.value.code == "ACCESS_DENIED"
+
+
 def test_unsupported_server_fails_before_login_call():
     driver = _Driver([_Record(data={"version": "1.9.0"})])
     with pytest.raises(CompatibilityError):
@@ -171,27 +470,88 @@ def test_public_recovery_references_hide_internal_keys_and_freeze_results(monkey
         pending[0].state = "released"
 
     backing.update(identity, record["key"], state="prepare_sent")
-    portable_outcome = {"id": "safe", "nested": {"items": [1, 2]}}
+    assert "result_format" not in record  # Existing v1 pending records remain legacy.
+    portable_outcome = {
+        "__deposit_gateway_result__": {"ordinary": [1, {"value": "caller data"}]},
+        "nested": {"items": [1, 2]},
+    }
     backing.update(identity, record["key"], state="outcome_saved", outcome=portable_outcome)
     backing.update(identity, record["key"], state="released")
     persisted = backing.load(identity, record["key"])["outcome"]
     assert persisted == portable_outcome
     assert isinstance(persisted["nested"]["items"], list)
     recovered = client.recovered_operations(recovery_directory="custom-root")
-    assert len(recovered) == 1 and recovered[0].result["id"] == "safe"
+    assert len(recovered) == 1 and isinstance(recovered[0], RecoveredOperation)
+    assert recovered[0].result["__deposit_gateway_result__"]["ordinary"][1]["value"] == "caller data"
     assert isinstance(recovered[0].result, Mapping)
-    assert isinstance(recovered[0].result["nested"], Mapping)
     assert recovered[0].result["nested"]["items"] == (1, 2)
     with pytest.raises(TypeError):
-        recovered[0].result["id"] = "changed"
-    with pytest.raises(TypeError):
         recovered[0].result["nested"]["new"] = True
+    with pytest.raises(TypeError):
+        recovered[0].result["__deposit_gateway_result__"]["ordinary"][1]["new"] = True
     with pytest.raises(AttributeError):
         recovered[0].result["nested"]["items"].append(3)
     repeated = client.recovered_operations(recovery_directory="custom-root")
     assert repeated == recovered
     assert repeated[0].result["nested"]["items"] == (1, 2)
     assert client.pending_operations(recovery_directory="custom-root") == ()
+
+
+def test_advanced_recovered_result_has_immutable_columns_and_rows_without_internal_wrapper(monkeypatch):
+    from deposit._recovery import journal as journal_module
+
+    class MemoryStorage:
+        def __init__(self):
+            self.records = {}
+            self.guard = threading.RLock()
+        @contextmanager
+        def lock(self, name="journal", *, timeout=0):
+            with self.guard:
+                yield self
+        def write(self, name, value): self.records[name] = bytes(value)
+        def read(self, name): return self.records[name]
+        def list_records(self): return tuple(sorted(self.records))
+        def delete(self, name): self.records.pop(name, None)
+
+    from deposit._recovery.journal import RESULT_FORMAT_NAMED_ROWS_V1
+
+    memory = MemoryStorage()
+    backing = ProtectedJournal(store=memory)
+    identity = DeploymentIdentity(1, "db.example:7687", "neo4j", "db-id", "dbms-id", "actor-id", "ns-id")
+    record = backing.create(
+        identity,
+        "deposit.get.query",
+        ["RETURN 1", {}, {}],
+        7,
+        result_format=RESULT_FORMAT_NAMED_ROWS_V1,
+    )
+    monkeypatch.setattr(journal_module, "ProtectedJournal", lambda root=None: ProtectedJournal(store=memory))
+    backing.update(identity, record["key"], state="prepare_sent")
+    outcome = {
+        "columns": ["data", "presence"],
+        "rows": [
+            {"data": {"items": [1, {"nested": [True, None]}]}, "presence": True},
+            {"data": {"items": []}, "presence": False},
+        ],
+    }
+    backing.update(identity, record["key"], state="outcome_saved", outcome=outcome)
+    backing.update(identity, record["key"], state="released")
+    client = Client(_Driver([]))
+
+    recovered = client.recovered_operations(recovery_directory="custom-root")
+    assert len(recovered) == 1 and isinstance(recovered[0], RecoveredOperation)
+    assert recovered[0].result == {
+        "columns": ("data", "presence"),
+        "rows": (
+            {"data": {"items": (1, {"nested": (True, None)})}, "presence": True},
+            {"data": {"items": ()}, "presence": False},
+        ),
+    }
+    assert isinstance(recovered[0].result, Mapping)
+    with pytest.raises(TypeError):
+        recovered[0].result["columns"] = ()
+    with pytest.raises(TypeError):
+        recovered[0].result["rows"][0]["data"]["items"][1]["nested"][0] = False
 
 
 def test_client_recovers_completed_namespace_deletion_from_original_receipt(monkeypatch):

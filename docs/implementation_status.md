@@ -23,7 +23,7 @@ acceptance.
 | --- | --- | --- | --- | --- | --- |
 | 1 | Contracts, package and live test infrastructure | Finalized | 1A-1E complete | Foundation gate passed; independent architect PASS, no blocking findings | All three Stage 1 commits verified; commit IDs recorded below |
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
-| 3 | Complete procedure gateway | Not started | 3A-3E pending | Not run / no implementation review | No stage commits |
+| 3 | Complete procedure gateway | Verified and reviewed (finalization pending) | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub commits pending |
 | 4 | Typed domain, queries and batches | Not started | 4A-4E pending | Not run / no implementation review | No stage commits |
 | 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
@@ -264,3 +264,73 @@ Tracker update state: Finalized. Separate Stage 2 implementation commits:
 
 The final Stage 2 tracker-state follow-up is a separate Python commit; its commit
 ID is recorded in the local project-run checkpoint and Git history.
+
+### Stage 3 / `deposit-python-20261025-01` / verified and reviewed
+
+Scope and prerequisites checked: Stage 2 finalized in all three repositories.
+Stage 3 uses manifest-backed Client/Store routes and explicitly preserves the
+approved deferrals for durable Client server-scope action recovery and
+`deposit.admin.pruneResources` execution at both scopes. Client singular
+`get_user` and `get_namespace` require explicit nonempty selectors; plural
+`get_users` and `get_namespaces` return detached dictionary tuples for zero,
+one or multiple rows.
+
+Implemented: the Python gateway handles safe binding, token placement, Client
+and Store ownership, recovery classifications, named results, native value
+lifetime and authorized request controls. StoreResult prevents access to its
+native graph container, checks iterator lifetime on advancement and detaches
+lazy property views. The Client handles a missing active Namespace without
+calling `toData` on null. The procedure ledger now maps all 124 manifest rows to
+dispatch, supported behavior, executed evidence and a later-stage specialized
+test target. The server acceptance scripts use the clean tagged source/build
+bundle route. Hub documentation records the accepted recovery and collection
+read APIs. Three existing server runtime POM edits were preserved as unrelated.
+
+Acceptance ID -> evidence:
+
+- **3A:** manifest parity and explicit route/classification/deferral policy
+  tests cover all 124 declarations; `test_gateway_policy.py` passed 47 tests in
+  both wheel and sdist.
+- **3B:** explicit singular selectors and zero/one/many tuple behavior are
+  covered by eight focused API assertions. Installed Gateway Seed/Verify also
+  exercised Client routing and Store representatives, safe permission denial,
+  dry-run pruning, export and import analysis.
+- **3C:** native lifetime, early close, conversion, iterator and Path behavior
+  passed the wheel/sdist gateway selections. Live Node and Relationship
+  conversion used the owning transaction and Store token.
+- **3D:** installed live request listing and active cancellation verified actor
+  denial, authorized cancellation and request disappearance; Stage 2 restart
+  recovery remains covered by its finalized Restart/KillRestart gates.
+- **3E:** all manifest rows identify supported routes, actual Stage 3 evidence
+  and specialized later-stage targets; approved action deferrals remain
+  explicitly pending.
+
+Exact cumulative command: `Invoke-PythonTests.ps1 -Stage 3 -Group gateway`
+using the verified clean Deposit Server `2.0.0-dev.77` bundle from tag
+`c1489c18b72c4a98d8bfb46a3926fe8195b3e2e6`. Run
+`20261026T214740608Z-6a36ef3f`, Python 3.14.4, 23 commands, all exit 0 with no
+timeouts. Wheel/sdist: package 42 each, core 94 each, gateway 47 each; wheel
+manifest 3, storage 14 and identity 6. Owner-managed live run
+`20261026T214902605Z-b04be0db`: Gateway Seed 3 passed / 2 skipped; Verify after
+server restart 5 passed. Result JSON SHA-256
+`93C78C061FA17D51A04662F6236A3F68CE2968A36A562BA58109BBB66AD4AE16` is at
+`../test_harness/results/python-20261026T214740608Z-6a36ef3f/results.json`;
+live logs are at `../test_harness/results/20261026T214902605Z-b04be0db/`.
+
+Failure/correction record: an exploratory direct unit run reported 46 passed
+and one Windows ACL setup failure because the current workspace exposes extra
+principals; the owner-managed full wheel/sdist gate passed the complete package,
+core and gateway selections. Earlier live gate failures and their corrections
+are recorded in `tests/acceptance_map.md`. The live harness reached terminal
+cleanup; all eight specifically identified stale `runner-probe-*` directories
+were already absent and remain absent.
+
+Independent architect review: PASS, no blocking findings, against the current
+Python, server and hub diffs. Follow-up read-only review confirmed the ledger's
+21 live evidence references use the final live run and distinguish it from the
+cumulative Python gate. The architect inspected retained evidence and did not
+rerun tests. Shared hub contract consistency was reviewed with the accepted
+selector/cardinality API and recovery deferrals.
+
+Tracker update state: verified and reviewed; stage commits pending in Python,
+server and hub. Commit IDs will be recorded after the separate Stage 3 commits.

@@ -18,6 +18,7 @@ from .storage import ProtectedStorageError, ProtectedStore
 
 
 FORMAT_VERSION = 1
+RESULT_FORMAT_NAMED_ROWS_V1 = "named_rows_v1"
 MAX_UNRESOLVED = 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 MAX_USER_BYTES = 1024 * 1024 * 1024
@@ -108,7 +109,13 @@ class ProtectedJournal:
         procedure: str,
         arguments: list[Any],
         snapshot_revision: int,
+        *,
+        result_format: str | None = None,
     ) -> dict[str, Any]:
+        if result_format is not None and (
+            type(result_format) is not str or result_format != RESULT_FORMAT_NAMED_ROWS_V1
+        ):
+            raise JournalError("Recovery result format is unsupported")
         key = str(uuid.uuid4())
         now = _utc_now()
         record = {
@@ -126,6 +133,8 @@ class ProtectedJournal:
             "operation_id": None,
             "resolved_at": None,
         }
+        if result_format is not None:
+            record["result_format"] = result_format
         self._write(record, creating=True)
         return record
 
@@ -147,6 +156,10 @@ class ProtectedJournal:
 
     def update(self, identity: DeploymentIdentity, key: str, **changes: Any) -> dict[str, Any]:
         record = self.load(identity, key)
+        if set(changes) - set(record):
+            raise JournalError("Recovery journal update contains unsupported fields")
+        if "result_format" in changes:
+            raise JournalError("Recovery result format metadata is immutable")
         next_state = changes.get("state", record["state"])
         if next_state != record["state"] and next_state not in _TRANSITIONS[record["state"]]:
             raise JournalError(f"Invalid recovery transition {record['state']} -> {next_state}")
@@ -154,6 +167,7 @@ class ProtectedJournal:
         record["updated_at"] = _utc_now()
         if next_state == "released" and record["resolved_at"] is None:
             record["resolved_at"] = record["updated_at"]
+        self._validate(record, identity, key)
         self._write(record)
         return record
 
@@ -329,7 +343,13 @@ class ProtectedJournal:
             "format_version", "key", "public_id", "identity", "procedure", "arguments", "snapshot_revision",
             "state", "created_at", "updated_at", "outcome", "operation_id", "resolved_at",
         }
-        if not isinstance(record, dict) or set(record) != required:
+        allowed = required | {"result_format"}
+        if not isinstance(record, dict) or not required <= set(record) or set(record) - allowed:
+            raise JournalError("Recovery journal record has an unsupported format")
+        if "result_format" in record and (
+            type(record["result_format"]) is not str
+            or record["result_format"] != RESULT_FORMAT_NAMED_ROWS_V1
+        ):
             raise JournalError("Recovery journal record has an unsupported format")
         if (
             type(record["format_version"]) is not int
@@ -373,7 +393,25 @@ class ProtectedJournal:
                 raise JournalError("Released recovery outcome is invalid")
         elif record["resolved_at"] is not None:
             raise JournalError("Unreleased recovery record has retention metadata")
+        if "result_format" in record and record["outcome"] is not None:
+            if not valid_named_rows_result(record["outcome"]):
+                raise JournalError("Advanced recovery result is invalid")
         return record
+
+
+def valid_named_rows_result(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"columns", "rows"}:
+        return False
+    columns, rows = value["columns"], value["rows"]
+    if (
+        not isinstance(columns, list)
+        or not columns
+        or any(not isinstance(column, str) or not column for column in columns)
+        or len(set(columns)) != len(columns)
+        or not isinstance(rows, list)
+    ):
+        return False
+    return all(isinstance(row, dict) and set(row) == set(columns) for row in rows)
 
 
 def _is_uuid(value: str) -> bool:

@@ -179,9 +179,10 @@ def test_procedure_coverage_ledger_tracks_every_declaration_separately():
         " Procedure ",
         " Invocation owner ",
         " Server dispatch evidence ",
-        " Python convenience behavior ",
+        " Supported Python route / behavior ",
         " Executed integration evidence ",
+        " Specialized unverified scenario / later test target ",
     ]
     rows = table[2:]
     assert [row.split("|")[1].strip() for row in rows] == [item["name"] for item in procedures]
-    assert all(len(row.split("|")) == 7 for row in rows)
+    assert all(len(row.split("|")) == 8 for row in rows)

@@ -13,7 +13,11 @@ import pytest
 
 from deposit._recovery.identity import DeploymentIdentity
 from deposit._recovery import journal
-from deposit._recovery.journal import JournalError, ProtectedJournal
+from deposit._recovery.journal import (
+    RESULT_FORMAT_NAMED_ROWS_V1,
+    JournalError,
+    ProtectedJournal,
+)
 from deposit._recovery.storage import ProtectedStorageError, ProtectedStore
 
 
@@ -77,6 +81,44 @@ def test_journal_persists_exact_inputs_and_requires_valid_transitions():
     record = journal_store.update(identity, record["key"], state="released")
     assert record["resolved_at"]
     assert journal_store.unresolved(identity) == []
+
+
+def test_optional_result_format_keeps_legacy_v1_records_and_strictly_validates_advanced_rows():
+    storage = _MemoryStorage()
+    journal_store = ProtectedJournal(store=storage)
+    identity = _identity()
+    legacy = journal_store.create(identity, "deposit.create.class", ["Find", {}], 12)
+    assert "result_format" not in legacy
+    assert journal_store.load(identity, legacy["key"]) == legacy
+
+    advanced = journal_store.create(
+        identity,
+        "deposit.apply.batch",
+        [[]],
+        12,
+        result_format=RESULT_FORMAT_NAMED_ROWS_V1,
+    )
+    assert journal_store.load(identity, advanced["key"]) == advanced
+    with pytest.raises(JournalError, match="immutable"):
+        journal_store.update(identity, advanced["key"], result_format=None)
+    advanced = journal_store.update(identity, advanced["key"], state="prepare_sent")
+    empty_result = {"columns": ["data", "presence"], "rows": []}
+    advanced = journal_store.update(identity, advanced["key"], state="outcome_saved", outcome=empty_result)
+    advanced = journal_store.update(identity, advanced["key"], state="released")
+    assert journal_store.load(identity, advanced["key"]) == advanced
+
+    name = next(name for name, payload in storage.records.items() if json.loads(payload)["key"] == advanced["key"])
+    unsupported = json.loads(storage.records[name])
+    unsupported["result_format"] = "future_rows_v2"
+    storage.records[name] = json.dumps(unsupported).encode()
+    with pytest.raises(JournalError, match="unsupported format"):
+        journal_store.load(identity, advanced["key"])
+
+    unsupported.pop("result_format")
+    unsupported["unreviewed"] = True
+    storage.records[name] = json.dumps(unsupported).encode()
+    with pytest.raises(JournalError, match="unsupported format"):
+        journal_store.load(identity, advanced["key"])
 
 
 def test_journal_identity_and_corrupt_versions_fail_closed():

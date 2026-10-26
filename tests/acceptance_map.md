@@ -95,3 +95,41 @@ the complete 56-file script baseline, exact HEAD/tag, clean Git status, absent
 overlay-only paths and unchanged bundle hash, with zero restoration failures.
 Both restoration report SHA-256 values are
 `9329C69D0CDA0E5618FE35793A3C29ED5C9D9152D92B32D313A427356FD1C17A`.
+
+## Stage 3 acceptance map
+
+Stage 3 ran the cumulative `-Stage 3` selection against an installed wheel and
+sdist plus the owner-managed live Gateway suite. The retained run
+`20261026T214740608Z-6a36ef3f` recorded 23 commands, all exit code 0 with no
+timeouts. Wheel and sdist each passed 47 gateway tests and 94 core tests; package
+tests passed 42 each, manifest 3, storage 14 and identity 6. Live Seed passed 3
+tests with 2 expected skips; Verify after the server restart passed 5 tests. The
+live run reached terminal cleanup with no cleanup error. Full result JSON is
+retained at
+`../test_harness/results/python-20261026T214740608Z-6a36ef3f/results.json` and
+live logs at
+`../test_harness/results/20261026T214902605Z-b04be0db/`.
+
+| ID | Assertion and concrete test | Command/group | Current evidence / limit |
+|---|---|---|---|
+| 3A | `test_every_manifest_entry_has_one_explicit_gateway_or_deferred_policy`, `test_manifest_binding_order_defaults_and_named_outputs_are_preserved`, `test_every_operational_manifest_entry_has_exact_store_gateway_classification`, and `test_prune_execution_is_rejected_before_any_coordinator_route` cover all 124 manifest entries, ordered arguments, outputs, ownership, actions, batches, internal routes and explicit deferrals. | `Invoke-PythonTests.ps1 -Stage 3`; wheel and sdist gateway selections | Passed in the installed wheel and sdist (47 gateway tests each). Prune dry-run and both execution branches are classified; live viewer denial is exercised in Seed. |
+| 3B | `tests/unit/test_client.py` verifies required selectors and zero/one/many detached tuple results for `get_users` and `get_namespaces`; installed Gateway Seed covers Client discovery/session and Namespace/user calls, active Namespace selection, administrative mode, Store class/classRelationship create/read, empty classRelationship page, safe invalid selector, permission denial, dry-run prune denial, and prepared operational `save.data` export plus `import.analyze` with named portable outcomes. | Focused selector/cardinality selection; owner-managed `SelectedPythonTest Gateway`, run `20261026T214902605Z-b04be0db` | Eight focused API assertions passed. Seed passed 3 tests / 2 skipped. Verify after restart passed 5 tests and recovered the committed Class result. Private `_single` calls only create test fixtures and are not counted as supported routes. Other non-deferred procedures remain assigned in the [procedure ledger](../docs/procedure_coverage_ledger.md). |
+| 3C | `test_advanced_store_result_native_values_are_transaction_bound_and_convert_in_owner_tx`, `test_advanced_store_result_converts_dynamic_relationship_and_rejects_paths`, `test_advanced_store_result_does_not_expose_graph_or_lazy_native_iterators_after_close`, plus early-close, conversion-failure and iteration-failure tests cover native lifetime and owning-transaction conversion. | Cumulative wheel/sdist gateway selections; live Gateway Seed | Passed; 44 focused Store/policy tests also passed after the correction. Live Node and dynamically typed Relationship converted through the same transaction and Store token. `.graph` is rejected, iterator advancement checks lifetime, property views detach while open, and Path conversion fails. Same transaction does not promise a frozen read snapshot. |
+| 3D | Live Gateway holds a query result open after its first row, lists the active request while Store work remains open, denies cancellation by another actor, cancels as the owner and confirms request removal after Bolt termination. Existing Stage 2 `test_live_close_cancels_after_server_commit_without_deadlock_or_duplicate_effect` covers ambiguous committed action completion. | Live Gateway Seed plus Stage 2 cumulative Restart and KillRestart runs; server `PreparedActionReplayIT` and `AccountAuthorizationIT` regressions | Passed. The live active query uses `fetch_size=1` to avoid driver-side buffering. Neo4j can surface transaction cancellation as a generic `TransportError`; the test also verifies authorized cancellation returned true and the request disappeared. Stage 2 live action cancellation preserved one committed effect and original result. |
+| 3E | Every manifest row separates dispatch policy, supported Python route, executed integration evidence and the remaining specialized scenario assigned to a later stage/test target. Approved Client server-scope action and prune-execution deferrals are explicit. | `docs/procedure_coverage_ledger.md`; `test_gateway_policy.py` | 124 ledger rows correspond to manifest entries. Stage 4/5/6 targets identify future coverage; those targets are planned and are not counted as completed tests. |
+
+Failure/correction record: the first reviewer found graph/lazy-iterator lifetime
+escapes, stale ledger entries and missing installed operational/cancellation
+coverage. The graph escape probe reproduced access after StoreResult close; the
+wrapper now hides `.graph`, guards every iterator step, and detaches lazy property
+views while open. One live cancellation attempt completed from driver-buffered
+rows; it was changed to a one-record fetch size. The next attempt used disconnected
+two-class projections and produced no rows; it was corrected to a single-class
+projection with objects selected by class UUID. The final cumulative gate passed
+after these corrections. Earlier failed run records are retained and were not
+counted as acceptance evidence. A direct interactive run of `test_client.py`
+also encountered one ACL-specific subprocess setup failure because the current
+workspace grants extra Windows principals; 46 other selected cases passed.
+The owner-managed Stage 3 wheel/sdist gate passed the complete package/core/
+gateway selections, including this test, so the interactive failure is not
+counted as a product regression.

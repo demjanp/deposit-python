@@ -7,6 +7,7 @@ param(
     [string[]]$Selection,
     [string]$PythonExecutable='python',
     [string]$PythonBuildBundle,
+    [string]$PythonBuildSourceRepository,
     [string]$ServerRepository,
     [ValidateSet('Restart','KillRestart')][string]$PythonRecoveryTransition='Restart'
 )
@@ -16,6 +17,7 @@ $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $scriptFile=$MyInvocation.MyCommand.Path
 if(!$Root){$Root=Join-Path (Split-Path $scriptFile -Parent) '..\..\test_harness'}
 $server=if($ServerRepository){[IO.Path]::GetFullPath($ServerRepository)}else{Join-Path (Split-Path $repo -Parent) 'deposit-server'}
+$buildSource=if($PythonBuildSourceRepository){[IO.Path]::GetFullPath($PythonBuildSourceRepository)}else{$server}
 $Root=[IO.Path]::GetFullPath($Root)
 if($PythonBuildBundle){
     $PythonBuildBundle=[IO.Path]::GetFullPath($PythonBuildBundle)
@@ -25,10 +27,10 @@ if($PythonBuildBundle){
 $stageGroups=@('foundation','core','gateway','domain','workflows','release')
 $foundationGroups=@('package','manifest','storage','identity','runner','live')
 $validGroups=@('foundation','package','manifest','storage','identity','runner','live','core','gateway','domain','workflows','release')
-$groups=if($Group){@($Group | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })}elseif($Stage -eq 2){@('core')}else{@('foundation')}
+$groups=if($Group){@($Group | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })}elseif($Stage -eq 2){@('core')}elseif($Stage -eq 3){@('gateway')}else{@('foundation')}
 $invalidGroups=@($groups|Where-Object {$_ -notin $validGroups})
 if($invalidGroups.Count){throw "Unknown Python test group(s): $($invalidGroups -join ', ')"}
-$selectedGroups=if($Stage -eq 2){@($foundationGroups+$groups)}elseif($groups -contains 'foundation'){@($foundationGroups)}else{@($groups)}
+$selectedGroups=if($Stage -eq 2){@($foundationGroups+$groups)}elseif($Stage -eq 3){@($foundationGroups+@('core')+$groups)}elseif($groups -contains 'foundation'){@($foundationGroups)}else{@($groups)}
 $later=@($selectedGroups|Where-Object {$_ -notin $foundationGroups})
 $known=@{
     package=@('tests/unit/test_installed_package.py','tests/unit/test_client.py')
@@ -38,6 +40,7 @@ $known=@{
     runner=@('scripts/Test-PythonRunner.ps1','../deposit-server/scripts/Test-PythonAcceptanceBuildBundle.ps1')
     live=@('tests/integration/test_live_smoke.py')
     core=@('tests/unit/test_journal.py','tests/unit/test_store.py')
+    gateway=@('tests/unit/test_gateway_policy.py','tests/unit/test_manifest.py','tests/unit/test_store.py')
 }
 if($ListOnly) {
     Write-Output "Python repository: $repo"
@@ -53,19 +56,25 @@ if($ListOnly) {
         Write-Output 'Live acceptance: server-owned Python hook Core (Stage 1 Smoke plus installed-package process-death recovery); owner performs a restart before Verify.'
     Write-Output "Python recovery transition: $PythonRecoveryTransition (choices: Restart, KillRestart)."
     }
+    if($Stage -ge 3) {
+        Write-Output ("Gateway: {0}" -f ($known.gateway -join ', '))
+        Write-Output 'Live acceptance: server-owned Python hook Gateway (Smoke, Core, and installed Store gateway recovery/controls).'
+    }
     Write-Output 'Prerequisites: network access for pinned Python dependencies; Windows DPAPI/ACLs; for live, the existing server harness and its fresh-runtime lifecycle owner.'
-    Write-Output 'Live hook: Invoke-IntegrationSuite.ps1 -SelectedPythonTest Smoke|Core -PythonRoot <repo> -PythonEnvironment <harness venv> -Root <harness>'
+    Write-Output 'Live hook: Invoke-IntegrationSuite.ps1 -SelectedPythonTest Smoke|Core|Gateway -PythonRoot <repo> -PythonEnvironment <harness venv> -Root <harness>'
     Write-Output 'Optional live build bundle: -PythonBuildBundle <verified clean tagged bundle under harness cache>; skips only server Build/Package.'
     return
 }
 
-if($Stage -notin @(1,2)) {throw "Stage $Stage selections are not implemented yet."}
+if($Stage -notin @(1,2,3)) {throw "Stage $Stage selections are not implemented yet."}
 if($Stage -eq 1 -and $later.Count){throw 'Stage 1 accepts only foundation groups.'}
 if($Stage -eq 2 -and $selectedGroups -notcontains 'core'){throw 'Stage 2 requires the cumulative core group.'}
+if($Stage -eq 3 -and $selectedGroups -notcontains 'gateway'){throw 'Stage 3 requires the cumulative gateway group.'}
 if($Selection -and $selectedGroups.Count -ne 1){throw 'Use -Selection with exactly one foundation group.'}
 if($PythonBuildBundle -and $selectedGroups -notcontains 'live'){throw 'PythonBuildBundle requires the live foundation group.'}
 if($PythonRecoveryTransition -ne 'Restart' -and ($Stage -lt 2 -or $selectedGroups -notcontains 'core' -or $selectedGroups -notcontains 'live')){throw 'KillRestart is available only for Stage 2 Core live acceptance.'}
 if(!(Test-Path -LiteralPath $server -PathType Container)){throw "Server checkout is missing: $server"}
+if($PythonBuildBundle -and !(Test-Path -LiteralPath $buildSource -PathType Container)){throw "Python build source checkout is missing: $buildSource"}
 $resolvedPython=(Get-Command $PythonExecutable -ErrorAction Stop).Source
 $pythonVersion=& $resolvedPython --version 2>&1
 if($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.14\.') {throw "Stage 1 requires Python 3.14.x; found $pythonVersion"}
@@ -134,16 +143,21 @@ try {
         $targets=Resolve-TestTargets $(if($Selection){@($Selection)}else{@($known.core)})
         Invoke-Recorded 'wheel-core-tests' $wheelPython (@('-m','pytest','-q','--import-mode=importlib')+$targets) $runRoot 1800
     }
+    if($selectedGroups -contains 'gateway') {
+        $targets=Resolve-TestTargets $(if($Selection){@($Selection)}else{@($known.gateway)})
+        Invoke-Recorded 'wheel-gateway-tests' $wheelPython (@('-m','pytest','-q','--import-mode=importlib')+$targets) $runRoot 1800
+    }
     if($selectedGroups -contains 'runner') {
         Invoke-Recorded 'runner-probes' (Join-Path $PSHOME 'powershell.exe') @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'Test-PythonRunner.ps1'),'-Root',$Root) $repo 120
         Invoke-Recorded 'build-bundle-probes' (Join-Path $PSHOME 'powershell.exe') @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $server 'scripts\Test-PythonAcceptanceBuildBundle.ps1')) $server 120
     }
     if($selectedGroups -contains 'live') {
         $suite=Join-Path $server 'scripts\Invoke-IntegrationSuite.ps1'
-        $pythonSelection=if($Stage -ge 2 -and $selectedGroups -contains 'core'){'Core'}else{'Smoke'}
+        $pythonSelection=if($Stage -ge 3 -and $selectedGroups -contains 'gateway'){'Gateway'}elseif($Stage -ge 2 -and $selectedGroups -contains 'core'){'Core'}else{'Smoke'}
         $arguments=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$suite,'-SelectedPythonTest',$pythonSelection,'-PythonRoot',$repo,'-PythonEnvironment',(Split-Path (Split-Path $wheelPython -Parent) -Parent),'-Root',$Root)
         if($Stage -ge 2 -and $selectedGroups -contains 'core'){$arguments+=@('-PythonRecoveryTransition',$PythonRecoveryTransition)}
         if($PythonBuildBundle){$arguments+=@('-PythonBuildBundle',$PythonBuildBundle)}
+        if($PythonBuildBundle -and $PythonBuildSourceRepository){$arguments+=@('-PythonBuildSourceRepository',$buildSource)}
         Invoke-Recorded 'live-smoke-hook' (Join-Path $PSHOME 'powershell.exe') $arguments $server 7200
     }
 
@@ -158,6 +172,10 @@ try {
     if($selectedGroups -contains 'core') {
         $targets=Resolve-TestTargets $(if($Selection){@($Selection)}else{@($known.core)})
         Invoke-Recorded 'sdist-core-tests' $sdistPython (@('-m','pytest','-q','--import-mode=importlib')+$targets) $runRoot 1800
+    }
+    if($selectedGroups -contains 'gateway') {
+        $targets=Resolve-TestTargets $(if($Selection){@($Selection)}else{@($known.gateway)})
+        Invoke-Recorded 'sdist-gateway-tests' $sdistPython (@('-m','pytest','-q','--import-mode=importlib')+$targets) $runRoot 1800
     }
     New-Item -ItemType Directory -Force -Path $resultsRoot | Out-Null
     Copy-Item -LiteralPath $workingLogs -Destination $resultsRoot -Recurse -Force
