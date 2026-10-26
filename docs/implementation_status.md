@@ -23,7 +23,7 @@ acceptance.
 | --- | --- | --- | --- | --- | --- |
 | 1 | Contracts, package and live test infrastructure | Finalized | 1A-1E complete | Foundation gate passed; independent architect PASS, no blocking findings | All three Stage 1 commits verified; commit IDs recorded below |
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
-| 3 | Complete procedure gateway | Verified and reviewed (finalization pending) | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub commits pending |
+| 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
 | 4 | Typed domain, queries and batches | Not started | 4A-4E pending | Not run / no implementation review | No stage commits |
 | 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
@@ -332,5 +332,14 @@ cumulative Python gate. The architect inspected retained evidence and did not
 rerun tests. Shared hub contract consistency was reviewed with the accepted
 selector/cardinality API and recovery deferrals.
 
-Tracker update state: verified and reviewed; stage commits pending in Python,
-server and hub. Commit IDs will be recorded after the separate Stage 3 commits.
+Tracker update state: Finalized. Separate Stage 3 implementation commits:
+
+- Python: `245e03c062bc5d7aeb7eafc89a5f23c9ecd50d72` —
+  `project-run deposit-python-20261025-01: Stage 3 - complete procedure gateway and controlled advanced access`
+- Server: `d7ec72e3ba560775848633d5a664c308d60130a7` —
+  `project-run deposit-python-20261025-01: Stage 3 - Python gateway acceptance routing`
+- Hub: `89b2a4a3420c63279cceb3b1ae3cbfdbca6a75ce` —
+  `project-run deposit-python-20261025-01: Stage 3 - Client gateway and collection API contract`
+
+The final Stage 3 tracker-state follow-up is a separate Python commit; its ID is
+recorded in the local project-run checkpoint and Git history.
