@@ -22,7 +22,7 @@ acceptance.
 | Stage | Scope | State | Acceptance | Verification/review | Finalization |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Contracts, package and live test infrastructure | Finalized | 1A-1E complete | Foundation gate passed; independent architect PASS, no blocking findings | All three Stage 1 commits verified; commit IDs recorded below |
-| 2 | Safe core and durable recovery | Verified and reviewed (finalization pending) | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Stage commits pending in Python, server and hub |
+| 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Not started | 3A-3E pending | Not run / no implementation review | No stage commits |
 | 4 | Typed domain, queries and batches | Not started | 4A-4E pending | Not run / no implementation review | No stage commits |
 | 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
@@ -37,8 +37,8 @@ finalization fails; resume pending work without duplicating commits.
 
 ## Acceptance and procedure coverage
 
-Stage 1 acceptance IDs 1A-1E are verified and reviewed as recorded below. Stages
-2-6 remain pending. Record separate states for supported dispatch, convenient
+Stage 1 acceptance IDs 1A-1E and Stage 2 acceptance IDs 2A-2F are verified and
+reviewed as recorded below. Stages 3-6 remain pending. Record separate states for supported dispatch, convenient
 Python behavior and executed integration acceptance. A catalog count or Java
 regression result cannot satisfy the latter two fields. No specialized scenario
 can remain unassigned beyond its stage or be waived at release.
@@ -155,7 +155,7 @@ Tracker update state: Finalized with all acceptance evidence and the completed r
 - Hub contract: `0cc09a5b34ccb83861f005d53e9797ce7df11124`; completed-commit status follow-up: `240dc999d341cd7d7cf3ae7f507cd92214e8888a`.
 - Python source and this tracker are included in the tracker-bearing Stage 1 commit; its full hash is recorded in the local project-run checkpoint and Git history.
 
-Stage 2 is verified and reviewed; its tracker finalization and repository commits are pending.
+Stage 2 has completed its verification, review, tracker update and repository commits.
 
 ## Planning record
 
@@ -182,7 +182,7 @@ Stage 1 resolved deployment identity without expanding the public server
 contract. Restart replay remains disabled until Stage 2 implements durable
 recovery checks against the accepted identity policy.
 
-### Stage 2 / `deposit-python-20261025-01` / verified and reviewed (finalization pending)
+### Stage 2 / `deposit-python-20261025-01` / finalized
 
 Scope and prerequisites checked: Stage 1 is finalized in Python, server and hub.
 Captured Stage 2 baselines: Python `e930e004888d2196fdf6a29de5f69e27de60e735`,
@@ -253,12 +253,14 @@ Shared contract/documentation consistency: stale Store-factory implementation
 wording and acceptance-map run references were corrected after review. Stage 2
 adds no new architectural decision requiring a contract change.
 
-Tracker update state: verified/reviewed; commit finalization pending. Intended
-separate commits:
+Tracker update state: Finalized. Separate Stage 2 implementation commits:
 
-- Python: `project-run deposit-python-20261025-01: Stage 2 - safe core and durable recovery`
-- Server: `project-run deposit-python-20261025-01: Stage 2 - Python acceptance harness integration`
-- Hub: `project-run deposit-python-20261025-01: Stage 2 - approved Client recovery contract`
+- Python: `9330881d661fea7694181967367a6f968c3fbc7d` —
+  `project-run deposit-python-20261025-01: Stage 2 - safe core and durable recovery`
+- Server: `0f9abfa5bb7ae6f781bde406a521f7182bd8c6ff` —
+  `project-run deposit-python-20261025-01: Stage 2 - Python acceptance harness integration`
+- Hub: `6e90461dfe1939dbac5b8b509faf5a214a495591` —
+  `project-run deposit-python-20261025-01: Stage 2 - approved Client recovery contract`
 
-After these commits, update the Stage 2 state to Finalized and record each commit
-ID in the tracker-bearing follow-up commit.
+The final Stage 2 tracker-state follow-up is a separate Python commit; its commit
+ID is recorded in the local project-run checkpoint and Git history.
