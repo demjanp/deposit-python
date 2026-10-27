@@ -24,7 +24,7 @@ acceptance.
 | 1 | Contracts, package and live test infrastructure | Finalized | 1A-1E complete | Foundation gate passed; independent architect PASS, no blocking findings | All three Stage 1 commits verified; commit IDs recorded below |
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
-| 4 | Typed domain, queries and batches | Verified and reviewed (finalization pending) | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Stage commits pending |
+| 4 | Typed domain, queries and batches | Finalized | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Server, Hub and Python commits verified; tracker follow-up committed |
 | 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
@@ -345,7 +345,7 @@ Tracker update state: Finalized. Separate Stage 3 implementation commits:
 The final Stage 3 tracker-state follow-up is a separate Python commit; its ID is
 recorded in the local project-run checkpoint and Git history.
 
-### Stage 4 / `deposit-python-20261025-01` / verified and reviewed (finalization pending)
+### Stage 4 / `deposit-python-20261025-01` / finalized
 
 Scope and prerequisites checked: Stage 3 was finalized in Python, Server and
 Hub. Stage 4 adds typed values, stable Store-bound entity handles, revision-
@@ -424,15 +424,17 @@ and verified the 4A-4E assertion map. The review did not run tests; it inspected
 the accessible redacted results, live logs and cleanup summary.
 
 Acceptance traceability is recorded in [tests/acceptance_map.md](../tests/acceptance_map.md)
-and [docs/acceptance_map.md](acceptance_map.md). Stage 4 is verified and
-reviewed. Separate Stage 4 commits completed so far:
+and [docs/acceptance_map.md](acceptance_map.md). Stage 4 is finalized after
+verification, independent review, and separate implementation commits:
 
-- Server: `5e46b1343069a5e55f4da3b3646061ab5cf0d97f` —
+- Server: `5e46b1343069a5e55f4da3b3646061ab5cf0d97f`:
   `project-run deposit-python-20261025-01: Stage 4 - Domain acceptance routing`
-- Hub: `c65b68750a5ed15b9ba87dcfab892ef3dadac1cc` —
+- Hub: `c65b68750a5ed15b9ba87dcfab892ef3dadac1cc`:
   `project-run deposit-python-20261025-01: Stage 4 - Python domain contract`
+- Python: `a505028503df7440cae186742dfb460cdded77fd`:
+  `project-run deposit-python-20261025-01: Stage 4 - typed domain, revision-fenced pages and atomic batches`
 
-Python source/tests/maps and this tracker are to be committed together; a
-separate tracker follow-up will record the resulting Python commit ID. Preserve
+This tracker-state follow-up records the Python implementation commit identity;
+its own commit ID is recorded in the local project-run checkpoint. Preserve
 unrelated Server POM/.gitignore/deleted skill-copy changes and the user-injected
 Python AGENTS.md change.
