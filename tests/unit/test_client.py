@@ -279,11 +279,63 @@ def test_driver_error_mapping_exposes_only_structured_server_errors():
     assert mapped.message == "Invalid option"
     assert mapped.request_id == request_id
     assert mapped.details == {"field": "options"}
+    assert mapped.retryable is False
+    assert mapped._server_reported is True
+    assert DepositError("VALIDATION_FAILED", "local error").retryable is None
 
     raw = _EncodedNeo4jError("Syntax error near private query text")
     transport = map_driver_error(raw)
     assert isinstance(transport, TransportError)
     assert "private query text" not in str(transport)
+
+
+def test_retained_failed_notice_is_discoverable_and_recovery_raises_saved_error_idempotently(monkeypatch):
+    from deposit._recovery import identity as identity_module
+    from deposit._recovery import journal as journal_module
+
+    class MemoryStorage:
+        def __init__(self):
+            self.records = {}
+            self.guard = threading.RLock()
+        @contextmanager
+        def lock(self, name="journal", *, timeout=0):
+            with self.guard:
+                yield self
+        def write(self, name, value): self.records[name] = bytes(value)
+        def read(self, name): return self.records[name]
+        def list_records(self): return tuple(sorted(self.records))
+        def delete(self, name): self.records.pop(name, None)
+
+    journal = ProtectedJournal(store=MemoryStorage())
+    identity = DeploymentIdentity(1, "db.example:7687", "neo4j", "db-id", "dbms-id", "actor-id", "ns-id")
+    record = journal.create(identity, "deposit.apply.batch", [[]], 4)
+    for state in ("prepare_sent", "prepared", "executing"):
+        record = journal.update(identity, record["key"], state=state)
+    failure = {"code": "NOT_FOUND", "message": "Class not found", "details": {"commandIndex": 1},
+               "request_id": "9cd08e5a-7ad5-4b0c-9e58-50de7e0412bc", "retryable": False}
+    journal.update(identity, record["key"], state="failure_saved", failure=failure)
+    terminal = journal.update(identity, record["key"], state="failed")
+    monkeypatch.setattr(journal_module, "ProtectedJournal", lambda root=None: journal)
+    monkeypatch.setattr(identity_module, "read_deployment_identity", lambda *_args, **_kwargs: identity)
+    logins = []
+    monkeypatch.setattr(Client, "login", lambda _self, username, password: logins.append((username, password)) or "token")
+    monkeypatch.setattr(Client, "get_session", lambda _self, _token: {"user": {"id": "actor-id"}})
+    monkeypatch.setattr(Client, "logout", lambda *_args: None)
+    monkeypatch.setattr(Client, "_single", lambda *_args: pytest.fail("A terminal failure must never execute again"))
+    client = Client(_Driver([]))
+    notices = client.pending_operations(recovery_directory="custom-root")
+    assert len(notices) == 1 and notices[0].state == "failed"
+    assert client.recovered_operations(recovery_directory="custom-root") == ()
+    for _ in range(2):
+        with pytest.raises(DepositError) as saved:
+            client.recover(notices[0], username="alice", password="fresh")
+        assert saved.value.code == failure["code"]
+        assert saved.value.details == failure["details"]
+        assert saved.value.request_id == failure["request_id"]
+        assert saved.value.retryable is False
+    assert logins == [("alice", "fresh"), ("alice", "fresh")]
+    assert journal.load(identity, record["key"]) == terminal
+    assert client.pending_operations(recovery_directory="custom-root") == notices
 
 
 def test_driver_error_mapping_accepts_only_the_deposit_procedure_wrapper():

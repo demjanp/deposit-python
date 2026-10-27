@@ -589,7 +589,10 @@ def _map_driver_error(exc: Exception) -> Exception:
         except (ValueError, AttributeError):
             request_id = None
     details = _bounded_details(envelope.get("details"))
-    return DepositError(code, message, details, request_id)
+    failure = DepositError(code, message, details, request_id)
+    failure.retryable = envelope["retryable"]
+    failure._server_reported = True
+    return failure
 
 
 def _bounded_details(value: Any) -> dict[str, Any] | None:

@@ -375,14 +375,14 @@ class Client:
             raise
 
     def pending_operations(self, *, recovery_directory: str | Path | None = None) -> tuple[PendingOperation, ...]:
-        """List protected unresolved work as immutable references without its keys or inputs."""
-        from ._recovery.journal import UNRESOLVED_STATES, ProtectedJournal
+        """List unresolved work and retained failure notices without their keys or inputs."""
+        from ._recovery.journal import PENDING_STATES, ProtectedJournal
         from .recovery import pending_operation
 
         journal = ProtectedJournal(recovery_directory)
         records = journal.records_all()
         self._recovery_journals.update({record["public_id"]: journal for record in records})
-        return tuple(pending_operation(record) for record in records if record["state"] in UNRESOLVED_STATES)
+        return tuple(pending_operation(record) for record in records if record["state"] in PENDING_STATES)
 
     def recovered_operations(self, *, recovery_directory: str | Path | None = None) -> tuple[RecoveredOperation, ...]:
         """List retained results whose server release was confirmed."""
@@ -399,6 +399,7 @@ class Client:
         from ._recovery.identity import DeploymentIdentity, IdentityUnavailableError, read_deployment_identity
         from ._recovery.journal import ProtectedJournal
         from .recovery import PendingOperation, RecoveredOperation, recovered_operation
+        from .errors import _saved_failure_error
 
         if self._closed:
             raise RuntimeError("Client is closed")
@@ -452,6 +453,8 @@ class Client:
             record = journal.load(stored_identity, record["key"])
             if record["state"] == "released":
                 return recovered_operation(record)
+            if record["state"] == "failed":
+                raise _saved_failure_error(record["failure"])
 
             if record["procedure"] == "deposit.delete.namespace":
                 with journal.action_lock(record["key"]):
@@ -505,6 +508,8 @@ class Client:
             )
             self._stores.add(store)
             record = journal.load(stored_identity, record["key"])
+            if record["state"] == "failed":
+                raise _saved_failure_error(record["failure"])
             if record["state"] != "released":
                 raise DepositError("RECOVERY_PENDING", "Operation remains unresolved after safe recovery")
             result = recovered_operation(record)

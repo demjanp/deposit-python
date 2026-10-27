@@ -13,7 +13,18 @@ class DepositError(Exception):
         self.message = message
         self.details = details
         self.request_id = request_id
+        # Only the validated driver error mapper sets these fields. Local
+        # validation errors carry no claim about a server transaction outcome.
+        self.retryable: bool | None = None
+        self._server_reported = False
         super().__init__(f"{code}: {message}")
+
+
+def _saved_failure_error(failure: dict[str, Any]) -> DepositError:
+    error = DepositError(failure["code"], failure["message"], failure["details"], failure["request_id"])
+    error.retryable = False
+    error._server_reported = True
+    return error
 
 
 class CompatibilityError(DepositError):

@@ -12,7 +12,7 @@ from ._recovery.journal import RESULT_FORMAT_NAMED_ROWS_V1, valid_named_rows_res
 
 @dataclass(frozen=True, slots=True)
 class PendingOperation:
-    """A safe reference to unresolved work; it contains no key or input payload."""
+    """A safe reference to unresolved work or a retained failure notice."""
 
     id: str
     procedure: str

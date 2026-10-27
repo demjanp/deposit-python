@@ -1,9 +1,8 @@
 # Acceptance map
 
-This map follows the IDs in `implementation_plan.md`. Stage 1 test paths below
-are concrete assertion targets; later-stage IDs are pending and their runner
-groups do not exist yet. Commands shown for future stages describe planned gate
-selection only and must not be read as runnable tests today.
+This map follows the IDs in `implementation_plan.md` and distinguishes completed
+evidence from planned targets. Future-stage commands describe planned gate
+selection only until their runner groups are implemented.
 
 | ID | Required evidence | Assertion or planned test target | Command / state |
 |---|---|---|---|
@@ -23,11 +22,11 @@ selection only and must not be read as runnable tests today.
 | 3C | Advanced results retain columns/lifetime and release readers on every exit | Planned result lifetime/early-close/error tests | Pending; planned Stage 3 gateway gate |
 | 3D | Cancellation works during busy Store calls and isolates admin state | Planned concurrent request cancellation integration tests | Pending; planned Stage 3 gateway/live gate |
 | 3E | Ledger identifies unsupported scenarios and owner stage | `docs/procedure_coverage_ledger.md` separates dispatch, convenience and executed evidence; full coverage remains future work | Pending; planned Stage 3 coverage review |
-| 4A | Lossless value boundaries, precision and rejection of lossy values | Planned typed codec and independent wire-value tests | Pending; planned `Invoke-PythonTests.ps1 -Stage 4 -Group domain` |
-| 4B | Missing/unknown descriptor and detached mutation semantics | Planned typed handle and live assignment assertions | Pending; planned Stage 4 domain gate |
-| 4C | CRUD selectors, same-name behavior, foreign-Store rejection and refresh | Planned handle/selector/conflict integration tests | Pending; planned Stage 4 domain gate |
-| 4D | Query columns/presence, pagination, expiry and cleanup | Planned query/page/lifetime tests | Pending; planned Stage 4 domain gate |
-| 4E | Batch references, validation, rollback, size and replay | Planned batch validation and live atomicity/restart tests | Pending; planned Stage 4 domain gate |
+| 4A | Lossless value boundaries, precision and rejection of lossy values | `tests/unit/test_values.py` covers numeric/temporal/spatial/duration/list/DDict boundaries; installed wire checks in `tests/integration/test_stage4_domain.py` | Cumulative `-Stage 4 -Group domain` passed in `20261027T134920925Z-17cf7ecc`: wheel/sdist domain 133 each; installed Seed 4 passed/2 skipped. |
+| 4B | Missing/unknown descriptor and detached mutation semantics | `tests/unit/test_entities.py`, `test_store.py`, and `test_batch.py`; live schema conversion and assignment assertions in `test_stage4_domain.py` | Passed in the cumulative Stage 4 gate. Descriptor type/rename invalidates batch schema knowledge; comment/order changes preserve it. |
+| 4C | CRUD selectors, same-name behavior, foreign-Store rejection and refresh | Handle identity/ownership and manifest-selector tests in `tests/unit/test_entities.py` and `tests/unit/test_store.py`; installed CRUD, stale-edit and refresh assertions in `test_stage4_domain.py` | Passed for representative Class/Object/Descriptor CRUD and selector behavior in the cumulative gate; specialized procedures remain in `docs/procedure_coverage_ledger.md`. |
+| 4D | Query columns/presence, pagination, expiry and cleanup | `tests/unit/test_pages.py` and `test_store.py` cover query pages, revision fences during snapshots/pages and buffered/final-page transforms, descriptor schema consistency, neighbor traversal, closure and cursor conflicts; live query/page checks in `test_stage4_domain.py` | Wheel/sdist page/domain selections passed; installed Domain Seed passed. Revision fences conservatively reject any Namespace sequence advance. |
+| 4E | Batch references, validation, rollback, size and replay | `tests/unit/test_batch.py` and `test_store.py`; installed Seed→Stop/Start→Verify lost-coordinator-reply replay in `test_stage4_domain.py` | Passed. Verify after restart passed 6 tests; public `Client.recover` returned saved class/object/Descriptor results and persisted effects were independently checked. This is a reply-loss injection after server execution, not a physical network fault. |
 | 5A | Exact uploads, interrupted resume, spool fidelity and download failures | Planned stream/resource restart tests | Pending; planned `Invoke-PythonTests.ps1 -Stage 5 -Group workflows` |
 | 5B | Geometry, CRS/Z, Pattern and layout workflows preserve server values | Planned installed geometry/Pattern workflow tests | Pending; planned Stage 5 workflow gate |
 | 5C | Import analysis/apply uses immutable snapshots and original mappings | Planned staging mutation, ambiguity, rollback and replay tests | Pending; planned Stage 5 workflow gate |

@@ -5,6 +5,8 @@ from .client import Client
 from .errors import CompatibilityError, DepositError, TransportError
 from .store import Store
 from .recovery import PendingOperation, RecoveredOperation
+from .entities import DClass, DObject
+from .values import DType, DDict, DGeometry, DResource, TypedList, TypedValue, typed
 
 __version__ = "2.0.0.dev0"
-__all__ = ["Client", "Store", "PendingOperation", "RecoveredOperation", "DepositError", "CompatibilityError", "TransportError", "title", "date", "__version__"]
+__all__ = ["Client", "Store", "DClass", "DObject", "PendingOperation", "RecoveredOperation", "DepositError", "CompatibilityError", "TransportError", "DType", "DDict", "DGeometry", "DResource", "TypedValue", "TypedList", "typed", "title", "date", "__version__"]

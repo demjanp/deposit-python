@@ -16,6 +16,7 @@ from deposit._recovery.journal import ProtectedJournal
 from deposit._recovery.storage import ProtectedStorageError
 from deposit._gateway import bind_arguments, build_query, detached_result, store_procedure
 from deposit.errors import DepositError, TransportError
+from deposit.entities import DClass, DObject
 from deposit.recovery import recovered_operation
 from deposit.store import Store, _STORE_FACTORY_TOKEN
 
@@ -233,6 +234,41 @@ class _Client:
                 self.lose_execute_reply = False
                 raise TransportError("simulated execute reply loss")
             return {"data": entity}
+        if "deposit.apply.batch" in query:
+            token = parameters["token"]
+            key = self.active[token]
+            action = self.server_actions[key]
+            if action["state"] == "committed":
+                return {"data": action["outcome"]}
+            if action["expected_revision"] != self.revision:
+                raise DepositError("REVISION_CONFLICT", "Namespace revision changed")
+            commands = action["arguments"][0]
+            results = {}
+            for command in commands:
+                procedure = command["procedure"]
+                arguments = command["arguments"]
+                if procedure == "deposit.create.class":
+                    entity = {"id": str(uuid.uuid4()), "namespaceId": "ns-id", "kind": "Class",
+                              "name": arguments[0], "descriptors": {}, "revision": self.revision + 1}
+                elif procedure == "deposit.create.object":
+                    selector = arguments[0]
+                    if isinstance(selector, dict) and "ref" in selector:
+                        selector = {"id": results[selector["ref"]]["id"]}
+                    entity = {"id": str(uuid.uuid4()), "namespaceId": "ns-id", "kind": "Object",
+                              "classId": selector["id"], "descriptors": arguments[1].get("descriptors", {}),
+                              "revision": self.revision + 1}
+                else:
+                    raise AssertionError(procedure)
+                results[command["key"]] = entity
+                self.effects.append(entity)
+            self.revision += 1
+            self.sessions[token]["revision"] = self.revision
+            action["state"] = "committed"
+            action["outcome"] = {"results": results}
+            if self.lose_execute_reply:
+                self.lose_execute_reply = False
+                raise TransportError("simulated batch execution reply loss")
+            return {"data": action["outcome"]}
         if "deposit.get.class" in query or "deposit.get.object" in query:
             selector = parameters["selection"]
             selected_id = selector.get("id") if isinstance(selector, dict) else None
@@ -328,10 +364,18 @@ class _GatewayTransaction:
     def run(self, query, parameters):
         self.calls.append((query, parameters))
         self.client.gateway_calls.append((query, parameters))
+        if "deposit.get.revision" in query and "RETURN revision, data AS entity, data AS schema" in query:
+            selected = parameters["selection"]["id"]
+            entity = next(item for item in self.client.effects if item["id"] == selected)
+            return _GatewayResult(("revision", "entity", "schema"),
+                                  [{"revision": {"sequence": self.client.revision},
+                                    "entity": entity, "schema": entity}])
         if "deposit.utils.toData" in query:
             return _GatewayResult(("data",), [{"data": {"id": "native-id", "namespaceId": "ns-id"}}])
         procedure = query.split("CALL ", 1)[1].split("(", 1)[0]
         response = self.client.gateway_rows.get(procedure)
+        if procedure == "deposit.get.revision" and response is None:
+            response = (("data",), [{"data": {"sequence": self.client.revision}}])
         if response is None:
             raise AssertionError(query)
         columns, rows = response
@@ -1217,6 +1261,134 @@ def test_conflict_preserves_pending_inputs_and_refresh_allows_explicit_reapplica
     assert len(client.effects) == 2
 
 
+def test_handle_edit_detects_external_revision_advance_before_creating_journal_record():
+    from deposit import DObject
+
+    client = _Client()
+    store = client.make_store("handle-stale-token")
+    handle = DObject(
+        store,
+        {"kind": "Object", "id": "object-id", "namespaceId": "ns-id", "classId": "class-id",
+         "descriptors": {"value": 1}},
+        {"value": "Integer"}, snapshot_revision=client.revision,
+    )
+    before = len(store._journal.records(store._identity))
+    client.revision += 1
+    client.sessions[store._token]["revision"] = client.revision
+
+    with pytest.raises(DepositError) as failure:
+        handle["value"] = 2
+
+    assert failure.value.code == "REVISION_CONFLICT"
+    assert handle.pending == {"value": 2}
+    assert handle.stale
+    assert len(store._journal.records(store._identity)) == before
+    assert not client.server_actions
+
+
+def test_same_entity_handles_are_registered_by_instance_and_invalidated_on_mutation_and_refresh():
+    from copy import deepcopy
+    from deposit import DObject
+
+    client = _Client()
+    store = client.make_store("same-entity-handles")
+    snapshot = {
+        "kind": "Object", "id": "object-id", "namespaceId": "ns-id", "classId": "class-id",
+        "descriptors": {"value": 1},
+    }
+    schema = {"value": "Integer"}
+    first = DObject(store, snapshot, schema, snapshot_revision=client.revision)
+    second = DObject(store, snapshot, schema, snapshot_revision=client.revision)
+
+    assert first == second
+    assert len(store._handles) == 2
+
+    # A committed mutation invalidates every extant snapshot, including a
+    # distinct handle that compares equal by stable domain identity.
+    store.create_class("InvalidateHandles")
+    assert first.stale and second.stale
+
+    # Refreshing handles adopts the same checked observation; a later explicit
+    # Store refresh invalidates both snapshots again.
+    for handle in (first, second):
+        handle._snapshot = deepcopy(snapshot)
+        handle._stale = False
+    store.refresh()
+    assert first.stale and second.stale
+
+
+def test_invalid_typed_object_value_fails_before_action_journal_or_server_prepare():
+    from deposit import DClass, typed
+
+    client = _Client()
+    store = client.make_store("invalid-object-value")
+    dclass = DClass(store, {
+        "kind": "Class", "id": "class-id", "namespaceId": "ns-id", "name": "Typed",
+        "descriptors": [{"name": "Count", "type": "Integer"}],
+    }, {"Count": "Integer"}, snapshot_revision=client.revision)
+    before = len(store._journal.records(store._identity))
+
+    with pytest.raises(TypeError, match="declared as Integer"):
+        store.create_object(dclass, {"descriptors": {"Count": typed("String", "wrong")}})
+
+    assert len(store._journal.records(store._identity)) == before
+    assert not client.server_actions
+
+
+def test_domain_convenience_routes_use_manifest_selector_shapes(monkeypatch):
+    client = _Client()
+    store = client.make_store("domain-selector-shapes")
+    dclass = DClass(store, {"kind": "Class", "id": "class-id", "namespaceId": "ns-id",
+                            "descriptors": []}, {}, snapshot_revision=client.revision)
+    dobject = DObject(store, {"kind": "Object", "id": "object-id", "namespaceId": "ns-id",
+                              "classId": "class-id", "descriptors": {}}, {},
+                      snapshot_revision=client.revision)
+    captured_actions = []
+    captured_pages = []
+    monkeypatch.setattr(store, "_run_action", lambda procedure, arguments, **options:
+                        captured_actions.append((procedure, arguments, options)) or {"changed": True})
+    monkeypatch.setattr(store, "_refresh_handle_snapshot", lambda handle: None)
+    monkeypatch.setattr(store, "_entity_page", lambda procedure, selection, **options:
+                        captured_pages.append((procedure, selection, options)) or iter(()))
+
+    store.set_position(dobject, 1, 2)
+    store.members(dclass)
+
+    assert captured_actions[0][0] == "deposit.set.object"
+    assert captured_actions[0][1] == ["object-id", {"position": [1, 2]}]
+    assert captured_pages[0][0] == "deposit.get.classMembersPage"
+    assert captured_pages[0][1] == {"id": "class-id"}
+    with pytest.raises(ValueError, match="does not belong"):
+        store.set_class_descriptor({"id": "foreign-declaration"}, {"comment": "x"}, dclass=dclass)
+
+
+def test_descriptor_conversion_uses_checked_declaration_id_and_public_patch_route(monkeypatch):
+    client = _Client()
+    store = client.make_store("descriptor-conversion-route")
+    dclass = DClass(store, {
+        "kind": "Class", "id": "class-id", "namespaceId": "ns-id",
+        "descriptors": [{"id": "declaration-id", "name": "Amount", "type": "Integer"}],
+    }, {"Amount": "Integer"}, snapshot_revision=client.revision)
+    captured = []
+    monkeypatch.setattr(store, "_run_handle_action", lambda handle, procedure, arguments:
+                        captured.append((procedure, arguments)) or {"changed": True})
+    monkeypatch.setattr(store, "_refresh_handle_snapshot", lambda handle: None)
+
+    store.change_class_descriptor_type(
+        dclass, "Amount", "Float", conversion="integerToFloat"
+    )
+
+    assert captured == [("deposit.set.classDescriptor", [
+        {"id": "declaration-id"}, {"type": "Float", "conversion": "integerToFloat"},
+    ])]
+    dclass._mark_stale()
+    with pytest.raises(RuntimeError, match="stale"):
+        store.change_class_descriptor_type(
+            dclass, "Amount", "Integer", conversion="floatToIntegerExact"
+        )
+    assert len(captured) == 1
+
+
 def test_close_cancels_through_control_path_before_waiting_for_active_operation():
     client = _Client()
     store = client.make_store("token")
@@ -1242,3 +1414,163 @@ def test_close_cancels_through_control_path_before_waiting_for_active_operation(
     assert not worker.is_alive() and not closer.is_alive()
     assert store.closed
     assert not failure
+
+
+def test_batch_exact_result_is_saved_and_recovered_after_lost_release_reply():
+    client = _Client()
+    store = client.make_store("token")
+    client.lose_release_reply = True
+    batch = store.transaction()
+    with pytest.raises(TransportError):
+        with batch as commands:
+            class_ref = commands.create_class("BatchClass", {"comment": "original"})
+            object_ref = commands.create_object(class_ref, {})
+    with pytest.raises(RuntimeError, match="only after"):
+        batch.result(object_ref)
+    record = next(r for r in store._journal.records(store._identity) if r["procedure"] == "deposit.apply.batch")
+    assert record["state"] == "release_sent"
+    saved = record["outcome"]["results"]
+    class_key, object_key = [command["key"] for command in record["arguments"][0]]
+    assert saved[object_key]["classId"] == saved[class_key]["id"]
+    original_object = dict(saved[object_key])
+
+    recovered_store = client.make_store("recovered-token")
+    released = next(r for r in recovered_store._journal.records(recovered_store._identity)
+                    if r["procedure"] == "deposit.apply.batch")
+    assert released["state"] == "released"
+    assert released["outcome"]["results"][object_key] == original_object
+    assert sum(item.get("kind") == "Object" for item in client.effects) == 1
+
+
+def _trusted_domain_error(code="NOT_FOUND", *, retryable=False):
+    from deposit._gateway import map_driver_error
+
+    class EncodedError(Neo4jError):
+        @property
+        def message(self):
+            return "DEPOSIT_ERROR " + json.dumps({
+                "code": code, "message": "Class not found", "details": {"commandIndex": 1},
+                "requestId": "9cd08e5a-7ad5-4b0c-9e58-50de7e0412bc", "retryable": retryable,
+            })
+    return map_driver_error(EncodedError())
+
+
+class _RejectedBatchClient(_Client):
+    def __init__(self, failure=None, *, commit_before_failure=False):
+        super().__init__()
+        self.batch_failure = failure
+        self.commit_before_failure = commit_before_failure
+        self.batch_executions = 0
+
+    def _single(self, query, parameters=None):
+        if "deposit.apply.batch" in query:
+            self.batch_executions += 1
+            if self.batch_failure is not None:
+                if self.commit_before_failure:
+                    super()._single(query, parameters)
+                raise self.batch_failure
+        return super()._single(query, parameters)
+
+
+def _submit_rejected_batch(store):
+    with store.transaction() as batch:
+        batch.create_class("RolledBack")
+        batch.create_object({"id": str(uuid.uuid4())})
+
+
+def test_definitive_batch_failure_is_retained_detached_and_never_reexecuted():
+    client = _RejectedBatchClient(_trusted_domain_error())
+    store = client.make_store("failed-batch")
+    with pytest.raises(DepositError) as rejected:
+        _submit_rejected_batch(store)
+    assert rejected.value.code == "NOT_FOUND"
+    record = store._journal.records(store._identity)[0]
+    assert record["state"] == "failed" and record["resolved_at"]
+    assert record["failure"]["code"] == "NOT_FOUND"
+    assert record["outcome"] is None
+    assert not client.effects and not client.active
+    store.close()
+    reopened = client.make_store("after-failure")
+    assert client.batch_executions == 1
+    client.batch_failure = None
+    with reopened.transaction() as batch:
+        cls = batch.create_class("Valid")
+        obj = batch.create_object(cls)
+    assert batch.result(obj)["classId"] == batch.result(cls)["id"]
+    assert client.batch_executions == 2
+    reopened.close()
+
+
+def test_failed_batch_lost_release_reply_only_reconciles_and_detaches_on_restart():
+    client = _RejectedBatchClient(_trusted_domain_error())
+    store = client.make_store("failed-release")
+    client.lose_release_reply = True
+    with pytest.raises(TransportError):
+        _submit_rejected_batch(store)
+    record = store._journal.records(store._identity)[0]
+    assert record["state"] == "failure_saved" and record["resolved_at"] is None
+    assert record["failure"]["retryable"] is False
+    reopened = client.make_store("release-recovery")
+    final = reopened._journal.records(reopened._identity)[0]
+    assert final["state"] == "failed" and final["resolved_at"]
+    assert client.batch_executions == 1 and not client.effects
+    # A caller that enumerated an old executing record must reload under the
+    # action lock rather than bypassing the durable failure marker.
+    with pytest.raises(DepositError, match="NOT_FOUND"):
+        reopened._resolve_action_locked({**record, "state": "executing"}, allow_new_prepare=True)
+    assert client.batch_executions == 1
+    reopened.close()
+
+
+def test_committed_receipt_wins_over_error_and_saved_failure_marker():
+    client = _RejectedBatchClient(_trusted_domain_error(), commit_before_failure=True)
+    store = client.make_store("committed-error")
+    with store.transaction() as batch:
+        created = batch.create_class("Committed")
+    assert batch.result(created)["name"] == "Committed"
+    record = store._journal.records(store._identity)[0]
+    assert record["state"] == "released" and "failure" not in record
+
+    other = _RejectedBatchClient(_trusted_domain_error())
+    pending = other.make_store("pending-failure")
+    other.lose_release_reply = True
+    with pytest.raises(TransportError):
+        _submit_rejected_batch(pending)
+    saved = pending._journal.records(pending._identity)[0]
+    action = other.server_actions[saved["key"]]
+    action.update(state="committed", outcome={"results": {"saved": {"id": "original-result"}}})
+    recovered = other.make_store("committed-after-marker")
+    final = recovered._journal.records(recovered._identity)[0]
+    assert final["state"] == "released" and final["failure"] is None
+    assert final["outcome"] == action["outcome"]
+    assert other.batch_executions == 1
+    recovered.close()
+
+
+@pytest.mark.parametrize("failure", [
+    DepositError("NOT_FOUND", "Synthetic local error"),
+    _trusted_domain_error(retryable=True),
+    *(_trusted_domain_error(code) for code in (
+        "AUTH_FAILED", "FORBIDDEN", "CANCELLED", "IDENTITY_MISMATCH", "SCOPE_MISMATCH", "UNKNOWN_FAILURE"
+    )),
+    TransportError("Unknown execution outcome"),
+])
+def test_ambiguous_or_ineligible_execution_errors_remain_pending(failure):
+    client = _RejectedBatchClient(failure)
+    store = client.make_store("ambiguous-batch")
+    with pytest.raises(type(failure)):
+        _submit_rejected_batch(store)
+    record = store._journal.records(store._identity)[0]
+    assert record["state"] == "executing" and "failure" not in record
+    assert client.active and not client.effects
+
+
+def test_failure_marker_storage_error_does_not_detach_or_claim_resolution():
+    client = _RejectedBatchClient(_trusted_domain_error())
+    store = client.make_store("unpersisted-failure")
+    client.storage.fail_state = "failure_saved"
+    with pytest.raises(ProtectedStorageError):
+        _submit_rejected_batch(store)
+    record = store._journal.records(store._identity)[0]
+    assert record["state"] == "executing" and "failure" not in record
+    assert client.active and not client.effects

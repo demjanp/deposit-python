@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import math
 from pathlib import Path
 import threading
+import weakref
 from typing import Any, Iterator
 
 from ._recovery.identity import DeploymentIdentity
@@ -28,7 +29,8 @@ from ._gateway import (
     store_control_procedure,
     named_rows_result,
 )
-from .errors import DepositError, TransportError
+from .errors import DepositError, TransportError, _saved_failure_error
+from .entities import DClass, DObject, DNode
 
 
 _ENTITY_QUERY = {
@@ -36,8 +38,14 @@ _ENTITY_QUERY = {
     "deposit.create.object": ("class", "properties"),
     "deposit.get.class": ("selection",),
     "deposit.get.object": ("selection",),
+    "deposit.apply.batch": ("data",),
 }
 _STORE_FACTORY_TOKEN = object()
+_DOMAIN_VALUE_TYPES = {
+    "String", "Integer", "Float", "Boolean", "Date", "Time", "LocalTime", "DateTime",
+    "LocalDateTime", "Duration", "Point", "List", "DDict", "DGeometry", "DResource",
+}
+_DEFINITIVE_DOMAIN_FAILURE_CODES = frozenset({"VALIDATION_FAILED", "TYPE_CONFLICT", "NOT_FOUND", "ALREADY_EXISTS"})
 
 
 class Store:
@@ -73,6 +81,12 @@ class Store:
         self._closing = False
         self._active = False
         self._active_result: StoreResult | None = None
+        self._batch_collection: Any = None
+        # DNode equality intentionally follows stable domain identity.  A
+        # WeakSet would therefore collapse separate snapshots of the same
+        # entity; key by Python object identity so each cached snapshot is
+        # invalidated independently.
+        self._handles = weakref.WeakValueDictionary()
         self._observed_revision = self._get_revision(observed)
         if self._observed_revision is None:
             self.refresh()
@@ -89,22 +103,517 @@ class Store:
         with self._state_lock:
             return self._closed
 
-    def create_class(self, name: str, properties: dict[str, Any] | None = None) -> dict[str, Any]:
+    def create_class(self, name: str, properties: dict[str, Any] | None = None, *,
+                     descriptors=None, position=None, order=None, comment=None) -> DClass:
         if not isinstance(name, str) or not name:
             raise ValueError("Class name must be a nonempty string")
-        props = _portable_input(properties or {})
-        return self._run_action("deposit.create.class", [name, props])
+        if properties is not None and not isinstance(properties, dict):
+            raise TypeError("Class properties must be a dictionary")
+        props = dict(properties or {})
+        if descriptors is not None:
+            props["descriptors"] = _class_declarations(descriptors)
+        if position is not None:
+            props["position"] = list(_position_value(position))
+        if order is not None:
+            if type(order) is not int or order < 0:
+                raise ValueError("Class order must be a nonnegative integer")
+            props["order"] = order
+        if comment is not None:
+            if not isinstance(comment, str):
+                raise TypeError("Class comment must be a string")
+            props["comment"] = comment
+        props = _portable_input(props)
+        created, (data, schema, revision) = self._run_action(
+            "deposit.create.class", [name, props], post_snapshot=True
+        )
+        return DClass(self, data, schema, snapshot_revision=revision)
 
-    def create_object(self, class_selector: str | dict[str, Any], properties: dict[str, Any] | None = None) -> dict[str, Any]:
-        selector = _selector(class_selector, "Class")
-        props = _portable_input(properties or {})
-        return self._run_action("deposit.create.object", [selector, props])
+    def create_object(self, class_selector: str | dict[str, Any] | DClass, properties: dict[str, Any] | None = None, *,
+                      descriptors: Mapping[str, Any] | None = None, position=None) -> DObject:
+        class_handle = class_selector if isinstance(class_selector, DClass) else self.get_class_handle(class_selector)
+        self._validate_handle(class_handle, "Class")
+        selector = {"id": class_handle.id}
+        if class_handle.stale:
+            # Creation is a new request whose explicitly supplied values are
+            # validated against the current checked Class schema.  Do not use
+            # a stale cached declaration as the encoding authority.
+            _class_data, class_schema, class_revision = self._checked_entity_snapshot(
+                "Class", {"id": class_handle.id}
+            )
+        else:
+            class_schema = class_handle._schema
+            class_revision = class_handle._baseline_revision
+        if properties is not None and not isinstance(properties, dict):
+            raise TypeError("Object properties must be a dictionary")
+        object_properties = dict(properties or {})
+        if descriptors is not None:
+            if not isinstance(descriptors, Mapping):
+                raise TypeError("Object descriptors must be a mapping")
+            if "descriptors" in object_properties:
+                raise ValueError("Supply descriptors either in properties or as a keyword")
+            object_properties["descriptors"] = dict(descriptors)
+        if position is not None:
+            object_properties["position"] = list(_position_value(position))
+        props = _encode_object_properties(object_properties, class_schema)
+        created, (data, schema, revision) = self._run_action(
+            "deposit.create.object", [selector, props], pinned_revision=class_revision,
+            stale_handle=class_handle, post_snapshot=True,
+        )
+        return DObject(self, data, schema, snapshot_revision=revision)
+
+    def delete_class(self, dclass: DClass | str | dict[str, Any]):
+        handle = dclass if isinstance(dclass, DClass) else self.get_class_handle(dclass)
+        self._validate_handle(handle, "Class")
+        return self._run_handle_action(handle, "deposit.delete.class", [{"id": handle.id}])
+
+    def delete_object(self, dobject: DObject | str | dict[str, Any]):
+        handle = dobject if isinstance(dobject, DObject) else self.get_object_handle(dobject)
+        self._validate_handle(handle, "Object")
+        return self._run_handle_action(handle, "deposit.delete.object", [handle.id])
+
+    def create_descriptor(self, dobject: DObject, name: str, value: Any):
+        self._validate_handle(dobject, "Object")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Descriptor name must be a nonempty string")
+        payload = _descriptor_payload(value, dobject._schema.get(name))
+        result = self._run_handle_action(dobject, "deposit.create.descriptor", [dobject.id, name, payload])
+        self._refresh_handle_snapshot(dobject)
+        return result
+
+    def delete_descriptor(self, dobject: DObject, name: str):
+        self._validate_handle(dobject, "Object")
+        return self._delete_descriptor(dobject, name)
+
+    def delete_class_descriptor(self, dclass: DClass, name: str):
+        self._validate_handle(dclass, "Class")
+        return self._delete_descriptor(dclass, name)
 
     def get_class(self, selection: str | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(selection, DNode):
+            self._validate_handle(selection, "Class")
         return self._read_entity("deposit.get.class", _selector(selection, "Class"))
 
     def get_object(self, selection: str | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(selection, DNode):
+            self._validate_handle(selection, "Object")
         return self._read_entity("deposit.get.object", _selector(selection, "Object"))
+
+    def get_class_handle(self, selection: str | dict[str, Any] | DClass) -> DClass:
+        identity = self._handle_id_or_selector(selection, "Class")
+        data, schema, revision = self._checked_entity_snapshot("Class", identity)
+        return DClass(self, data, schema, snapshot_revision=revision)
+
+    def get_object_handle(self, selection: str | dict[str, Any] | DObject) -> DObject:
+        identity = self._handle_id_or_selector(selection, "Object")
+        data, schema, revision = self._checked_entity_snapshot("Object", identity)
+        return DObject(self, data, schema, snapshot_revision=revision)
+
+    def _handle_id_or_selector(self, selection, kind: str):
+        if isinstance(selection, DNode):
+            self._validate_handle(selection, kind)
+            return {"id": selection.id}
+        if kind == "Class":
+            return _selector(selection, kind)
+        if isinstance(selection, str) and selection:
+            return selection
+        if isinstance(selection, dict) and set(selection) == {"id"} and isinstance(selection["id"], str):
+            return selection
+        raise TypeError("Object selector must be a stable UUID or an Object handle")
+
+    def _validate_handle(self, handle, kind: str | None = None) -> None:
+        if not isinstance(handle, DNode) or handle._store is not self:
+            raise ValueError("Entity handle belongs to another Store")
+        if handle.namespace_id != self._namespace_id or (kind is not None and handle.kind != kind):
+            raise ValueError("Entity handle has the wrong Store Namespace or kind")
+
+    def _set_descriptor(self, dobject: DObject, name: str, value: Any) -> dict[str, Any]:
+        return self.set_descriptor(dobject, name, value)
+
+    def _register_handle(self, handle) -> None:
+        self._handles[id(handle)] = handle
+
+    def _invalidate_handles(self, *, except_handle=None) -> None:
+        for handle in tuple(self._handles.values()):
+            if handle is not except_handle:
+                handle._mark_stale()
+
+    def _checked_entity_snapshot(self, kind: str, selection, *, _already_serialized: bool = False,
+                                 expected_revision: int | None = None):
+        self._assert_not_collecting_batch()
+        if kind not in {"Class", "Object"}:
+            raise ValueError("Only Class and Object snapshots are supported")
+        procedure = "deposit.get.class" if kind == "Class" else "deposit.get.object"
+        if kind == "Class":
+            query = (
+                "CYPHER 25 CALL deposit.get.revision($token) YIELD data AS revision "
+                f"CALL {procedure}($selection, $token) YIELD node "
+                "CALL deposit.utils.toData(node, $token) YIELD data "
+                "RETURN revision, data AS entity, data AS schema"
+            )
+            parameters = {"selection": selection, "token": self._token}
+        else:
+            query = (
+                "CYPHER 25 CALL deposit.get.revision($token) YIELD data AS revision "
+                "CALL deposit.get.object($selection, $token) YIELD node AS object "
+                "CALL deposit.utils.toData(object, $token) YIELD data AS entity "
+                "CALL deposit.get.class({id: entity.classId}, $token) YIELD node AS class "
+                "CALL deposit.utils.toData(class, $token) YIELD data AS schema "
+                "RETURN revision, entity, schema"
+            )
+            parameters = {"selection": selection, "token": self._token}
+        with (nullcontext() if _already_serialized else self._serialized()):
+            session = None
+            transaction = None
+            try:
+                session = self._client._session()
+                transaction = session.begin_transaction()
+                result = transaction.run(query, parameters)
+                record = result.single(strict=True)
+                result.consume()
+                if record is None:
+                    raise DepositError("INVALID_RESPONSE", "Checked entity snapshot returned no record")
+                entity = record.get("entity")
+                schema = record.get("schema")
+                revision = record.get("revision")
+                if not isinstance(entity, dict) or not isinstance(schema, dict) or not isinstance(revision, dict):
+                    raise DepositError("INVALID_RESPONSE", "Checked entity snapshot returned invalid data")
+                if entity.get("namespaceId") != self._namespace_id:
+                    raise DepositError("SCOPE_MISMATCH", "Snapshot belongs to another Store Namespace")
+                tx_revision = revision.get("sequence")
+                if isinstance(tx_revision, bool) or not isinstance(tx_revision, int) or tx_revision < 0:
+                    raise DepositError("INVALID_RESPONSE", "Snapshot returned no checked Namespace revision")
+                self._require_revision(tx_revision, expected_revision)
+                # Procedure invocations can observe intervening commits even
+                # within one Neo4j transaction. Fence all materialized entity
+                # and declaration data before publishing a checked snapshot.
+                self._require_revision(self._read_namespace_revision(transaction), tx_revision)
+                transaction.commit()
+                if kind == "Class":
+                    declarations = _schema_from_class_data(entity)
+                    return entity, declarations, tx_revision
+                from .entities import decode_snapshot
+                decoded = decode_snapshot(entity, schema, self._namespace_id, self, snapshot_revision=tx_revision)
+                return decoded._snapshot, decoded._schema, tx_revision
+            except BaseException as exc:
+                if transaction is not None:
+                    try: transaction.rollback()
+                    except Exception: pass
+                if isinstance(exc, DepositError) or not isinstance(exc, Exception):
+                    raise
+                raise map_driver_error(exc) from exc
+            finally:
+                if session is not None:
+                    try: session.close()
+                    except Exception: pass
+
+    @staticmethod
+    def _require_revision(revision: int, expected_revision: int | None) -> None:
+        if expected_revision is not None and revision != expected_revision:
+            raise DepositError("REVISION_CONFLICT", "Namespace changed during checked iteration or snapshot read")
+
+    def _read_namespace_revision(self, transaction) -> int:
+        result = transaction.run(
+            "CYPHER 25 CALL deposit.get.revision($token) YIELD data RETURN data", {"token": self._token}
+        )
+        record = result.single(strict=True)
+        result.consume()
+        data = record.get("data") if record is not None else None
+        revision = data.get("sequence") if isinstance(data, dict) else None
+        if type(revision) is not int or revision < 0:
+            raise DepositError("INVALID_RESPONSE", "Read returned no checked Namespace revision")
+        return revision
+
+    def _checked_entity_page(self, procedure: str, selection, options, *, expected_revision=None):
+        """Fully detach a page between fresh, equal Namespace sequence reads."""
+        self._assert_not_collecting_batch()
+        entry = store_procedure(procedure)
+        if entry["action"] or tuple(entry["columns"]) != ("data",) or not procedure.endswith("Page"):
+            raise ValueError("Checked pages require a read-only Domain Page procedure")
+        bound = bind_arguments(entry, (selection, options), namespace_id=self._namespace_id)
+        query, parameters = build_query(entry, bound, self._token)
+        with self._serialized():
+            session = None
+            transaction = None
+            try:
+                session = self._client._session()
+                transaction = session.begin_transaction()
+                revision = self._read_namespace_revision(transaction)
+                self._require_revision(revision, expected_revision)
+                result = transaction.run(query, parameters)
+                if tuple(result.keys()) != ("data",):
+                    raise DepositError("INVALID_RESPONSE", f"{procedure} returned unexpected columns")
+                record = result.single(strict=True)
+                result.consume()
+                if record is None:
+                    raise DepositError("INVALID_RESPONSE", f"{procedure} returned no page")
+                page = _portable_input(record.get("data"))
+                self._require_revision(self._read_namespace_revision(transaction), revision)
+                transaction.commit()
+                return page, revision
+            except BaseException as exc:
+                if transaction is not None:
+                    try: transaction.rollback()
+                    except Exception: pass
+                if isinstance(exc, DepositError) or not isinstance(exc, Exception):
+                    raise
+                raise map_driver_error(exc) from exc
+            finally:
+                if session is not None:
+                    try: session.close()
+                    except Exception: pass
+
+    def _entity_handle_at_revision(self, kind: str, identity: str, revision: int):
+        data, schema, checked_revision = self._checked_entity_snapshot(
+            kind, {"id": identity}, expected_revision=revision
+        )
+        handle_type = DClass if kind == "Class" else DObject
+        return handle_type(self, data, schema, snapshot_revision=checked_revision)
+
+    def set_descriptor(self, dobject: DObject, name: str, value: Any) -> dict[str, Any]:
+        self._validate_handle(dobject, "Object")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Descriptor name must be a nonempty string")
+        from .values import DType, TypedValue, _infer_type, encode_value
+        declared = dobject._schema.get(name)
+        if declared is None:
+            if isinstance(value, TypedValue):
+                payload = value.to_dict()
+            elif isinstance(value, DType):
+                payload = value.to_dict()
+            else:
+                kind = _infer_type(value)
+                payload = {"type": kind, "value": encode_value(kind, value)}
+        else:
+            if isinstance(value, TypedValue):
+                if value.type != declared:
+                    raise TypeError(f"Descriptor {name!r} is declared as {declared}")
+                value = value.value
+            elif isinstance(value, DType):
+                if value._type != declared:
+                    raise TypeError(f"Descriptor {name!r} is declared as {declared}")
+                value = value.value
+            payload = encode_value(declared, value)
+        result = self._run_handle_action(dobject, "deposit.set.descriptor", [dobject.id, name, payload])
+        data, schema, revision = self._checked_entity_snapshot("Object", {"id": dobject.id})
+        dobject._snapshot, dobject._schema = data, schema
+        dobject._stale = False
+        dobject._baseline_revision = revision
+        return result
+
+    def _delete_descriptor(self, owner: DNode, name: str) -> dict[str, Any]:
+        if not isinstance(owner, DNode) or owner._store is not self or owner.namespace_id != self._namespace_id:
+            raise ValueError("Entity handle belongs to another Store")
+        if owner.kind == "Object":
+            procedure = "deposit.delete.descriptor"
+            selector = {"id": self._descriptor_id(owner, name)}
+        elif owner.kind == "Class":
+            procedure = "deposit.delete.classDescriptor"
+            selector = {"id": self._descriptor_id(owner, name)}
+        else:
+            raise TypeError("Only Class or Object Descriptor values can be deleted")
+        result = self._run_handle_action(owner, procedure, [selector])
+        self._refresh_handle_snapshot(owner)
+        return result
+
+    def create_class_descriptor(self, dclass: DClass, name: str, type_name: str, comment: str = "") -> dict[str, Any]:
+        self._validate_handle(dclass, "Class")
+        if not isinstance(name, str) or not name or not isinstance(type_name, str) or not type_name:
+            raise ValueError("Descriptor name and type must be nonempty strings")
+        result = self._run_handle_action(dclass, "deposit.create.classDescriptor", [{"id": dclass.id}, name, type_name, {"comment": comment}])
+        data, schema, revision = self._checked_entity_snapshot("Class", {"id": dclass.id})
+        dclass._snapshot, dclass._schema = data, schema
+        dclass._baseline_revision = revision
+        dclass._stale = False
+        return result
+
+    def set_class_descriptor(self, selector: dict[str, Any], patch: dict[str, Any], *,
+                             dclass: DClass | None = None) -> dict[str, Any]:
+        selector_dclass = selector if isinstance(selector, DClass) else None
+        owner = dclass or selector_dclass
+        if selector_dclass is not None:
+            self._validate_handle(selector_dclass, "Class")
+            name = patch.get("name") if isinstance(patch, dict) else None
+            declaration = selector_dclass.declarations.get(name) if isinstance(name, str) else None
+            if declaration is None:
+                raise KeyError(name)
+            selector = {"id": declaration["id"]}
+        if owner is not None:
+            self._validate_handle(owner, "Class")
+            descriptor_id = selector.get("id") if isinstance(selector, Mapping) else None
+            if descriptor_id is not None and descriptor_id not in {
+                item.get("id") for item in owner.declarations.values()
+            }:
+                raise ValueError("Class Descriptor selector does not belong to the supplied Class handle")
+        if not isinstance(selector, dict) or not isinstance(patch, dict):
+            raise TypeError("selector and patch must be dictionaries")
+        result = (self._run_handle_action(owner, "deposit.set.classDescriptor", [selector, _portable_input(patch)])
+                  if owner is not None else self._run_action("deposit.set.classDescriptor", [selector, _portable_input(patch)]))
+        if owner is not None:
+            self._refresh_handle_snapshot(owner)
+        return result
+
+    def set_class_properties(self, dclass: DClass, **patch) -> dict[str, Any]:
+        self._validate_handle(dclass, "Class")
+        allowed = {"name", "position", "order", "comment"}
+        if not patch or set(patch) - allowed:
+            raise ValueError("Class patch must contain supported fields")
+        if "name" in patch and (not isinstance(patch["name"], str) or not patch["name"]):
+            raise ValueError("Class name must be a nonempty string")
+        if "comment" in patch and not isinstance(patch["comment"], str):
+            raise TypeError("Class comment must be a string")
+        if "order" in patch and (type(patch["order"]) is not int or patch["order"] < 0):
+            raise ValueError("Class order must be a nonnegative integer")
+        if "position" in patch:
+            patch["position"] = _position_value(patch["position"])
+        result = self._run_handle_action(dclass, "deposit.set.class", [{"id": dclass.id}, _portable_input(patch)])
+        self._refresh_handle_snapshot(dclass)
+        return result
+
+    def set_position(self, node: DNode, x: float, y: float) -> dict[str, Any]:
+        self._validate_handle(node)
+        position = _position_value((x, y))
+        if node.kind == "Class":
+            procedure, selector = "deposit.set.class", {"id": node.id}
+        elif node.kind == "Object":
+            procedure, selector = "deposit.set.object", node.id
+        else:
+            raise TypeError("Only Class and Object handles have a position")
+        result = self._run_handle_action(node, procedure, [selector, {"position": list(position)}])
+        self._refresh_handle_snapshot(node)
+        return result
+
+    def change_class_descriptor_type(self, dclass: DClass, name: str, type_name: str, *, conversion: str):
+        self._validate_handle(dclass, "Class")
+        declaration = dclass.declarations.get(name)
+        if declaration is None:
+            raise KeyError(name)
+        if not isinstance(type_name, str) or not type_name:
+            raise ValueError("type_name must be a nonempty string")
+        if conversion not in {"identity", "integerToFloat", "floatToIntegerExact"}:
+            raise ValueError("Unsupported class Descriptor conversion")
+        result = self._run_handle_action(dclass, "deposit.set.classDescriptor", [
+            {"id": declaration["id"]}, {"type": type_name, "conversion": conversion},
+        ])
+        self._refresh_handle_snapshot(dclass)
+        return result
+
+    def switch_descriptor_order(self, dclass: DClass, name1: str, name2: str):
+        self._validate_handle(dclass, "Class")
+        first, second = dclass.declarations.get(name1), dclass.declarations.get(name2)
+        if first is None or second is None:
+            raise KeyError(name1 if first is None else name2)
+        if first["id"] == second["id"]:
+            return {"changed": False}
+        with self.transaction() as batch:
+            batch._pin_handle(dclass, "Class")
+            batch.call("deposit.set.classDescriptor", {"id": first["id"]}, {"order": second.get("order", 0)})
+            batch.call("deposit.set.classDescriptor", {"id": second["id"]}, {"order": first.get("order", 0)})
+        self._refresh_handle_snapshot(dclass)
+        return {"changed": True}
+
+    def switch_class_order(self, first: DClass, second: DClass):
+        self._validate_handle(first, "Class")
+        self._validate_handle(second, "Class")
+        if first.id == second.id:
+            return {"changed": False}
+        if first._baseline_revision != second._baseline_revision:
+            raise ValueError("Class handles have conflicting checked snapshot revisions")
+        with self.transaction() as batch:
+            batch._pin_handle(first, "Class")
+            batch._pin_handle(second, "Class")
+            batch.call("deposit.set.class", {"id": first.id}, {"order": second.order})
+            batch.call("deposit.set.class", {"id": second.id}, {"order": first.order})
+        self._refresh_handle_snapshot(first)
+        self._refresh_handle_snapshot(second)
+        return {"changed": True}
+
+    def set_membership(self, dobject: DObject, dclass: DClass | str | dict[str, Any]):
+        self._validate_handle(dobject, "Object")
+        target = dclass if isinstance(dclass, DClass) else self.get_class_handle(dclass)
+        self._validate_handle(target, "Class")
+        revision = _matching_handle_revision(dobject, target)
+        try:
+            result = self._run_action("deposit.set.membership", [dobject.id, {"id": target.id}],
+                                      pinned_revision=revision)
+        except DepositError as exc:
+            if exc.code == "REVISION_CONFLICT":
+                dobject._mark_stale()
+                target._mark_stale()
+            raise
+        self._refresh_handle_snapshot(dobject)
+        return result
+
+    def object_class(self, dobject: DObject) -> DClass:
+        self._validate_handle(dobject, "Object")
+        data = self._call_one("deposit.get.objectClass", dobject.id)
+        if not isinstance(data, dict) or not isinstance(data.get("id"), str):
+            raise DepositError("INVALID_RESPONSE", "Object class lookup returned no Class identity")
+        return self.get_class_handle({"id": data["id"]})
+
+    def create_relationship(self, src_object: DObject, tgt_object: DObject, label: str, weight=None):
+        self._validate_handle(src_object, "Object")
+        self._validate_handle(tgt_object, "Object")
+        if not isinstance(label, str) or not label:
+            raise ValueError("Relationship label must be a nonempty string")
+        revision = _matching_handle_revision(src_object, tgt_object)
+        properties = {} if weight is None else {"weight": weight}
+        return self._run_multi_handle_action("deposit.create.relationship",
+                                             [src_object.id, tgt_object.id, label, properties],
+                                             revision, (src_object, tgt_object))
+
+    def create_class_relationship(self, src_class: DClass, tgt_class: DClass, label: str, comment=""):
+        self._validate_handle(src_class, "Class")
+        self._validate_handle(tgt_class, "Class")
+        if not isinstance(label, str) or not label or not isinstance(comment, str):
+            raise ValueError("Class relationship label and comment must be strings")
+        revision = _matching_handle_revision(src_class, tgt_class)
+        return self._run_multi_handle_action(
+            "deposit.create.classRelationship", [
+                {"id": src_class.id}, {"id": tgt_class.id}, label, {"comment": comment},
+            ], revision, (src_class, tgt_class),
+        )
+
+    def set_relationship(self, relationship_id: str, **patch):
+        if not isinstance(relationship_id, str) or not relationship_id:
+            raise ValueError("relationship_id must be a nonempty stable ID")
+        if not patch:
+            raise ValueError("Relationship patch must not be empty")
+        return self._run_action("deposit.set.relationship", [relationship_id, _portable_input(patch)])
+
+    def set_class_relationship(self, relationship_id: str, **patch):
+        if not isinstance(relationship_id, str) or not relationship_id:
+            raise ValueError("relationship_id must be a nonempty stable ID")
+        if not patch:
+            raise ValueError("Class relationship patch must not be empty")
+        return self._run_action("deposit.set.classRelationship", [relationship_id, _portable_input(patch)])
+
+    def delete_relationship(self, relationship_id: str):
+        return self._run_action("deposit.delete.relationship", [_stable_id(relationship_id)])
+
+    def delete_class_relationship(self, relationship_id: str):
+        return self._run_action("deposit.delete.classRelationship", [_stable_id(relationship_id)])
+
+    def delete_all(self, confirm_namespace_name: str):
+        if not isinstance(confirm_namespace_name, str) or not confirm_namespace_name:
+            raise ValueError("Namespace name confirmation must be a nonempty string")
+        return self._run_action("deposit.delete.all", [confirm_namespace_name])
+
+    def get_relationship(self, selection: str | dict[str, Any]):
+        return self._call_one("deposit.get.relationship", selection)
+
+    def get_class_relationship(self, selection: str | dict[str, Any]):
+        return self._call_one("deposit.get.classRelationship", selection)
+
+    def create_user_tool(self, name: str, data: str, comment: str = ""):
+        if not isinstance(name, str) or not name or not isinstance(data, str) or not isinstance(comment, str):
+            raise ValueError("User Tool name, data, and comment must be strings")
+        return self._run_action("deposit.create.userTool", [name, {"data": data, "comment": comment}])
+
+    def set_user_tool(self, user_tool_id: str, **patch):
+        return self._run_action("deposit.set.userTool", [{"id": _stable_id(user_tool_id)}, _portable_input(patch)])
+
+    def delete_user_tool(self, user_tool_id: str):
+        return self._run_action("deposit.delete.userTool", [{"id": _stable_id(user_tool_id)}])
 
     def call(self, procedure: str, *arguments: Any) -> StoreResult:
         """Call an allowlisted namespace procedure using its manifest signature.
@@ -113,6 +622,8 @@ class Store:
         Action procedures use the same durable coordinator as the convenience
         methods and return detached portable rows.
         """
+        if self._batch_collection is not None:
+            raise RuntimeError("Store calls are unavailable while collecting a batch")
         entry = store_procedure(procedure)
         bound = bind_arguments(entry, arguments, namespace_id=self._namespace_id)
         if entry["action"]:
@@ -140,6 +651,7 @@ class Store:
         Store's ordinary operation lock, so it remains usable while a request
         is running on the Store session.
         """
+        self._assert_not_collecting_batch()
         if not self._begin_parallel_control():
             raise RuntimeError("Store is closed")
         try:
@@ -172,6 +684,7 @@ class Store:
 
     def cancel_request(self, request_id: str) -> bool:
         """Request cancellation of one server-authorized active request."""
+        self._assert_not_collecting_batch()
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id must be a nonempty string")
         if not self._begin_parallel_control():
@@ -190,6 +703,7 @@ class Store:
 
     def get_administrative_mode(self) -> bool:
         """Read this Store session's administrative-mode state."""
+        self._assert_not_collecting_batch()
         with self._serialized():
             value = self._client.get_administrative_mode(self._token)
             if not isinstance(value, bool):
@@ -198,6 +712,7 @@ class Store:
 
     def get_operation(self, operation_id: str) -> Any:
         """Inspect an operation in this Store's fixed Namespace scope."""
+        self._assert_not_collecting_batch()
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("operation_id must be a nonempty string")
         with self._serialized():
@@ -205,11 +720,13 @@ class Store:
 
     def get_last_operation(self) -> Any:
         """Return the last operation observed by this Store session."""
+        self._assert_not_collecting_batch()
         with self._serialized():
             return self._client.get_last_operation(self._token)
 
     def set_administrative_mode(self, enabled: bool) -> bool:
         """Explicitly set this Store session's administrative-mode state."""
+        self._assert_not_collecting_batch()
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be a bool")
         with self._serialized():
@@ -220,12 +737,302 @@ class Store:
 
     def refresh(self) -> None:
         """Explicitly refresh this session's Namespace revision baseline."""
+        self._assert_not_collecting_batch()
         with self._serialized(allow_closing=True):
             self._client._single(
                 "CYPHER 25 CALL deposit.utils.refresh($scope, $token) YIELD data RETURN data",
                 {"scope": "namespace", "token": self._token},
             )
             self._update_observed_revision()
+            self._invalidate_handles()
+
+    def transaction(self):
+        """Collect one bounded atomic ``deposit.apply.batch`` action."""
+        from ._batch import Batch
+        if self._batch_collection is not None:
+            raise RuntimeError("Nested batches are not supported")
+        return Batch(self)
+
+    def get_query_page(self, querystr: str, *, parameters: dict[str, Any] | None = None,
+                       page_size: int | None = None, cursor: str | None = None) -> dict[str, Any]:
+        """Return one typed, revision-bound page from the server query engine."""
+        from .values import decode_value
+        if not isinstance(querystr, str) or not querystr:
+            raise ValueError("querystr must be a nonempty string")
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict) or any(not isinstance(k, str) for k in parameters):
+            raise TypeError("parameters must be a string-keyed dictionary")
+        if page_size is not None and (type(page_size) is not int or not 1 <= page_size <= 1000):
+            raise ValueError("page_size must be an integer from 1 through 1000")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ValueError("cursor must be a nonempty string")
+        options = {}
+        if page_size is not None:
+            options["pageSize"] = page_size
+        if cursor is not None:
+            options["cursor"] = cursor
+        bound_parameters = _query_parameters(parameters)
+        with self.call("deposit.get.queryPage", querystr, bound_parameters, options) as result:
+            first = next(result, None)
+            if first is None:
+                raise DepositError("INVALID_RESPONSE", "Query page returned no page record")
+            if next(result, None) is not None:
+                raise DepositError("INVALID_RESPONSE", "Query page returned multiple page records")
+            data = first.get("data")
+        if not isinstance(data, dict) or set(data) != {"columns", "rows", "nextCursor"}:
+            raise DepositError("INVALID_RESPONSE", "Query page returned an invalid page")
+        columns = data["columns"]
+        rows = data["rows"]
+        next_cursor = data["nextCursor"]
+        if (not isinstance(columns, list) or not isinstance(rows, list)
+                or (next_cursor is not None and not isinstance(next_cursor, str))):
+            raise DepositError("INVALID_RESPONSE", "Query page returned invalid columns, rows, or cursor")
+        names = []
+        for column in columns:
+            if not isinstance(column, dict) or set(column) != {"name", "type"}:
+                raise DepositError("INVALID_RESPONSE", "Query page returned invalid column metadata")
+            if not isinstance(column["name"], str) or not isinstance(column["type"], str) or column["name"] in names:
+                raise DepositError("INVALID_RESPONSE", "Query page returned duplicate or invalid columns")
+            names.append(column["name"])
+        detached_rows = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"values", "presence"}:
+                raise DepositError("INVALID_RESPONSE", "Query page returned an invalid row")
+            values, presence = row["values"], row["presence"]
+            if not isinstance(values, dict) or not isinstance(presence, dict) or set(values) != set(names) or set(presence) != set(names):
+                raise DepositError("INVALID_RESPONSE", "Query page row does not match its columns")
+            if any(type(flag) is not bool for flag in presence.values()):
+                raise DepositError("INVALID_RESPONSE", "Query page presence flags must be booleans")
+            decoded = {}
+            for column in columns:
+                name, kind = column["name"], column["type"]
+                try:
+                    decoded[name] = decode_value(kind, values[name]) if kind in _DOMAIN_VALUE_TYPES else values[name]
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise DepositError("INVALID_RESPONSE", "Query page contains an invalid typed value") from exc
+            detached_rows.append({"values": decoded, "presence": dict(presence)})
+        from ._paging import QueryPage
+        return QueryPage({"columns": [dict(column) for column in columns], "rows": detached_rows,
+                          "nextCursor": next_cursor})
+
+    def iter_query(self, querystr: str, *, parameters: dict[str, Any] | None = None,
+                   page_size: int = 200):
+        """Create a lazy row iterator over cursor-bound query pages."""
+        from ._paging import QueryIterator
+        if not isinstance(querystr, str) or not querystr:
+            raise ValueError("querystr must be a nonempty string")
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict):
+            raise TypeError("parameters must be a dictionary")
+        if type(page_size) is not int or not 1 <= page_size <= 1000:
+            raise ValueError("page_size must be an integer from 1 through 1000")
+        if self._batch_collection is not None:
+            raise RuntimeError("Store operations are unavailable while collecting a batch")
+        return QueryIterator(self, querystr, _query_parameters(parameters), page_size)
+
+    def query_from(self, queries):
+        """Yield one first page for each independent ``(query, parameters)`` pair."""
+        for item in queries:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise TypeError("queries must yield (querystr, parameters) pairs")
+            querystr, parameters = item
+            yield self.get_query_page(querystr, parameters=parameters)
+
+    def _entity_page(self, procedure: str, selection, *, page_size=200, transform=None, expected_revision=None):
+        from ._paging import EntityPageIterator
+        return EntityPageIterator(self, procedure, selection, page_size=page_size, transform=transform,
+                                  expected_revision=expected_revision)
+
+    def classes(self, name: str | None = None, *, page_size=200):
+        selection = None if name is None else {"name": name}
+        return self._entity_page("deposit.get.classPage", selection, page_size=page_size,
+                                 transform=lambda item, revision: self._entity_handle_at_revision(
+                                     "Class", _item_id(item), revision))
+
+    def objects(self, *, class_name: str | None = None, descriptors: Mapping[str, Any] | None = None,
+                object_id: str | None = None, page_size=200):
+        from .values import DType, TypedValue
+        if object_id is not None:
+            if class_name is not None or descriptors:
+                raise ValueError("object_id is exclusive with Class and Descriptor filters")
+            return iter((self.get_object_handle({"id": _stable_id(object_id)}),))
+        selection = {}
+        schema = None
+        schema_revision = None
+        if class_name is not None:
+            dclass = self.get_class_handle(class_name)
+            selection["classId"] = dclass.id
+            schema = dclass._schema
+            schema_revision = dclass._baseline_revision
+        if descriptors is not None:
+            if not isinstance(descriptors, Mapping) or any(not isinstance(k, str) for k in descriptors):
+                raise TypeError("descriptors must be a string-keyed mapping")
+            encoded = {}
+            for name, value in descriptors.items():
+                if isinstance(value, (TypedValue, DType)):
+                    if schema is None:
+                        raise TypeError("Typed Descriptor filters require class_name schema context")
+                    kind = schema.get(name)
+                    if kind is None:
+                        raise KeyError(name)
+                    encoded[name] = _descriptor_payload(value, kind)
+                else:
+                    encoded[name] = value
+            selection["descriptors"] = encoded
+        return self._entity_page("deposit.get.objectPage", selection or None, page_size=page_size,
+                                 expected_revision=schema_revision,
+                                 transform=lambda item, revision: self._entity_handle_at_revision(
+                                     "Object", _item_id(item), revision))
+
+    def members(self, dclass: DClass | str | dict[str, Any], *, page_size=200):
+        handle = dclass if isinstance(dclass, DClass) else self.get_class_handle(dclass)
+        self._validate_handle(handle, "Class")
+        return self._entity_page(
+            "deposit.get.classMembersPage", {"id": handle.id}, page_size=page_size,
+            transform=lambda item, revision: self._entity_handle_at_revision("Object", _item_id(item), revision),
+        )
+
+    def is_member(self, dobject: DObject, dclass: DClass | str | dict[str, Any]) -> bool:
+        self._validate_handle(dobject, "Object")
+        return dobject.has_class(dclass)
+
+    def descriptors(self, dobject: DObject, name: str | None = None, *, page_size=200):
+        self._validate_handle(dobject, "Object")
+        self._ensure_handle_current(dobject)
+        revision = _matching_handle_revision(dobject)
+        schema = dict(dobject._schema)
+        selection = {"objectId": dobject.id}
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise ValueError("Descriptor name must be a nonempty string")
+            selection["name"] = name
+
+        def decode(item, page_revision):
+            descriptor_name = item.get("name")
+            if not isinstance(descriptor_name, str):
+                raise DepositError("INVALID_RESPONSE", "Descriptor page item has no name")
+            kind = schema.get(descriptor_name)
+            if kind is None:
+                raise DepositError("INVALID_RESPONSE", "Descriptor page item has no checked declaration")
+            from .values import decode_value
+            try:
+                value = decode_value(kind, item.get("value"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise DepositError("INVALID_RESPONSE", "Descriptor page value does not match its declaration") from exc
+            return descriptor_name, value, kind
+
+        return self._entity_page("deposit.get.descriptorPage", selection, page_size=page_size, transform=decode,
+                                 expected_revision=revision)
+
+    def class_descriptors(self, dclass: DClass, name: str | None = None, *, page_size=200):
+        self._validate_handle(dclass, "Class")
+        selection = {"classId": dclass.id}
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise ValueError("Descriptor name must be a nonempty string")
+            selection["name"] = name
+        return self._entity_page(
+            "deposit.get.classDescriptorPage", selection, page_size=page_size,
+            transform=lambda item, revision: (item.get("name"), item.get("type"), item.get("comment", "")),
+        )
+
+    def relationships(self, src_object: DObject | None = None, tgt_object: DObject | None = None,
+                      label: str | None = None, *, page_size=200):
+        selection = {}
+        if src_object is not None:
+            self._validate_handle(src_object, "Object")
+            selection["sourceId"] = src_object.id
+        if tgt_object is not None:
+            self._validate_handle(tgt_object, "Object")
+            selection["targetId"] = tgt_object.id
+        if label is not None:
+            if not isinstance(label, str) or not label:
+                raise ValueError("Relationship label must be a nonempty string")
+            selection["label"] = label
+        return self._entity_page("deposit.get.relationshipPage", selection or None, page_size=page_size)
+
+    def class_relationships(self, src_class: DClass | None = None, tgt_class: DClass | None = None,
+                            label: str | None = None, *, page_size=200):
+        selection = {}
+        if src_class is not None:
+            self._validate_handle(src_class, "Class")
+            selection["sourceId"] = src_class.id
+        if tgt_class is not None:
+            self._validate_handle(tgt_class, "Class")
+            selection["targetId"] = tgt_class.id
+        if label is not None:
+            if not isinstance(label, str) or not label:
+                raise ValueError("Relationship label must be a nonempty string")
+            selection["label"] = label
+        return self._entity_page("deposit.get.classRelationshipPage", selection or None, page_size=page_size)
+
+    def neighbors(self, dobject: DObject, *, direction="both", page_size=200):
+        return self._neighbors(dobject, direction=direction, page_size=page_size, class_relationship=False)
+
+    def class_neighbors(self, dclass: DClass, *, direction="both", page_size=200):
+        return self._neighbors(dclass, direction=direction, page_size=page_size, class_relationship=True)
+
+    def _neighbors(self, source: DNode, *, direction, page_size, class_relationship):
+        kind = "Class" if class_relationship else "Object"
+        self._validate_handle(source, kind)
+        if direction not in {"outgoing", "incoming", "both"}:
+            raise ValueError("direction must be 'outgoing', 'incoming', or 'both'")
+        procedure = "deposit.get.classRelationshipPage" if class_relationship else "deposit.get.relationshipPage"
+        seen = set()
+        selections = []
+        if direction in {"outgoing", "both"}:
+            selections.append(("sourceId", "targetId"))
+        if direction in {"incoming", "both"}:
+            selections.append(("targetId", "sourceId"))
+        revision = None
+        for filter_key, other_key in selections:
+            iterator = self._entity_page(procedure, {filter_key: source.id}, page_size=page_size,
+                                         expected_revision=revision)
+            try:
+                for relationship in iterator:
+                    identity = relationship.get("id")
+                    other_id = relationship.get(other_key)
+                    if not isinstance(identity, str) or not isinstance(other_id, str):
+                        raise DepositError("INVALID_RESPONSE", "Relationship page omitted stable endpoint identity")
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    yield self._entity_handle_at_revision(kind, other_id, iterator.revision), relationship
+            finally:
+                revision = iterator.revision
+                iterator.close()
+
+    def get_user_tool(self, selection: str | dict[str, Any]):
+        if isinstance(selection, str):
+            selection = {"name": selection}
+        return self._call_one("deposit.get.userTool", selection)
+
+    def user_tools(self, name: str | None = None, *, page_size=200):
+        selection = None if name is None else {"name": name}
+        return self._entity_page("deposit.get.userToolPage", selection, page_size=page_size)
+
+    def _begin_batch_collection(self, batch) -> None:
+        with self._state_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("Store is closed")
+            if self._batch_collection is not None:
+                raise RuntimeError("Nested batches are not supported")
+            self._batch_collection = batch
+
+    def _end_batch_collection(self, batch) -> None:
+        with self._state_lock:
+            if self._batch_collection is batch:
+                self._batch_collection = None
+
+    def _submit_batch(self, commands: list[dict[str, Any]], *, pinned_revision: int | None = None) -> dict[str, Any]:
+        if not commands:
+            return {}
+        result = self._run_action("deposit.apply.batch", [commands], pinned_revision=pinned_revision)
+        if not isinstance(result, dict) or not isinstance(result.get("results"), dict):
+            raise DepositError("INVALID_RESPONSE", "Batch action returned no portable command results")
+        return result["results"]
 
     def cancel(self) -> bool:
         """Request cancellation of all requests for this token.
@@ -234,6 +1041,7 @@ class Store:
         Any action whose outcome is uncertain remains under its normal durable
         receipt and recovery path.
         """
+        self._assert_not_collecting_batch()
         return self._cancel(allow_closing=False)
 
     def _cancel(self, *, allow_closing: bool) -> bool:
@@ -264,6 +1072,7 @@ class Store:
             self._control_condition.notify_all()
 
     def close(self) -> None:
+        self._assert_not_collecting_batch()
         with self._close_lock:
             with self._state_lock:
                 if self._closed:
@@ -329,6 +1138,7 @@ class Store:
             self._operation_lock.release()
 
     def _read_entity(self, procedure: str, selection: dict[str, Any] | str) -> dict[str, Any]:
+        self._assert_not_collecting_batch()
         with self._serialized():
             query = (
                 f"CYPHER 25 CALL {procedure}($selection, $token) YIELD node "
@@ -341,6 +1151,64 @@ class Store:
             if data.get("namespaceId") != self._namespace_id:
                 raise DepositError("SCOPE_MISMATCH", "Entity belongs to another Namespace")
             return data
+
+    def _call_one(self, procedure: str, *arguments: Any) -> Any:
+        entry = store_procedure(procedure)
+        with self.call(procedure, *arguments) as result:
+            row = next(result, None)
+            if row is None:
+                raise DepositError("INVALID_RESPONSE", f"{procedure} returned no row")
+            if len(entry["columns"]) == 1:
+                column = entry["columns"][0]
+                value = row.get(column)
+                if not entry["action"] and column in {"node", "rel"}:
+                    value = result.to_data(value)
+            else:
+                value = dict(row)
+            if next(result, None) is not None:
+                raise DepositError("INVALID_RESPONSE", f"{procedure} returned multiple rows")
+            return _portable_input(value)
+
+    def _refresh_handle_snapshot(self, handle: DNode) -> None:
+        data, schema, revision = self._checked_entity_snapshot(handle.kind, {"id": handle.id})
+        handle._snapshot = data
+        handle._schema = dict(schema)
+        handle._baseline_revision = revision
+        handle._stale = False
+
+    def _descriptor_id(self, owner: DNode, name: str) -> str:
+        if owner.kind == "Class":
+            declaration = owner.declarations.get(name)
+            if declaration is None:
+                raise KeyError(name)
+            identity = declaration.get("id")
+        else:
+            self._ensure_handle_current(owner)
+            descriptor_ids = owner._snapshot.get("descriptorIds", {})
+            identity = descriptor_ids.get(name) if isinstance(descriptor_ids, Mapping) else None
+            if not identity:
+                # Portable Object snapshots intentionally omit Descriptor IDs.
+                # Resolve this one stable Descriptor selector in a checked read.
+                descriptor = self._call_one("deposit.get.descriptor", {"objectId": owner.id, "name": name})
+                identity = descriptor.get("id") if isinstance(descriptor, dict) else None
+        if not isinstance(identity, str) or not identity:
+            raise DepositError("INVALID_RESPONSE", "Descriptor snapshot returned no stable ID")
+        return identity
+
+    @staticmethod
+    def _ensure_handle_current(handle: DNode) -> None:
+        if handle.stale:
+            raise RuntimeError("Entity snapshot is stale; call refresh() before reading or editing")
+
+    def _run_multi_handle_action(self, procedure: str, arguments: list[Any], revision: int,
+                                 handles: tuple[DNode, ...]):
+        try:
+            return self._run_action(procedure, arguments, pinned_revision=revision)
+        except DepositError as exc:
+            if exc.code == "REVISION_CONFLICT":
+                for handle in handles:
+                    handle._mark_stale()
+            raise
 
     def _open_result(self, entry: dict[str, Any], arguments: tuple[Any, ...]) -> StoreResult:
         guard = self._serialized()
@@ -400,23 +1268,56 @@ class Store:
                 raise map_driver_error(exc) from exc
             raise
 
-    def _run_action(self, procedure: str, arguments: list[Any]) -> dict[str, Any]:
-        if procedure not in _ENTITY_QUERY:
-            raise ValueError("Unsupported Stage 2 action")
+    def _run_handle_action(self, handle: DNode, procedure: str, arguments: list[Any]) -> dict[str, Any]:
+        self._validate_handle(handle)
+        self._ensure_handle_current(handle)
+        return self._run_action(procedure, arguments, pinned_revision=handle._baseline_revision,
+                                stale_handle=handle)
+
+    def _run_action(self, procedure: str, arguments: list[Any], *, pinned_revision: int | None = None,
+                    stale_handle: DNode | None = None, post_snapshot: bool = False):
+        if self._batch_collection is not None and procedure != "deposit.apply.batch":
+            raise RuntimeError("Store mutations are unavailable while collecting a batch")
+        entry = store_procedure(procedure)
+        if entry.get("action") is not True:
+            raise ValueError("Prepared action coordinator accepts only declared action procedures")
         _portable_input(arguments)
         with self._serialized():
             self._update_observed_revision()
             revision = self._observed_revision
             if revision is None:
                 raise DepositError("REVISION_UNAVAILABLE", "Store has no observed Namespace revision")
+            if pinned_revision is not None and pinned_revision != revision:
+                if stale_handle is not None:
+                    stale_handle._mark_stale()
+                raise DepositError("REVISION_CONFLICT", "Entity handle baseline is stale; refresh and reapply explicitly")
             record = self._journal.create(self._identity, procedure, arguments, revision)
-            return self._resolve_action_locked(record, allow_new_prepare=True)
+            try:
+                outcome = self._resolve_action_locked(record, allow_new_prepare=True)
+                if post_snapshot:
+                    kind = "Class" if procedure == "deposit.create.class" else "Object"
+                    snapshot = self._checked_entity_snapshot(kind, {"id": outcome["id"]},
+                                                             _already_serialized=True)
+                    return outcome, snapshot
+                return outcome
+            except DepositError as exc:
+                if exc.code == "REVISION_CONFLICT" and stale_handle is not None:
+                    stale_handle._mark_stale()
+                raise
+
+    def _assert_not_collecting_batch(self) -> None:
+        if self._batch_collection is not None:
+            raise RuntimeError("Store operations are unavailable while collecting a batch")
 
     def _recover_pending_locked(self) -> None:
         for record in self._journal.unresolved(self._identity):
             try:
                 self._resolve_action_locked(record, allow_new_prepare=True)
             except DepositError as exc:
+                # A definitive failure notice is retained for Client discovery,
+                # while Store lifecycle recovery only finishes its detachment.
+                if self._journal.load(self._identity, record["key"])["state"] == "failed":
+                    continue
                 if exc.code == "REVISION_CONFLICT":
                     continue
                 raise DepositError("RECOVERY_PENDING", "An unresolved action could not be safely recovered") from exc
@@ -425,6 +1326,9 @@ class Store:
 
     def _resolve_action_locked(self, record: dict[str, Any], *, allow_new_prepare: bool) -> dict[str, Any]:
         with self._journal.action_lock(record["key"]):
+            # Another process may have resolved or recorded a definitive
+            # failure after this caller enumerated the journal.
+            record = self._journal.load(self._identity, record["key"])
             return self._resolve_action_with_lock(record, allow_new_prepare=allow_new_prepare)
 
     def _resolve_action_with_lock(self, record: dict[str, Any], *, allow_new_prepare: bool) -> dict[str, Any]:
@@ -432,6 +1336,10 @@ class Store:
         state = record["state"]
         if state == "conflicted":
             raise DepositError("REVISION_CONFLICT", "Pending action requires explicit refresh and reapplication")
+        if state == "failed":
+            raise _saved_failure_error(record["failure"])
+        if state == "failure_saved":
+            return self._finish_failed_action(record)
 
         if state in {"intent", "prepare_sent"}:
             self._journal.update(self._identity, key, state="prepare_sent")
@@ -466,6 +1374,16 @@ class Store:
                 if exc.code == "REVISION_CONFLICT":
                     self._release_conflict(record)
                     raise
+                if (status.get("state") == "prepared"
+                        and getattr(exc, "_server_reported", False) is True
+                        and exc.retryable is False
+                        and exc.code in _DEFINITIVE_DOMAIN_FAILURE_CODES):
+                    failed = self._journal.update(
+                        self._identity, key, state="failure_saved",
+                        failure={"code": exc.code, "message": exc.message, "details": exc.details,
+                                 "request_id": exc.request_id, "retryable": False},
+                    )
+                    return self._finish_failed_action(failed, status=status)
                 raise
             return self._save_and_release(
                 record,
@@ -482,11 +1400,29 @@ class Store:
             self._control("deposit.action.release")
             saved = self._journal.update(self._identity, key, state="released")
             self._update_observed_revision()
+            self._invalidate_handles()
             return saved["outcome"]
 
         if state == "released":
             return record["outcome"]
         raise JournalError("Recovery journal state cannot be resumed")
+
+    def _finish_failed_action(self, record: dict[str, Any], *, status: dict[str, Any] | None = None):
+        """Reconcile and detach a known rollback without executing it again."""
+        key = record["key"]
+        status = status if status is not None else self._control("deposit.action.status", key)
+        if status.get("state") == "committed":
+            return self._save_and_release(record, status)
+        if status.get("state") != "prepared":
+            raise DepositError("RECOVERY_PENDING", "Failed action release remains unconfirmed")
+        resumed = self._control("deposit.action.resume", key)
+        if resumed.get("state") == "committed":
+            return self._save_and_release(record, resumed)
+        if resumed.get("state") != "prepared":
+            raise DepositError("RECOVERY_PENDING", "Failed action release remains unconfirmed")
+        self._control("deposit.action.release")
+        saved = self._journal.update(self._identity, key, state="failed")
+        raise _saved_failure_error(saved["failure"])
 
     def _assert_preconditions_unchanged(self, record: dict[str, Any], allowed: bool) -> None:
         if not allowed:
@@ -599,12 +1535,14 @@ class Store:
         key = record["key"]
         current = self._journal.load(self._identity, key)
         if current["state"] not in {"outcome_saved", "release_sent", "released"}:
+            failure_changes = {"failure": None} if "failure" in current else {}
             current = self._journal.update(
                 self._identity,
                 key,
                 state="outcome_saved",
                 outcome=_portable_input(outcome),
                 operation_id=status.get("operationId"),
+                **failure_changes,
             )
         if current["state"] == "released":
             return current["outcome"]
@@ -615,6 +1553,7 @@ class Store:
         self._control("deposit.action.release")
         saved = self._journal.update(self._identity, key, state="released")
         self._update_observed_revision()
+        self._invalidate_handles()
         return saved["outcome"]
 
     def _release_conflict(self, record: dict[str, Any]) -> None:
@@ -666,6 +1605,10 @@ class Store:
 
 
 def _selector(value: str | dict[str, Any], kind: str) -> str | dict[str, Any]:
+    if isinstance(value, DNode):
+        if value.kind != kind:
+            raise TypeError(f"{kind} selector has the wrong handle kind")
+        return {"id": value.id, "kind": value.kind, "namespaceId": value.namespace_id}
     if isinstance(value, str) and value:
         return value
     if isinstance(value, dict):
@@ -674,6 +1617,168 @@ def _selector(value: str | dict[str, Any], kind: str) -> str | dict[str, Any]:
         if value.get("kind") == kind and isinstance(value.get("id"), str):
             return {"id": value["id"]}
     raise TypeError(f"{kind} selector must be a name or a stable-ID record")
+
+
+def _schema_from_class_data(data: Any) -> dict[str, str]:
+    if not isinstance(data, Mapping):
+        return {}
+    declarations = data.get("descriptors", [])
+    if not isinstance(declarations, list):
+        return {}
+    schema = {}
+    for declaration in declarations:
+        if not isinstance(declaration, Mapping):
+            continue
+        name, type_name = declaration.get("name"), declaration.get("type")
+        if isinstance(name, str) and isinstance(type_name, str):
+            schema[name] = type_name
+    return schema
+
+
+def _stable_id(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError("Entity selector must be a nonempty stable ID")
+    return value
+
+
+def _item_id(item: Mapping[str, Any]) -> str:
+    """Extract a stable public entity ID from a portable page item."""
+    identity = item.get("id")
+    if not isinstance(identity, str) or not identity:
+        raise DepositError("INVALID_RESPONSE", "Entity page item has no stable public ID")
+    return identity
+
+
+def _position_value(value: Any) -> tuple[int | float, int | float]:
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise TypeError("position must contain exactly two numeric coordinates")
+    if any(type(item) not in {int, float} or not math.isfinite(item) for item in value):
+        raise TypeError("position coordinates must be finite numbers")
+    return value[0], value[1]
+
+
+def _matching_handle_revision(*handles: DNode) -> int:
+    if not handles:
+        raise ValueError("At least one entity handle is required")
+    revisions = []
+    for handle in handles:
+        if handle.stale:
+            raise RuntimeError("Entity snapshot is stale; call refresh() before editing")
+        revision = handle._baseline_revision
+        if type(revision) is not int or revision < 0:
+            raise ValueError("Entity handle has no checked snapshot revision")
+        revisions.append(revision)
+    if len(set(revisions)) != 1:
+        raise ValueError("Entity handles have conflicting checked snapshot revisions")
+    return revisions[0]
+
+
+def _class_declarations(values: Any) -> list[dict[str, Any]]:
+    if isinstance(values, Mapping):
+        source = []
+        for name, item in values.items():
+            if isinstance(item, str):
+                source.append((name, item))
+            elif isinstance(item, (tuple, list)):
+                source.append((name, *item))
+            elif isinstance(item, Mapping):
+                source.append({"name": name, **item})
+            else:
+                raise TypeError("Class declaration values must be type names or declaration records")
+    elif isinstance(values, (tuple, list)):
+        source = list(values)
+    else:
+        raise TypeError("descriptors must be a mapping or sequence")
+    declarations = []
+    names = set()
+    for order, item in enumerate(source):
+        if isinstance(item, Mapping):
+            declaration = dict(item)
+            name, type_name = declaration.get("name"), declaration.get("type")
+            comment = declaration.get("comment", "")
+            order_value = declaration.get("order", order)
+        elif isinstance(item, (tuple, list)) and len(item) in {2, 3}:
+            name, type_name = item[:2]
+            comment = item[2] if len(item) == 3 else ""
+            order_value = order
+            declaration = {}
+        else:
+            raise TypeError("Each Class declaration must be (name, type[, comment]) or a mapping")
+        if not isinstance(name, str) or not name or not isinstance(type_name, str) or not type_name:
+            raise ValueError("Class declaration name and type must be nonempty strings")
+        if name in names:
+            raise ValueError(f"Duplicate Class declaration {name!r}")
+        if not isinstance(comment, str) or type(order_value) is not int or order_value < 0:
+            raise ValueError("Class declaration comment/order is invalid")
+        names.add(name)
+        declarations.append({"name": name, "type": type_name, "order": order_value, "comment": comment})
+    return declarations
+
+
+def _descriptor_payload(value: Any, declared: str | None) -> Any:
+    from .values import DType, TypedValue, _infer_type, encode_value
+    if declared is not None:
+        if isinstance(value, TypedValue):
+            if value.type != declared:
+                raise TypeError(f"Descriptor is declared as {declared}")
+            value = value.value
+        elif isinstance(value, DType):
+            if value._type != declared:
+                raise TypeError(f"Descriptor is declared as {declared}")
+            value = value.value
+        return encode_value(declared, value)
+    if isinstance(value, TypedValue):
+        return value.to_dict()
+    if isinstance(value, DType):
+        return value.to_dict()
+    kind = _infer_type(value)
+    return {"type": kind, "value": encode_value(kind, value)}
+
+
+def _encode_object_properties(properties: dict[str, Any], schema: Mapping[str, str]) -> dict[str, Any]:
+    from .values import DType, TypedValue, _infer_type, encode_value
+    if not isinstance(properties, dict):
+        raise TypeError("Object properties must be a dictionary")
+    result = dict(properties)
+    if "descriptors" in result:
+        descriptors = result["descriptors"]
+        if not isinstance(descriptors, Mapping) or any(not isinstance(name, str) for name in descriptors):
+            raise TypeError("Object descriptors must be a string-keyed mapping")
+        encoded = {}
+        for name, value in descriptors.items():
+            type_name = schema.get(name)
+            if type_name is None:
+                if isinstance(value, (TypedValue, DType)):
+                    encoded[name] = value.to_dict()
+                else:
+                    kind = _infer_type(value)
+                    encoded[name] = {"type": kind, "value": encode_value(kind, value)}
+            else:
+                if isinstance(value, TypedValue):
+                    if value.type != type_name: raise TypeError(f"Descriptor {name!r} is declared as {type_name}")
+                    value = value.value
+                elif isinstance(value, DType):
+                    if value._type != type_name: raise TypeError(f"Descriptor {name!r} is declared as {type_name}")
+                    value = value.value
+                encoded[name] = encode_value(type_name, value)
+        result["descriptors"] = encoded
+    return _portable_input(result)
+
+
+def _query_parameters(values: dict[str, Any]) -> dict[str, Any]:
+    from .values import DType, TypedValue
+    result = {}
+    for key, value in values.items():
+        if isinstance(value, (TypedValue, DType)):
+            result[key] = value.to_dict()
+        elif isinstance(value, dict):
+            result[key] = _query_parameters(value)
+        elif isinstance(value, list):
+            result[key] = [_query_parameters(item) if isinstance(item, dict) else item.to_dict()
+                           if isinstance(item, (TypedValue, DType)) else item for item in value]
+        else:
+            result[key] = value
+    return result
 
 
 def _portable_input(value: Any) -> Any:

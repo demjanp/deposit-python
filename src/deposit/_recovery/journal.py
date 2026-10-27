@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import stat
 import uuid
@@ -23,16 +24,19 @@ MAX_UNRESOLVED = 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 MAX_USER_BYTES = 1024 * 1024 * 1024
 RESULT_RETENTION = timedelta(days=30)
-UNRESOLVED_STATES = frozenset({"intent", "prepare_sent", "prepared", "executing", "outcome_saved", "release_sent", "conflicted"})
+UNRESOLVED_STATES = frozenset({"intent", "prepare_sent", "prepared", "executing", "outcome_saved", "release_sent", "conflicted", "failure_saved"})
+PENDING_STATES = UNRESOLVED_STATES | {"failed"}
 _TRANSITIONS = {
     "intent": {"prepare_sent", "prepared", "outcome_saved", "conflicted"},
     "prepare_sent": {"prepared", "executing", "outcome_saved", "conflicted"},
     "prepared": {"executing", "outcome_saved", "conflicted"},
-    "executing": {"prepared", "outcome_saved", "conflicted"},
+    "executing": {"prepared", "outcome_saved", "conflicted", "failure_saved"},
     "outcome_saved": {"release_sent", "released"},
     "release_sent": {"outcome_saved", "released"},
     "released": {"released"},
     "conflicted": {"conflicted"},
+    "failure_saved": {"failure_saved", "failed", "outcome_saved"},
+    "failed": {"failed"},
 }
 
 
@@ -156,8 +160,10 @@ class ProtectedJournal:
 
     def update(self, identity: DeploymentIdentity, key: str, **changes: Any) -> dict[str, Any]:
         record = self.load(identity, key)
-        if set(changes) - set(record):
+        if set(changes) - (set(record) | {"failure"}):
             raise JournalError("Recovery journal update contains unsupported fields")
+        if "failure" in record and changes.get("failure", record["failure"]) not in (record["failure"], None):
+            raise JournalError("Saved failure metadata is immutable")
         if "result_format" in changes:
             raise JournalError("Recovery result format metadata is immutable")
         next_state = changes.get("state", record["state"])
@@ -165,7 +171,7 @@ class ProtectedJournal:
             raise JournalError(f"Invalid recovery transition {record['state']} -> {next_state}")
         record.update(changes)
         record["updated_at"] = _utc_now()
-        if next_state == "released" and record["resolved_at"] is None:
+        if next_state in {"released", "failed"} and record["resolved_at"] is None:
             record["resolved_at"] = record["updated_at"]
         self._validate(record, identity, key)
         self._write(record)
@@ -216,7 +222,7 @@ class ProtectedJournal:
         removed = 0
         with self.storage.lock("journal-index"):
             for record in self.records(identity):
-                if record["state"] != "released":
+                if record["state"] not in {"released", "failed"}:
                     continue
                 try:
                     resolved = datetime.fromisoformat(record["resolved_at"])
@@ -298,7 +304,7 @@ class ProtectedJournal:
                 continue
             try:
                 record = self._decode_record(self.storage.read(name), name)
-                if record["state"] != "released":
+                if record["state"] not in {"released", "failed"}:
                     continue
                 resolved = _aware_datetime(record["resolved_at"])
             except Exception as exc:
@@ -343,7 +349,7 @@ class ProtectedJournal:
             "format_version", "key", "public_id", "identity", "procedure", "arguments", "snapshot_revision",
             "state", "created_at", "updated_at", "outcome", "operation_id", "resolved_at",
         }
-        allowed = required | {"result_format"}
+        allowed = required | {"result_format", "failure"}
         if not isinstance(record, dict) or not required <= set(record) or set(record) - allowed:
             raise JournalError("Recovery journal record has an unsupported format")
         if "result_format" in record and (
@@ -380,7 +386,13 @@ class ProtectedJournal:
                 raise JournalError("Recovery journal timestamp is invalid") from exc
         if record["operation_id"] is not None and not isinstance(record["operation_id"], str):
             raise JournalError("Recovery journal operation metadata is invalid")
-        if record["state"] == "released":
+        failure = record.get("failure")
+        if record["state"] in {"failure_saved", "failed"}:
+            if not _valid_failure(failure) or record["outcome"] is not None:
+                raise JournalError("Saved recovery failure is invalid")
+        elif failure is not None:
+            raise JournalError("Recovery failure metadata is invalid for its state")
+        if record["state"] in {"released", "failed"}:
             if not isinstance(record["outcome"], (dict, list, str, int, float, bool, type(None))):
                 raise JournalError("Released recovery outcome is invalid")
             if not isinstance(record["resolved_at"], str):
@@ -397,6 +409,23 @@ class ProtectedJournal:
             if not valid_named_rows_result(record["outcome"]):
                 raise JournalError("Advanced recovery result is invalid")
         return record
+
+
+def _valid_failure(failure: Any) -> bool:
+    if not isinstance(failure, dict) or set(failure) != {"code", "message", "details", "request_id", "retryable"}:
+        return False
+    if (not isinstance(failure["code"], str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", failure["code"]) is None
+            or not isinstance(failure["message"], str) or not 1 <= len(failure["message"]) <= 2048
+            or failure["retryable"] is not False
+            or (failure["details"] is not None and not isinstance(failure["details"], dict))):
+        return False
+    request_id = failure["request_id"]
+    if request_id is not None:
+        try:
+            uuid.UUID(request_id)
+        except (ValueError, TypeError, AttributeError):
+            return False
+    return True
 
 
 def valid_named_rows_result(value: Any) -> bool:

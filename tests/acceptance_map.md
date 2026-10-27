@@ -1,4 +1,4 @@
-# Stage 1-2 acceptance assertion map
+# Acceptance assertion map
 
 This map separates declaration parity, Python behavior, and live integration
 evidence. Server catalog parity or Java tests alone do not establish Python
@@ -133,3 +133,35 @@ workspace grants extra Windows principals; 46 other selected cases passed.
 The owner-managed Stage 3 wheel/sdist gate passed the complete package/core/
 gateway selections, including this test, so the interactive failure is not
 counted as a product regression.
+
+## Stage 4 acceptance map
+
+Stage 4 ran the cumulative `-Stage 4 -Group domain` selection against installed
+wheel and sdist artifacts plus the owner-managed live Domain workflow. Final run
+`20261027T134920925Z-17cf7ecc` recorded 25 commands, all exit code 0 with no
+timeouts. Wheel tests passed: package 43, manifest 3, storage 14, identity 6,
+core 115, gateway 66 and domain 133. Sdist tests passed: package 43, core 115,
+gateway 66 and domain 133. Installed Seed passed 4 tests with 2 expected skips;
+Verify after the owner-managed Stop/Start passed 6 tests. The retained result
+record SHA-256 is
+`FAE7F1E6B16259E27E472AF81BE9FADE38927B787E9DD5E4F227B6527D48FD4B`.
+
+| ID | Assertion and concrete test | Command/group | Current evidence / limit |
+|---|---|---|---|
+| 4A | `test_integer_bounds_float_fidelity_and_nonfinite_rejection`, temporal precision and naive local temporal codec tests, `test_duration_and_point_preserve_calendar_months_and_srid`, nested-list/DDict null tests, and the installed wire assertions in `test_installed_domain_values_snapshots_pages_and_batch_recovery`. | `Invoke-PythonTests.ps1 -Stage 4 -Group domain`; wheel and sdist value/domain selections; installed Domain Seed | Passed. Includes signed 64-bit boundaries, finite floats, nanosecond/offset values, local built-in time/datetime, negative/calendar duration, SRID, typed nulls, nested and empty/all-null lists, plus independent wire values. |
+| 4B | `test_object_handle_distinguishes_missing_from_explicit_null_and_uses_checked_schema`, `test_stale_handle_preserves_edit_until_explicit_refresh_and_reapply`, `test_class_handle_declarations_are_detached_and_id_stable`, batch class Descriptor type/rename invalidation tests, and live schema-conversion/declaration assertions. | Wheel/sdist entity, batch, store and value tests; installed Domain Seed | Passed. Missing/default/unknown remain distinct; detached edits require assignment; schema conversion and concurrent revision conflict do not decode against a newer unrelated declaration. |
+| 4C | `test_handles_are_bound_to_exact_store_and_namespace_identity`, `test_domain_convenience_routes_use_manifest_selector_shapes`, and installed create/read/update/delete, foreign Store, stale edit and explicit refresh checks in `test_installed_domain_values_snapshots_pages_and_batch_recovery`. | Wheel/sdist entity/store selections; installed Domain Seed | Passed for representative Class/Object/Descriptor CRUD and selectors. Specialized procedure coverage remains in [procedure_coverage_ledger.md](../docs/procedure_coverage_ledger.md). |
+| 4D | `tests/unit/test_pages.py` covers query presence, empty/multiple pages, cursor validation, early close, revision fences during snapshot/page collection and after buffered/final-page transforms, descriptor schema revision, neighbor direction consistency and iterator closure. `test_installed_domain_values_snapshots_pages_and_batch_recovery` covers live page/query behavior. | Wheel/sdist pages/store/domain selections; installed Domain Seed | Passed. Cursor scope/revision rejection and no-mixed-revision checks are covered. Revision fences conservatively reject any Namespace sequence advance. |
+| 4E | `test_collection_failure_submits_nothing_and_references_are_batch_local`, `test_batch_revalidates_the_whole_request_before_submission`, `test_batch_exact_result_is_saved_and_recovered_after_lost_release_reply`, and installed Seed→Stop/Start→Verify lost-coordinator-reply recovery in `test_installed_domain_values_snapshots_pages_and_batch_recovery`. | Wheel/sdist batch/store/domain selections; installed Domain Verify after restart | Passed. Earlier-result references, rollback, limits and exact saved outcomes are checked. The live child executes the real batch and exits after the server reply returns but before the coordinator receives it; `Client.recover` returns the original class/object/Descriptor results, and persisted effects are independently checked. This is a coordinator-visible reply-loss injection, not a physical network fault. |
+
+Failure/correction record: an initial build-bundle probe treated Git checkout
+progress text on stderr as a terminating PowerShell 5.1 error; delaying optional
+Git progress for the gate process let the probe pass. Two early live attempts
+exposed test defects (the driver's nanosecond-formatted temporal string and a
+duplicate close of a cleared Store variable); both were corrected before the
+final pass. Those two live failures were acceptance-test issues, not
+implementation regressions. The suite owner reported `cleaned`,
+`terminalCleanup=true`, and `cleanupError=null` after each run. Reviewed
+redacted result JSON and live Seed/Verify summaries are retained at
+`../../test_harness/results/python-20261027T134920925Z-17cf7ecc/results.json`
+and `../../test_harness/results/20261027T135046795Z-d3d67315/`.

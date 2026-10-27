@@ -138,6 +138,51 @@ def test_journal_identity_and_corrupt_versions_fail_closed():
         journal_store.load(identity, record["key"])
 
 
+def _save_definitive_failure(journal_store, identity):
+    record = journal_store.create(identity, "deposit.apply.batch", [[]], 1)
+    for state in ("prepare_sent", "prepared", "executing"):
+        record = journal_store.update(identity, record["key"], state=state)
+    return journal_store.update(identity, record["key"], state="failure_saved", failure={
+        "code": "NOT_FOUND", "message": "Class not found", "details": {"commandIndex": 1},
+        "request_id": None, "retryable": False,
+    })
+
+
+def test_failure_release_records_count_as_unresolved_and_terminal_notices_do_not(monkeypatch):
+    storage = _MemoryStorage()
+    journal_store = ProtectedJournal(store=storage)
+    identity = _identity()
+    monkeypatch.setattr(journal, "MAX_UNRESOLVED", 1)
+    record = _save_definitive_failure(journal_store, identity)
+    assert record["resolved_at"] is None
+    with pytest.raises(ProtectedStorageError, match="1,024 unresolved"):
+        journal_store.create(identity, "deposit.create.class", ["Blocked", {}], 1)
+    terminal = journal_store.update(identity, record["key"], state="failed")
+    assert terminal["resolved_at"] and journal_store.unresolved(identity) == []
+    assert journal_store.create(identity, "deposit.create.class", ["Allowed", {}], 1)["state"] == "intent"
+    with pytest.raises(JournalError, match="immutable"):
+        journal_store.update(identity, record["key"], failure={**terminal["failure"], "message": "changed"})
+
+
+def test_only_confirmed_terminal_failure_notices_expire_after_retention():
+    storage = _MemoryStorage()
+    journal_store = ProtectedJournal(store=storage)
+    identity = _identity()
+    pending = _save_definitive_failure(journal_store, identity)
+    done = _save_definitive_failure(journal_store, identity)
+    done = journal_store.update(identity, done["key"], state="failed")
+    old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    for name, payload in tuple(storage.records.items()):
+        record = json.loads(payload)
+        record["created_at"] = record["updated_at"] = old
+        if record["key"] == done["key"]:
+            record["resolved_at"] = old
+        storage.records[name] = json.dumps(record).encode()
+    assert journal_store.cleanup_expired(identity) == 1
+    assert journal_store.load(identity, pending["key"])["state"] == "failure_saved"
+    assert journal_store.load(identity, pending["key"])["resolved_at"] is None
+
+
 def test_corrupt_journal_json_fails_closed():
     storage = _MemoryStorage()
     journal_store = ProtectedJournal(store=storage)

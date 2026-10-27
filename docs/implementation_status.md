@@ -1,6 +1,6 @@
 # Deposit Python 2 implementation status
 
-Updated: 2026-10-26.
+Updated: 2026-10-27.
 
 ## Authority and baseline
 
@@ -24,7 +24,7 @@ acceptance.
 | 1 | Contracts, package and live test infrastructure | Finalized | 1A-1E complete | Foundation gate passed; independent architect PASS, no blocking findings | All three Stage 1 commits verified; commit IDs recorded below |
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
-| 4 | Typed domain, queries and batches | Not started | 4A-4E pending | Not run / no implementation review | No stage commits |
+| 4 | Typed domain, queries and batches | Verified and reviewed (finalization pending) | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Stage commits pending |
 | 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
@@ -38,7 +38,8 @@ finalization fails; resume pending work without duplicating commits.
 ## Acceptance and procedure coverage
 
 Stage 1 acceptance IDs 1A-1E and Stage 2 acceptance IDs 2A-2F are verified and
-reviewed as recorded below. Stages 3-6 remain pending. Record separate states for supported dispatch, convenient
+reviewed as recorded below. Stages 3 and 4 are also verified and reviewed;
+Stages 5-6 remain pending. Record separate states for supported dispatch, convenient
 Python behavior and executed integration acceptance. A catalog count or Java
 regression result cannot satisfy the latter two fields. No specialized scenario
 can remain unassigned beyond its stage or be waived at release.
@@ -343,3 +344,95 @@ Tracker update state: Finalized. Separate Stage 3 implementation commits:
 
 The final Stage 3 tracker-state follow-up is a separate Python commit; its ID is
 recorded in the local project-run checkpoint and Git history.
+
+### Stage 4 / `deposit-python-20261025-01` / verified and reviewed (finalization pending)
+
+Scope and prerequisites checked: Stage 3 was finalized in Python, Server and
+Hub. Stage 4 adds typed values, stable Store-bound entity handles, revision-
+checked snapshots and pages, query iteration, and atomic batches. It preserves
+the existing prepared-action coordinator, exact command replay, caller-visible
+explicit refresh/reapply behavior, existing public page/result shapes, and the
+Stage 3 server-scope action and prune execution deferrals.
+
+Implemented: Python typed codecs and DType/DDict/DGeometry/DResource
+representations; entity handles and CRUD helpers; batch collection, validation,
+temporary references and saved outcomes; and query/page iterators. Fresh
+Namespace sequence fences now bind snapshots, fully consumed pages, buffered
+handle transformations, descriptor schema decoding and neighbor traversal to a
+fixed revision. Batch schema knowledge is invalidated after descriptor type or
+name changes. Geometry aliases and naive built-in local temporal inputs are
+supported. The installed live test covers a real committed batch whose client
+process exits before returning the reply, followed by owner restart, public
+`Client.recover`, exact saved outcomes and independent effect checks.
+
+Acceptance ID -> evidence:
+
+- **4A:** `tests/unit/test_values.py` covers numeric bounds, finite floats,
+  temporal/offset precision, naive local built-ins, calendar duration, Point
+  SRID, nested typed collections and nulls. Installed wire assertions passed.
+- **4B:** entity/store/batch tests cover missing vs null, detached edits,
+  declaration changes and conversion, revision conflicts, batch schema
+  invalidation, and explicit refresh. Installed schema and assignment checks
+  passed.
+- **4C:** Store/entity tests and installed checks passed for Class/Object/
+  Descriptor CRUD, name/UUID selectors, handle ownership, stale edits and
+  refresh.
+- **4D:** page/store tests cover query presence, multiple/empty pages, cursor
+  validation, sequence fences during collection and after buffered/final-page
+  transforms, descriptor/neighbor consistency and reader cleanup. Installed
+  query/page checks passed.
+- **4E:** batch/store tests cover reference ownership, whole-request validation,
+  rollback, limits and saved results. Installed Seed→Stop/Start→Verify proved
+  recovery of the original batch result after the coordinator-visible reply was
+  lost and checked persisted effects. The test describes child termination
+  after the server response, not a physical network fault.
+
+Exact cumulative command: `Invoke-PythonTests.ps1 -Stage 4 -Group domain` using
+Python 3.14.4 and the verified Deposit Server `2.0.0-dev.77` bundle from source
+commit `c1489c18b72c4a98d8bfb46a3926fe8195b3e2e6`. Run
+`20261027T134920925Z-17cf7ecc`: 25 commands, all exit 0, no timeouts. Wheel:
+package 43, manifest 3, storage 14, identity 6, core 115, gateway 66, domain
+133. Sdist: package 43, core 115, gateway 66, domain 133. Runner and bundle
+probes passed. Installed Domain Seed passed 4 / 2 skipped; Verify after the
+owner-managed restart passed 6. Result JSON SHA-256
+`FAE7F1E6B16259E27E472AF81BE9FADE38927B787E9DD5E4F227B6527D48FD4B` is at
+`../test_harness/results/python-20261027T134920925Z-17cf7ecc/results.json`;
+live summaries are at `../test_harness/results/20261027T135046795Z-d3d67315/`.
+The reviewed redacted evidence archive contains 22 files with verified hashes;
+raw recovery artifacts were excluded.
+
+Supporting Server regressions passed earlier in this Stage 4 run: unit
+`ValueCodecTest,StrictValuesTest` 4/4; integration `BatchMutationIT`,
+`QueryLanguageIT`, and `TypedDataModelIT` 43/43. No Server source changed in
+the subsequent review corrections, so those selections remain applicable.
+
+Failure/correction record: a direct PowerShell script invocation was blocked by
+execution policy; the authorized run used process-scoped `-ExecutionPolicy
+Bypass` without changing machine policy. One build-bundle probe treated Git
+checkout progress on stderr as a terminating PowerShell 5.1 error; delaying
+optional Git progress for the gate process made the probe pass. These were
+minor invocation/harness adjustments. Two initial live attempts exposed test
+defects, not implementation regressions: Neo4j formatted local fractional
+seconds at nanosecond precision, and a test attempted to close a Store after
+clearing its reference. Both were corrected before the final passing run. Each
+suite journal ended `cleaned`, `terminalCleanup=true`, `cleanupError=null`.
+
+Independent architect review: PASS, no unresolved blocking findings. The fresh
+review checked the Python, Server runner and Hub contract diffs against the
+Stage 4 plan and approved decisions, confirmed all prior findings were fixed,
+and verified the 4A-4E assertion map. The review did not run tests; it inspected
+the accessible redacted results, live logs and cleanup summary.
+
+Acceptance traceability is recorded in [tests/acceptance_map.md](../tests/acceptance_map.md)
+and [docs/acceptance_map.md](acceptance_map.md). Stage 4 is verified and
+reviewed. Separate Stage 4 commits completed so far:
+
+- Server: `5e46b1343069a5e55f4da3b3646061ab5cf0d97f` —
+  `project-run deposit-python-20261025-01: Stage 4 - Domain acceptance routing`
+- Hub: `c65b68750a5ed15b9ba87dcfab892ef3dadac1cc` —
+  `project-run deposit-python-20261025-01: Stage 4 - Python domain contract`
+
+Python source/tests/maps and this tracker are to be committed together; a
+separate tracker follow-up will record the resulting Python commit ID. Preserve
+unrelated Server POM/.gitignore/deleted skill-copy changes and the user-injected
+Python AGENTS.md change.
