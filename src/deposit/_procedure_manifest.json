@@ -3,12 +3,12 @@
   "source": {
     "repository": "deposit-server",
     "files_sha256": {
-      "runtime/public-api.json": "d8afdd5cce6ef3aa17503d548caf3881edc53b026d9e3e783770f45179997a4d",
-      "plugin/src/main/java/deposit/api/DepositAPI.java": "6b897e5d97b6abc503388238afe7f30763e8290a44ae9980eb90b98be65727bb",
-      "plugin/src/main/java/org/deposit/runtime/Discovery.java": "a8e183bb8fdd3c7feea9ad1c975399e30755e0eca793200a8e738a1f41531df0",
-      "plugin/src/main/java/deposit/common/ProcedureCatalog.java": "3b5bbdf04a452f52161f8cce751ad9b1028d3855d13d72fa3869a7aa3752014e",
-      "plugin/src/main/java/deposit/common/PublicResults.java": "50b67a8f6af32f5385e052d9b7edaeb7070bef9401311617807a265cd3ad8a9c",
-      "plugin/src/main/java/deposit/service/DomainService.java": "7ca61bb9be8e7ea14455cbc9744997f015bab3d34705b85c73d9ab517f8dc90c"
+      "runtime/public-api.json": "4a7ab3ad34cbfbec8eb33d67c1222e187cb1c38424020b2cd1e1bdae5d8dd89d",
+      "plugin/src/main/java/deposit/api/DepositAPI.java": "039c52217f0d9c747eb9b7d86fd47403f0512feac687888ab865369b5217479e",
+      "plugin/src/main/java/org/deposit/runtime/Discovery.java": "fd90a706ad5b87ed0e71de279888e58d580660c9e29682ac5c67f0377ce51232",
+      "plugin/src/main/java/deposit/common/ProcedureCatalog.java": "ce517b17ed8836335cd09215335c52e6e763c92f4a5aa9c77e7b643a386683e8",
+      "plugin/src/main/java/deposit/common/PublicResults.java": "27274be2b8adf36e13856c78225ea1b13ebb10cfb3cbec18b2607d733fbdcfcb",
+      "plugin/src/main/java/deposit/service/DomainService.java": "5cab363e537153b87022ece73c038eb9311d7506c6649bbca1134a35b9d85ad2"
     },
     "catalog_entries": 123,
     "discovery_entry": "deposit.get.info",
@@ -16,7 +16,7 @@
     "neo4j_version": "2026.05.0"
   },
   "support": {
-    "target_server_version": "2.0.0-dev.77",
+    "target_server_version": "2.0.0-dev.77-post.6.g4f5f6f2-SNAPSHOT",
     "target_neo4j_version": "2026.05.0",
     "target_python": "3.14.x (Windows x64)",
     "supported_python": ">=3.14,<3.15",

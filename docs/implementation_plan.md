@@ -515,6 +515,17 @@ Acceptance:
   rename/deletion, administrative mode and server-scope recovery obey the contract.
   Interrupted analysis/export/staging preserves operational IDs and expiry behavior.
 
+Approved execution clarifications for `deposit-python-20261025-01`: retain the
+earlier deferral of full-Namespace clone and Client-owned server-scope mutation
+recovery until their separate identity/recovery contract is designed. The user
+also deferred a companion-content API for resource-bearing `from_dict` inputs;
+dictionary/subtree helpers must reject missing resource bytes before upload or
+analysis. Complete resource transfer and the Server's verified Exchange-package
+route remain in scope. `DResource.is_image` remains unknown without verified
+classification metadata. Python's exact supported Server version will be
+retargeted to the committed Stage 5 artifact, with equality checks retained and
+clean committed-artifact verification required before finalization.
+
 **Gate:** runner `-Stage 5`; family-specific workflows and actual interrupted
 transfer/import scenarios. Relevant server selections come from the verification
 guide (resource/geometry, Patterns, formats, history, clone/import, authorization,

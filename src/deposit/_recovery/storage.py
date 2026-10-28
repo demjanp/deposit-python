@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import ctypes
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import os
 import re
 import secrets
 import stat
-import subprocess
 import threading
 import time
 from ctypes import wintypes
@@ -98,41 +97,320 @@ def _crypt(data: bytes, *, protect: bool) -> bytes:
     return result
 
 
-def _secure_acl(path: Path, *, directory: bool) -> None:
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("length", wintypes.DWORD), ("descriptor", wintypes.LPVOID),
+                ("inherit", wintypes.BOOL)]
+
+
+class _FileInformation(ctypes.Structure):
+    _fields_ = [("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
+                ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+                ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
+                ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
+                ("index_high", wintypes.DWORD), ("index_low", wintypes.DWORD)]
+
+
+class _AclHeader(ctypes.Structure):
+    _fields_ = [("revision", wintypes.BYTE), ("reserved", wintypes.BYTE),
+                ("size", wintypes.WORD), ("count", wintypes.WORD),
+                ("reserved2", wintypes.WORD)]
+
+
+class _AllowedAce(ctypes.Structure):
+    _fields_ = [("kind", wintypes.BYTE), ("flags", wintypes.BYTE),
+                ("size", wintypes.WORD), ("mask", wintypes.DWORD),
+                ("sid", wintypes.DWORD)]
+
+
+class _WindowsAcl:
+    """Native SID and handle based protection; never modify owner or SACL."""
+
+    def __init__(self):
+        self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        pointer = ctypes.c_void_p
+        out_pointer = ctypes.POINTER(pointer)
+        signatures = {
+            "OpenProcessToken": ([wintypes.HANDLE, wintypes.DWORD, out_pointer], wintypes.BOOL),
+            "OpenThreadToken": ([wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, out_pointer], wintypes.BOOL),
+            "GetTokenInformation": ([wintypes.HANDLE, ctypes.c_int, pointer, wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+            "ConvertSidToStringSidW": ([pointer, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW":
+                ([wintypes.LPCWSTR, wintypes.DWORD, out_pointer, pointer], wintypes.BOOL),
+            "GetSecurityDescriptorDacl": ([pointer, ctypes.POINTER(wintypes.BOOL), out_pointer,
+                                            ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+            "GetSecurityDescriptorControl": ([pointer, ctypes.POINTER(wintypes.WORD),
+                                               ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+            "GetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, out_pointer,
+                                 pointer, out_pointer, pointer, out_pointer], wintypes.DWORD),
+            "SetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, pointer,
+                                 pointer, pointer, pointer], wintypes.DWORD),
+            "EqualSid": ([pointer, pointer], wintypes.BOOL),
+            "GetAce": ([pointer, wintypes.DWORD, out_pointer], wintypes.BOOL),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.advapi, name)
+            function.argtypes, function.restype = arguments, result
+        signatures = {
+            "CreateFileW": ([wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, pointer,
+                             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
+            "CreateDirectoryW": ([wintypes.LPCWSTR, pointer], wintypes.BOOL),
+            "GetFileInformationByHandle": ([wintypes.HANDLE, ctypes.POINTER(_FileInformation)], wintypes.BOOL),
+            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+            "LocalFree": ([pointer], pointer),
+            "GetCurrentProcess": ([], wintypes.HANDLE),
+            "GetCurrentThread": ([], wintypes.HANDLE),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = arguments, result
+        token = pointer()
+        if not self.advapi.OpenThreadToken(self.kernel.GetCurrentThread(), 8, True, ctypes.byref(token)):
+            if ctypes.get_last_error() != 1008:  # ERROR_NO_TOKEN
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.check(self.advapi.OpenProcessToken(self.kernel.GetCurrentProcess(), 8, ctypes.byref(token)))
+        try:
+            size = wintypes.DWORD()
+            self.advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+            self.token_user = ctypes.create_string_buffer(size.value)
+            self.check(self.advapi.GetTokenInformation(token, 1, self.token_user, size, ctypes.byref(size)))
+            self.sid = ctypes.cast(self.token_user, ctypes.POINTER(pointer))[0]
+        finally:
+            self.kernel.CloseHandle(token)
+        sid_text = wintypes.LPWSTR()
+        self.check(self.advapi.ConvertSidToStringSidW(self.sid, ctypes.byref(sid_text)))
+        try:
+            self.sid_text = sid_text.value
+        finally:
+            self.kernel.LocalFree(ctypes.cast(sid_text, pointer))
+
+    @staticmethod
+    def check(result):
+        if not result:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return result
+
+    @contextmanager
+    def descriptor(self, directory):
+        descriptor = ctypes.c_void_p()
+        flags = "OICI" if directory else ""
+        # Explicit owner also avoids an elevated token's default Administrators owner.
+        sddl = f"O:{self.sid_text}D:P(A;{flags};FA;;;{self.sid_text})"
+        self.check(self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1, ctypes.byref(descriptor), None))
+        try:
+            yield descriptor
+        finally:
+            self.kernel.LocalFree(descriptor)
+
+    def dacl(self, descriptor):
+        present, defaulted = wintypes.BOOL(), wintypes.BOOL()
+        acl = ctypes.c_void_p()
+        self.check(self.advapi.GetSecurityDescriptorDacl(
+            descriptor, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)))
+        if not present.value or not acl.value:
+            raise PermissionError("Recovery DACL must be present and non-null")
+        return acl
+
+    @contextmanager
+    def security(self, handle):
+        owner, acl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        error = self.advapi.GetSecurityInfo(handle, 1, 5, ctypes.byref(owner), None,
+                                          ctypes.byref(acl), None, ctypes.byref(descriptor))
+        if error:
+            raise ctypes.WinError(error)
+        try:
+            yield owner, acl, descriptor
+        finally:
+            self.kernel.LocalFree(descriptor)
+
+    def validate_target(self, handle, directory):
+        info = _FileInformation()
+        self.check(self.kernel.GetFileInformationByHandle(handle, ctypes.byref(info)))
+        if info.attributes & 0x400 or bool(info.attributes & 0x10) != directory:
+            raise PermissionError("Recovery target is a reparse point or has the wrong type")
+        if not directory and info.links != 1:
+            raise PermissionError("Recovery files must not have additional hard links")
+        with self.security(handle) as (owner, _acl, _descriptor):
+            if not owner.value or not self.advapi.EqualSid(owner, self.sid):
+                raise PermissionError("Recovery target has an unexpected owner")
+
+    def verify(self, handle, directory):
+        self.validate_target(handle, directory)
+        with self.security(handle) as (_owner, acl, descriptor):
+            control, revision = wintypes.WORD(), wintypes.DWORD()
+            self.check(self.advapi.GetSecurityDescriptorControl(descriptor, ctypes.byref(control),
+                                                               ctypes.byref(revision)))
+            if not control.value & 0x1000 or not acl.value:
+                raise PermissionError("Recovery DACL is not protected and non-null")
+            self.dacl(descriptor)
+            if ctypes.cast(acl, ctypes.POINTER(_AclHeader)).contents.count != 1:
+                raise PermissionError("Recovery DACL contains unexpected grants")
+            ace = ctypes.c_void_p()
+            self.check(self.advapi.GetAce(acl, 0, ctypes.byref(ace)))
+            allowed = ctypes.cast(ace, ctypes.POINTER(_AllowedAce)).contents
+            sid = ace.value + _AllowedAce.sid.offset
+            if (allowed.kind != 0 or allowed.flags != (3 if directory else 0)
+                    or allowed.mask != 0x1F01FF or not self.advapi.EqualSid(sid, self.sid)):
+                raise PermissionError("Recovery DACL is not exactly current-user full control")
+
+    def apply(self, handle, directory):
+        self.validate_target(handle, directory)
+        with self.descriptor(directory) as descriptor:
+            error = self.advapi.SetSecurityInfo(handle, 1, 0x80000004, None, None,
+                                               self.dacl(descriptor), None)
+            if error:
+                raise ctypes.WinError(error)
+        self.verify(handle, directory)
+
+    def open(self, path, *, directory, access=0x60080, share=None, create=False, descriptor=None):
+        attributes = None
+        if descriptor is not None:
+            attributes = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+        handle = self.kernel.CreateFileW(str(path), access, (0 if directory else 3) if share is None else share,
+                                        ctypes.byref(attributes) if attributes is not None else None,
+                                        1 if create else 3, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
+
+    @contextmanager
+    def parents(self, path, *, create=False):
+        # FILE_LIST_DIRECTORY participates in Windows sharing checks; metadata
+        # access alone does not prevent rename even without FILE_SHARE_DELETE.
+        # Retain this validated chain through use, replacement and temp cleanup.
+        handles = []
+        try:
+            for parent in reversed(path.parents):
+                try:
+                    handle = self.open(parent, directory=True, access=0x20081, share=3)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    self.mkdir(parent)
+                    handle = self.open(parent, directory=True, access=0x20081, share=3)
+                    try:
+                        self.verify(handle, True)
+                    except Exception:
+                        self.kernel.CloseHandle(handle)
+                        raise
+                handles.append(handle)
+                info = _FileInformation()
+                self.check(self.kernel.GetFileInformationByHandle(handle, ctypes.byref(info)))
+                if info.attributes & 0x400 or not info.attributes & 0x10:
+                    raise PermissionError("Recovery path traverses a reparse point")
+            yield
+        finally:
+            for handle in reversed(handles):
+                self.kernel.CloseHandle(handle)
+
+    def mkdir(self, path):
+        with self.descriptor(True) as descriptor:
+            attributes = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), descriptor, False)
+            if not self.kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+                if ctypes.get_last_error() != 183:  # concurrent creator; checked on open
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _acl_apis():
     if os.name != "nt":
         raise ProtectedStorageError("Windows ACLs are required for recovery storage")
-    try:
-        import csv
+    return _WindowsAcl()
 
-        identity = subprocess.run(
-            ["whoami.exe", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True
-        )
-        fields = next(csv.reader(identity.stdout.splitlines()))
-        sid = next((field for field in fields if field.startswith("S-1-")), None)
-        account = next((field for field in fields if "\\" in field), None)
-        if not sid or not account:
-            raise ValueError("Current Windows SID was not returned")
-        inheritance = subprocess.run(
-            ["icacls.exe", str(path), "/inheritance:r"], capture_output=True, text=True
-        )
-        if inheritance.returncode:
-            raise OSError(inheritance.stderr.strip() or "ACL inheritance could not be removed")
-        rights = "(OI)(CI)F" if directory else "F"
-        grant = subprocess.run(
-            ["icacls.exe", str(path), "/grant:r", f"*{sid}:{rights}"], capture_output=True, text=True
-        )
-        if grant.returncode:
-            raise OSError(grant.stderr.strip() or "Current-user ACL could not be applied")
-        verify = subprocess.run(["icacls.exe", str(path)], capture_output=True, text=True, check=True)
-        principals = []
-        for line in verify.stdout.splitlines():
-            match = re.search(r"\s([^:]+):\(", line)
-            if match:
-                principals.append(match.group(1))
-        if not principals or any(principal.lower() not in {account.lower(), f"*{sid}".lower()} for principal in principals):
-            raise PermissionError("Recovery ACL grants access to an unexpected identity")
+
+def _absolute_path(path: Path) -> Path:
+    # Do not resolve(): resolving first would hide a junction or symbolic link.
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _secure_acl(path: Path, *, directory: bool) -> None:
+    try:
+        api = _acl_apis()
+        path = _absolute_path(path)
+        with api.parents(path):
+            handle = api.open(path, directory=directory,
+                              access=0x02000000 if directory else 0x60080)
+            try:
+                api.apply(handle, directory)
+            finally:
+                api.kernel.CloseHandle(handle)
     except Exception as exc:
         raise ProtectedStorageError("Could not apply the current-user-only recovery ACL") from exc
+
+
+def _private_directory(path: Path) -> None:
+    try:
+        api = _acl_apis()
+        with api.parents(path, create=True):
+            api.mkdir(path)
+            # Already-correct roots can be used while legitimate child/ancestor
+            # handles exist. Only repairs need an exclusive directory handle.
+            handle = api.open(path, directory=True, access=0x20080, share=3)
+            try:
+                try:
+                    api.verify(handle, True)
+                except PermissionError:
+                    pass
+                else:
+                    return
+            finally:
+                api.kernel.CloseHandle(handle)
+            # SetSecurityInfo explicitly does not propagate to existing children
+            # for a MAXIMUM_ALLOWED handle. Share mode alone cannot ensure this.
+            handle = api.open(path, directory=True, access=0x02000000)
+            try:
+                api.apply(handle, True)
+            finally:
+                api.kernel.CloseHandle(handle)
+    except Exception as exc:
+        raise ProtectedStorageError("Could not apply the current-user-only recovery ACL") from exc
+
+
+@contextmanager
+def _private_file(path: Path, *, create: bool):
+    """Retain the validated ancestor chain through file use and failed cleanup."""
+    import msvcrt
+
+    with ExitStack() as stack:
+        handle = None
+        created = False
+        stream = None
+        try:
+            api = _acl_apis()
+            stack.enter_context(api.parents(path))
+            with api.descriptor(False) as descriptor:
+                handle = api.open(path, directory=False, access=0xC0060080,
+                                  create=create, descriptor=descriptor if create else None)
+                created = create
+            try:
+                api.verify(handle, False)
+                descriptor_fd = msvcrt.open_osfhandle(handle, os.O_BINARY | os.O_RDWR)
+                handle = None  # descriptor now owns the native handle
+                stream = stack.enter_context(os.fdopen(descriptor_fd, "w+b" if create else "r+b"))
+            finally:
+                if handle is not None:
+                    api.kernel.CloseHandle(handle)
+        except Exception as exc:
+            if created:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if isinstance(exc, FileExistsError):
+                raise
+            raise ProtectedStorageError("Protected recovery file is unavailable") from exc
+        try:
+            # Preserve errors from writes/flushes and lock operations after setup.
+            yield stream
+        except BaseException:
+            if created:
+                stream.close()
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
 
 
 class FileLock:
@@ -144,16 +422,18 @@ class FileLock:
         self.path = path
         self.timeout = timeout
         self._file: BinaryIO | None = None
+        self._file_context = None
 
     def acquire(self) -> "FileLock":
         if os.name != "nt":
             raise ProtectedStorageError("Windows process locks are required for recovery storage")
         import msvcrt
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = _absolute_path(self.path)
+        _private_directory(self.path.parent)
         if not self.path.exists():
             try:
-                with self.path.open("xb") as created:
+                with _private_file(self.path, create=True) as created:
                     created.write(b"\0")
                     created.flush()
             except FileExistsError:
@@ -162,7 +442,8 @@ class FileLock:
         deadline = time.monotonic() + self.timeout
         while True:
             try:
-                self._file = self.path.open("r+b")
+                self._file_context = _private_file(self.path, create=False)
+                self._file = self._file_context.__enter__()
                 self._file.seek(0)
                 msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
                 if self.path.stat().st_size == 0:
@@ -171,7 +452,8 @@ class FileLock:
                 return self
             except OSError as exc:
                 if self._file is not None:
-                    self._file.close()
+                    self._file_context.__exit__(None, None, None)
+                    self._file_context = None
                     self._file = None
                 if time.monotonic() >= deadline:
                     raise ProtectedStorageError("Recovery storage is locked by another process") from exc
@@ -186,7 +468,8 @@ class FileLock:
             self._file.seek(0)
             msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
         finally:
-            self._file.close()
+            self._file_context.__exit__(None, None, None)
+            self._file_context = None
             self._file = None
 
     def __enter__(self) -> "FileLock":
@@ -207,9 +490,8 @@ class ProtectedStore:
     def __init__(self, root: str | Path):
         if os.name != "nt":
             raise ProtectedStorageError("Protected recovery storage is supported only on Windows")
-        self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        _secure_acl(self.root, directory=True)
+        self.root = _absolute_path(Path(root))
+        _private_directory(self.root)
         self._register_root()
 
     @staticmethod
@@ -217,10 +499,9 @@ class ProtectedStore:
         local = os.environ.get("LOCALAPPDATA")
         if not local:
             raise ProtectedStorageError("Windows current-user recovery directory is unavailable")
-        root = (Path(local) / "Deposit" / "recovery").resolve()
+        root = _absolute_path(Path(local) / "Deposit" / "recovery")
         try:
-            root.mkdir(parents=True, exist_ok=True)
-            _secure_acl(root, directory=True)
+            _private_directory(root)
         except Exception as exc:
             raise ProtectedStorageError("Per-user recovery quota coordinator is unavailable") from exc
         return root
@@ -261,7 +542,9 @@ class ProtectedStore:
                 return ()
             if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
                 raise ProtectedStorageError("Per-user recovery root index is not a regular file")
-            payload = path.read_bytes()
+            _secure_acl(path, directory=False)
+            with _private_file(path, create=False) as source:
+                payload = source.read()
             if not payload.startswith(self._MAGIC):
                 raise ProtectedStorageError("Per-user recovery root index is corrupt")
             raw = _crypt(payload[len(self._MAGIC):], protect=False)
@@ -291,17 +574,14 @@ class ProtectedStore:
             raise ProtectedStorageError("Per-user recovery storage quota (1 GiB) is exhausted")
         temporary = path.with_name(f".{secrets.token_hex(16)}.tmp")
         try:
-            with temporary.open("xb") as output:
+            with _private_file(temporary, create=True) as output:
+                _secure_acl(temporary, directory=False)
                 output.write(payload)
                 output.flush()
                 os.fsync(output.fileno())
-            _secure_acl(temporary, directory=False)
-            os.replace(temporary, path)
+                output.close()
+                os.replace(temporary, path)
         except Exception as exc:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
             raise ProtectedStorageError("Per-user recovery root index cannot be updated") from exc
 
     def _register_root(self) -> None:
@@ -340,19 +620,13 @@ class ProtectedStore:
             projected = self._usage_bytes_locked() + len(payload)
             if projected > self.MAX_TOTAL_BYTES:
                 raise ProtectedStorageError("Per-user recovery storage quota (1 GiB) is exhausted")
-            try:
-                with temporary.open("xb") as output:
-                    output.write(payload)
-                    output.flush()
-                    os.fsync(output.fileno())
+            with _private_file(temporary, create=True) as output:
                 _secure_acl(temporary, directory=False)
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+                output.close()
                 os.replace(temporary, path)
-            except Exception:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
         return path
 
     def read(self, name: str) -> bytes:
@@ -363,7 +637,9 @@ class ProtectedStore:
             raise ProtectedStorageError("Recovery record is unavailable") from exc
         if size > self.MAX_PROTECTED_BYTES:
             raise ProtectedStorageError("Recovery record exceeds the 16 MiB limit")
-        payload = path.read_bytes()
+        _secure_acl(path, directory=False)
+        with _private_file(path, create=False) as source:
+            payload = source.read()
         if not payload.startswith(self._MAGIC):
             raise ProtectedStorageError("Recovery record format is invalid")
         return _crypt(payload[len(self._MAGIC):], protect=False)

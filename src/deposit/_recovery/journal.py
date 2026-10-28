@@ -115,12 +115,15 @@ class ProtectedJournal:
         snapshot_revision: int,
         *,
         result_format: str | None = None,
+        key: str | None = None,
     ) -> dict[str, Any]:
         if result_format is not None and (
             type(result_format) is not str or result_format != RESULT_FORMAT_NAMED_ROWS_V1
         ):
             raise JournalError("Recovery result format is unsupported")
-        key = str(uuid.uuid4())
+        key = str(uuid.uuid4()) if key is None else key
+        if not _is_uuid(key):
+            raise JournalError("Recovery action key is invalid")
         now = _utc_now()
         record = {
             "format_version": FORMAT_VERSION,
@@ -157,6 +160,24 @@ class ProtectedJournal:
         except (UnicodeError, ValueError, TypeError) as exc:
             raise JournalError("Recovery journal record is corrupt") from exc
         return record
+
+    def load_if_present(self, identity: DeploymentIdentity, key: str) -> dict[str, Any] | None:
+        """Load an action only when its exact protected record is present.
+
+        The index lock makes absence classification consistent with journal
+        creation and pruning. Storage read failures for present records remain
+        errors; only a successful enumeration proving absence returns None.
+        """
+        if not _is_uuid(key):
+            raise JournalError("Recovery action key is invalid")
+        name = _record_name(identity, key)
+        with self.storage.lock("journal-index"):
+            names = self.storage.list_records()
+            if name not in names:
+                if any(candidate.startswith("op-") and candidate.endswith(f"-{key}") for candidate in names):
+                    raise JournalError("Recovery journal identity does not match this Store")
+                return None
+            return self.load(identity, key)
 
     def update(self, identity: DeploymentIdentity, key: str, **changes: Any) -> dict[str, Any]:
         record = self.load(identity, key)
@@ -221,6 +242,7 @@ class ProtectedJournal:
         cutoff = (now or datetime.now(timezone.utc)) - RESULT_RETENTION
         removed = 0
         with self.storage.lock("journal-index"):
+            dependencies = self._transfer_dependencies_locked()
             for record in self.records(identity):
                 if record["state"] not in {"released", "failed"}:
                     continue
@@ -230,7 +252,7 @@ class ProtectedJournal:
                     raise JournalError("Resolved journal record has invalid retention metadata") from exc
                 if resolved.tzinfo is None:
                     raise JournalError("Resolved journal record has invalid retention metadata")
-                if resolved <= cutoff:
+                if resolved <= cutoff and _record_name(identity, record["key"]) not in dependencies:
                     self.storage.delete(_record_name(identity, record["key"]))
                     removed += 1
         return removed
@@ -297,7 +319,31 @@ class ProtectedJournal:
                     count += 1
         return count
 
+    def _transfer_dependencies_locked(self) -> set[str]:
+        """Snapshot validated transfer pins under journal-index, never transfer locks."""
+        from .transfers import ProtectedTransferSpool
+
+        dependencies = set()
+        for name in self.storage.list_records():
+            match = re.fullmatch(r"transfer-([0-9a-f]{32})-manifest", name)
+            if match is None:
+                continue
+            try:
+                raw = _strict_json_loads(self.storage.read(name))
+                identity = DeploymentIdentity.from_dict(raw["identity"])
+                manifest = ProtectedTransferSpool(self, identity).load(match.group(1))
+                if manifest["state"] == "failed":
+                    continue  # Self-contained failure; retain ordinary notice TTL.
+                fields = ("finish_action_key",) if manifest["state"] == "finished" else (
+                    "begin_action_key", "pending_action_key", "finish_action_key")
+                dependencies.update(_record_name(identity, manifest[field]) for field in fields
+                                    if manifest[field] is not None)
+            except Exception as exc:
+                raise JournalError("Protected transfer dependencies cannot be assessed safely") from exc
+        return dependencies
+
     def _prune_expired_locked(self, identity: DeploymentIdentity) -> None:
+        dependencies = self._transfer_dependencies_locked()
         cutoff = datetime.now(timezone.utc) - RESULT_RETENTION
         for name in self.storage.list_records():
             if not name.startswith("op-"):
@@ -309,7 +355,7 @@ class ProtectedJournal:
                 resolved = _aware_datetime(record["resolved_at"])
             except Exception as exc:
                 raise JournalError("An existing recovery journal record cannot be pruned safely") from exc
-            if resolved <= cutoff:
+            if resolved <= cutoff and name not in dependencies:
                 self.storage.delete(name)
 
     def _decode_record(

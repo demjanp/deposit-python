@@ -174,12 +174,21 @@ class DNode(Mapping):
         if self._kind != "Object":
             raise TypeError("Only Object handles assign Descriptor values")
         self._ensure_current()
-        # Validate against the checked declaration before retaining this as a
-        # pending edit.  A type/value error is not an unresolved user intent.
-        from .store import _descriptor_payload
-        _descriptor_payload(value, self._schema.get(name))
+        # Prepare (including Server-owned DGeometry resolution) before retaining
+        # this as a pending edit. A type/value error is not unresolved intent.
+        prepare = getattr(self._store, "_prepare_descriptor_payload", None)
+        submit = getattr(self._store, "_submit_descriptor_payload", None)
+        if prepare is None or submit is None:
+            from .store import _descriptor_payload
+            _descriptor_payload(value, self._schema.get(name))
+            payload = None
+        else:
+            payload = prepare(value, self._schema.get(name))
         self._pending[name] = deepcopy(value)
-        self._store.set_descriptor(self, name, value)
+        if payload is None:
+            self._store.set_descriptor(self, name, value)
+        else:
+            submit(self, name, payload)
         self._pending.pop(name, None)
 
     def __delitem__(self, name: str) -> None:

@@ -162,7 +162,7 @@ class Client:
                 column = entry["columns"][0]
                 rows = []
                 for record in result:
-                    if column not in record:
+                    if column not in record.keys():
                         raise DepositError("INVALID_RESPONSE", f"{procedure} returned no {column} result")
                     value = record[column]
                     if not isinstance(value, dict):

@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ._gateway import store_procedure
-from .store import _encode_object_properties, _portable_input
+from .store import _descriptor_payload, _encode_object_properties, _portable_input
 from .values import DType, TypedValue, _infer_type, encode_value
 
 
@@ -34,6 +34,8 @@ class BatchReference:
 class Batch:
     def __init__(self, store):
         self._store = store
+        self._geometry_encoder = getattr(store, "_geometry_write_value", None)
+        self._resource_encoder = getattr(store, "_resource_write_value", None)
         self._commands: list[dict[str, Any]] = []
         self._keys: dict[BatchReference, str] = {}
         self._class_schemas: dict[BatchReference, dict[str, str]] = {}
@@ -116,7 +118,10 @@ class Batch:
 
     def create_class(self, name: str, properties: dict[str, Any] | None = None) -> BatchReference:
         properties = {} if properties is None else properties
-        reference = self.call("deposit.create.class", name, _wire_values(properties))
+        reference = self.call("deposit.create.class", name, _wire_values(
+            properties, geometry_encoder=self._geometry_encoder,
+            resource_encoder=self._resource_encoder,
+        ))
         self._class_schemas[reference] = _schema_from_class_properties(properties)
         return reference
 
@@ -140,8 +145,12 @@ class Batch:
             if schema is None:
                 raise ValueError("This batch reference has no known Class schema; use Batch.call with explicit wire values")
         properties = {} if properties is None else properties
-        encoded = (_encode_object_properties(properties, schema) if schema is not None
-                   else _wire_values(properties))
+        encoded = (_encode_object_properties(
+            properties, schema, geometry_encoder=self._geometry_encoder,
+            resource_encoder=self._resource_encoder,
+        ) if schema is not None
+                   else _wire_values(properties, geometry_encoder=self._geometry_encoder,
+                                     resource_encoder=self._resource_encoder))
         reference = self.call("deposit.create.object", class_selector, encoded)
         if schema is not None:
             self._object_schemas[reference] = dict(schema)
@@ -154,13 +163,25 @@ class Batch:
             schema = dict(object_id._schema)
             if self._schema_mutated:
                 raise ValueError("A prior batch schema or membership change makes this handle schema ambiguous")
-            patch = _encode_object_properties(patch, schema)
+            patch = _encode_object_properties(
+                patch, schema, geometry_encoder=self._geometry_encoder,
+                resource_encoder=self._resource_encoder,
+            )
             object_id = object_id.id
         elif isinstance(object_id, BatchReference):
             self._reference_key(object_id)
             schema = self._object_schemas.get(object_id)
             if schema is not None:
-                patch = _encode_object_properties(patch, schema)
+                patch = _encode_object_properties(
+                    patch, schema, geometry_encoder=self._geometry_encoder,
+                    resource_encoder=self._resource_encoder,
+                )
+            else:
+                patch = _wire_values(patch, geometry_encoder=self._geometry_encoder,
+                                     resource_encoder=self._resource_encoder)
+        else:
+            patch = _wire_values(patch, geometry_encoder=self._geometry_encoder,
+                                 resource_encoder=self._resource_encoder)
         return self.call("deposit.set.object", object_id, patch)
 
     def delete_object(self, object_id: Any) -> BatchReference:
@@ -231,22 +252,11 @@ class Batch:
 
     def _encode_descriptor_value(self, name: str, value: Any, schema: Mapping[str, str]):
         declared = schema.get(name)
-        if declared is not None:
-            if isinstance(value, TypedValue):
-                if value.type != declared:
-                    raise TypeError(f"Descriptor {name!r} is declared as {declared}")
-                value = value.value
-            elif isinstance(value, DType):
-                if value._type != declared:
-                    raise TypeError(f"Descriptor {name!r} is declared as {declared}")
-                value = value.value
-            return encode_value(declared, value), None
-        if isinstance(value, TypedValue):
-            return value.to_dict(), value.type
-        if isinstance(value, DType):
-            return value.to_dict(), value._type
-        kind = _infer_type(value)
-        return {"type": kind, "value": encode_value(kind, value)}, kind
+        payload = _descriptor_payload(
+            value, declared, geometry_encoder=self._geometry_encoder,
+            resource_encoder=self._resource_encoder,
+        )
+        return (payload, None) if declared is not None else (payload, payload["type"])
 
     def _pin_handle(self, handle, kind: str) -> None:
         self._store._validate_handle(handle, kind)
@@ -344,16 +354,25 @@ def _schema_from_class_properties(properties: Mapping[str, Any]) -> dict[str, st
             and isinstance(item.get("type"), str)}
 
 
-def _wire_values(value: Any) -> Any:
+def _wire_values(value: Any, *, geometry_encoder=None, resource_encoder=None) -> Any:
     """Convert explicit public typed values without guessing server schema."""
     if isinstance(value, (TypedValue, DType)):
+        kind = value.type if isinstance(value, TypedValue) else value._type
+        if kind == "DGeometry" and geometry_encoder is not None:
+            raw = value.value if isinstance(value, TypedValue) else value
+            return {"type": kind, "value": encode_value(kind, geometry_encoder(raw))}
+        if kind == "DResource" and resource_encoder is not None:
+            raw = value.value if isinstance(value, TypedValue) else value
+            return {"type": kind, "value": encode_value(kind, resource_encoder(raw))}
         return value.to_dict()
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise TypeError("Batch map keys must be strings")
-        return {key: _wire_values(child) for key, child in value.items()}
+        return {key: _wire_values(child, geometry_encoder=geometry_encoder,
+                                  resource_encoder=resource_encoder) for key, child in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_wire_values(child) for child in value]
+        return [_wire_values(child, geometry_encoder=geometry_encoder,
+                             resource_encoder=resource_encoder) for child in value]
     return value
 
 

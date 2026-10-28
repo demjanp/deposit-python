@@ -25,7 +25,7 @@ acceptance.
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
 | 4 | Typed domain, queries and batches | Finalized | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Server, Hub and Python commits verified; tracker follow-up committed |
-| 5 | Resources and extended workflows | Not started | 5A-5F pending | Not run / no implementation review | No stage commits |
+| 5 | Resources and extended workflows | Verification incomplete | Implemented in approved scope; 5A-5F acceptance pending | Focused units/probes passed; cumulative verification and independent review pending | No stage commits |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
 Allowed states: Not started; Planning; Implementing; Verification incomplete;
@@ -438,3 +438,304 @@ This tracker-state follow-up records the Python implementation commit identity;
 its own commit ID is recorded in the local project-run checkpoint. Preserve
 unrelated Server POM/.gitignore/deleted skill-copy changes and the user-injected
 Python AGENTS.md change.
+
+
+### Stage 5 / `deposit-python-20261025-01` / verification incomplete
+
+Implemented scope: protected frozen resource uploads and checked downloads,
+continuation and terminal-failure recovery; strict Server-owned geometry/resource
+write projections; Pattern/form/layout helpers; immutable resource-free Exchange
+dictionary/subgraph analysis and row analysis/apply; installed format, browser,
+history and operational recovery scenarios. Full acceptance remains incomplete.
+
+Approved decisions retained: defer full-Namespace clone and Client-owned
+server-scope mutation recovery; leave image classification unknown without
+verified metadata; reject resource-bearing dictionary imports until a companion
+content API is decided. The user approved retargeting Python's exact supported
+Server version to the committed Stage 5 Server artifact while retaining equality.
+That committed-artifact retarget and validation remain pending.
+
+Verification/correction record so far:
+
+- Focused transfer/recovery units passed 48 tests using the gate's importlib
+  mode; the previously omitted transfer-recovery module is now in the cumulative
+  workflow selection. Its sibling imports were corrected before inclusion.
+- Acceptance diagnostics units passed 3 tests. The real owned-process probe
+  passed failure-then-hang retention, predeadline stack output, secret redaction,
+  timeout detection and reaping. Original stderr is duplicated before pytest
+  capture so a killed test cannot hide the timer's output.
+- Repeated 300-second Verify timeouts were diagnosed as a cumulative suite budget
+  problem. A reproduction passed the first six tests at 87 seconds, failed a
+  Stage 5 fixture assertion at 256 seconds, passed import recovery at 297 seconds,
+  then started export recovery before the total deadline killed the process.
+  Full protected-journal scans dominated the Stage 5 stack samples. No deadlock
+  or external blocker was established; architect did not approve that interruption.
+  The fixture imported a third object before expecting a two-row export; form
+  import is now sequenced after the format assertions. Workflows Seed/Verify
+  receive explicit 1,800-second budgets; the security/persistence checks remain.
+- Provisional cumulative run `20261027T235226091Z-871f918f` passed wheel unit
+  selections and runner/bundle probes, then failed Server `ResourceAndGeometryIT`
+  (1/12) before Python live acceptance: expected reclaimed bytes 1365, actual 0.
+  A diagnostic repeat reproduced the underlying fixture race twice in 30 runs:
+  lease expiry was set, but maintenance had removed `orphanSince`, so no prune
+  candidate/item was scheduled. The expert owns a test-only correction using
+  existing Namespace/resource coordination around artificial fixture expiry.
+  Corrected repetition run `20261028T001116857Z-6387fb0c` passed 30/30 in 105.3
+  seconds; final normal-test class run `20261028T001558958Z-6dfb7bdd` passed
+  12/12 in 29.29 seconds. Both owners reached clean terminal cleanup with zero
+  Java processes. Exact reclamation, rollback, replay and authorization assertions
+  remain, with stronger scheduling/item checks. Production GC is unchanged.
+- The next cumulative run, `20261028T001939441Z-99846af3`, passed all nine
+  Server selections and installed Seed (8 passed / 2 phase-specific skips,
+  165.12 seconds). Verify completed without timeout (9 passed / 1 failed,
+  287.02 seconds), including interrupted import and export recovery. The sole
+  failure was a fixture expectation: tabular DDict cells retain per-entry
+  `{type,value}` JSON, rather than plain Python dictionary values. Independent
+  typed literal expectations now cover exported CSV and loaded CSV/XLSX/GeoPackage.
+  UTC timestamp assertions compare full-precision temporal values across the
+  equivalent `Z` and `+00:00` representations. Complete rerun remains pending.
+- Manifest parity now honors the runner's selected Server/build-source path
+  through an explicitly restored environment setting, rather than assuming a
+  sibling checkout. All 3 parity/mutation checks passed with explicit source
+  selection, including rejecting mutations in the selected source.
+- Provisional run `20261028T005817137Z-a1934dc0` passed all nine Server
+  selections (90 tests), Seed (8 passed / 2 skips, 165.92 seconds), and the
+  wheel/probe groups. Verify stopped at its first failure (6 passed / 1 failed,
+  247.99 seconds), without timeout: the XLSX fixture assumed a nonempty shared
+  string table, while Server emits valid inline strings. Independent decoding
+  now checks both representations and exact large-integer text; its focused
+  unit passed. The fixture audit also corrected staged row-mapping keys and
+  decoded DDict comparison. Final complete-run evidence remains pending.
+- Main-source reader context cleanup now preserves an existing permission or
+  chunk-validation exception instead of replacing it with an incomplete-close
+  error. Both regression cases were reproduced before correction; 50 focused
+  transfer/recovery tests passed afterward. This change was deliberately outside
+  the running candidate and must be included in the final main-source gate.
+- Clean Server setup at `4dd5838` passed and derived official version
+  `2.0.0-dev.77-post.5.g4dd5838-SNAPSHOT`; both JAR versions and the packaged
+  plugin bytes were verified. Exact Python pin regeneration and all 3 manifest
+  checks passed. Main-source run `20261028T014643068Z-b763bc16` passed its wheel
+  groups and runner probes, then stopped before live acceptance: the synthetic
+  bundle probe assumed a sibling Python checkout and a tagged runtime support
+  version. Architect classified this as a routine harness-fixture correction:
+  use explicit historical tagged probe provenance and a manifest in owned probe
+  scratch, preserving all production bundle checks. The corrected focused probe
+  passed without a sibling Python checkout and rejected a missing tag. Component
+  review requested an additional manifest-write failure cleanup check before
+  committing the harness correction. No timeout occurred in this run.
+
+Reviewed redacted diagnostic evidence and source/log hashes are retained locally
+under `.stage5-diagnostics/`; these partial/failed runs are not acceptance passes.
+Prior observed suite owners reached terminal cleanup without cleanup errors.
+The selected assertion maps identify implemented branches and pending evidence.
+
+The preliminary independent Server component review found no blocking findings
+and confirmed its nine passing selections. Server commit `4dd5838` contains only
+the 11 reviewed Stage 5 files; unrelated work is preserved. This component commit
+provides the source identity needed for the clean exact-version artifact and
+does not establish whole-stage acceptance. The updated main-source workflow unit
+selection passed 71 tests.
+
+The bundle-probe follow-up passed the no-sibling positive probe, explicit
+missing-tag rejection and an injected manifest-write failure with no remaining
+scratch directory. Independent component review cleared the cleanup correction.
+Server commit `4f5f6f2` contains that single test-script change. Its clean official
+setup passed at version `2.0.0-dev.77-post.6.g4f5f6f2-SNAPSHOT`; Python's exact
+pin and regenerated manifest match it, with all 3 parity/mutation tests passing.
+The complete gate against these final inputs remains pending.
+
+Run `20261028T021428946Z-69c94163` passed all nine Server selections (90 tests),
+the corrected bundle probe, wheel groups and runner probes. Seed passed 8 tests
+with 2 phase skips in 184.78 seconds; Verify stopped at its first fixture failure
+(6 passed / 1 failed, 282.30 seconds): numeric XLSX `9.0` was compared with text
+`9`. No timeout occurred, cleanup completed, and all 426 frozen input hashes
+remained unchanged. The fixture now compares exact numeric values using Decimal
+while preserving the large-integer digit assertion.
+
+A read-only acceptance audit identified required Namespace-bound gaps in history
+epochs/modes, deletion effects on existing handles, and interrupted table-load
+recovery/expiry. Added assertions now cover those branches, strengthen table
+cursor/diagnostic checks, and use the public revision field `revisionId`.
+Architect pre-gate review cleared the corrected fixture after addressing recovery
+root lifetime, immutable named-row results, undo arguments and stale-Store error
+paths. The decoder and five embedded child-program checks passed (2 focused
+tests). These additions have not yet passed installed live acceptance; complete
+rerun and fresh whole-stage independent review remain required.
+
+Expanded run `20261028T025901140Z-032153e9` again passed all nine Server
+selections (90 tests), wheel groups and both runner probes. Seed stopped at the
+new history test (7 passed / 2 skips / 1 failed, 196.75 seconds); Verify did not
+start. The client left an expected `HISTORY_UNAVAILABLE` undo unresolved, which
+blocked later preparation and made close report `RECOVERY_PENDING`. Read-only
+protected-journal metadata and source inspection identified the missing
+definitive-error classification. This was an implementation failure, without
+timeout; cleanup completed and all 426 frozen input hashes matched.
+
+Architect approved adding exactly `HISTORY_UNAVAILABLE`, `IMPORT_CONFLICT` and
+`PLAN_STALE` under the existing trusted/nonretryable/prepared-status guards.
+The correction keeps failure persistence before release, committed-result
+precedence, and conservative authorization/availability/unknown handling.
+Seventeen new history/import coordinator tests passed, alongside 13 existing
+Store and 10 recovery coordinator checks. The lost-release case establishes
+lifecycle reconciliation; close may finish it before reopen. Diagnostics now
+retain bounded redacted causes, and fixture cleanup preserves the primary error
+while attempting all closes. Six diagnostics tests and two decoder/child-program
+checks passed. Pre-gate implementation review found no blocking findings; full
+installed verification and fresh final review remain pending.
+
+Run `20261028T034527544Z-630098fc` stopped before Server startup during wheel
+workflow collection: a fixture helper used the live hook's top-level module
+path. The package-scoped test import now works without that extra Python path.
+All seven workflow modules passed against that installed wheel outside the checkout
+(93 tests, 1.81 seconds), with `deposit` verified in `site-packages` and the
+packaged Store hash matching the corrected source. Cleanup cancellation tests
+also preserve immediate `KeyboardInterrupt` propagation. This focused pass is
+not installed live acceptance; the complete gate remains required.
+
+Run `20261028T040004758Z-562185ad` passed wheel groups, runner probes and all
+nine Server selections, then reached a different history-fixture error in Seed
+(7 passed / 2 skips / 1 failed, 263.30 seconds). It read a Class name from a
+snapshot invalidated by a mode change. The fixture now captures generated names
+before writes, mode changes and deletion; the same audit corrected subgraph and
+Namespace-recreation name reads. Explicit stale-handle assertions remain. Two
+installed-wheel decoder/child-program checks passed after the correction. No
+timeout occurred; all 427 frozen input hashes matched before this fixture edit.
+
+Remaining: finish the complete main-Python/clean-Server gate with the exact
+compatibility pin, obtain fresh whole-stage independent review, finalize
+evidence/docs and the tracker, and commit the remaining affected repositories.
+No push has occurred. Stage 6 has not begun.
+
+
+Run `20261028T042428671Z-cbe4488b` passed all wheel groups/probes and all
+nine Server selections (90 tests). Seed passed 11 tests with two phase skips
+in 349.78 seconds. Verify reported a precise stale-plan fixture assertion
+(6 passed / 1 failed, 411.26 seconds): it expected `REVISION_CONFLICT` although
+the independent analyzed-plan revision contract returns `PLAN_STALE`. No command
+timed out; the corrected phase budget and failure diagnostics functioned.
+All 427 frozen inputs matched. Twenty-six reviewed original logs were retained
+and hash-verified before reset; owner cleanup completed with no error and no
+remaining owner/Java process. The exact assertion now follows the Server contract;
+rollback/no-effects and fresh-analysis checks remain. Six installed-wheel
+PLAN_STALE coordinator cases and two decoder/child-program checks passed.
+Complete live verification, sdist checks and fresh independent review remain pending.
+
+
+### User-conditioned interruption after recurring acceptance-fixture defects
+
+Run `20261028T044958825Z-6737e11c` passed wheel groups/probes and all nine
+Server selections (90 tests). Seed passed 11 tests with two phase skips in
+349.10 seconds. Verify reported 6 passed / 1 failed in 444.12 seconds; no
+command timed out. The fixture supplied targets for only `code` and `count`
+when importing a staged table with additional columns. Server correctly rejected
+it with `VALIDATION_FAILED`: every staged column requires an explicit target.
+This mapping defect has not been corrected. Sdist checks were not reached.
+
+Architect read-only assessment confirms this is a fixture contract defect, not
+evidence of an SDK regression. Individually minor corrections have accumulated
+across independent DDict/XLSX representations, stale-handle expectations, error
+codes, collection imports and target mappings. Architect agrees interruption
+is appropriate under the user's explicit condition about recurring harness
+malfunctions. This is not an external-blocker approval: repository remedies
+remain available, and no administrator requirement is demonstrated. Earlier
+readiness reviews did not catch the mapping defect and were too narrow to prevent
+repeated expensive discovery. Process containment, deadlines, diagnostics and
+cleanup now function; the original cumulative-budget timeouts are resolved.
+
+Twenty-six reviewed original logs were retained and hash-verified; all 427 frozen
+inputs matched before this tracker update. The owner reached `cleaned` with no
+cleanup error; its PID is absent, and no Java process remains. Implementation
+is interrupted under the user condition. Stage 5 remains verification-incomplete;
+no final whole-stage review, Stage 6 advancement or push has occurred. Preserve
+all existing changes, component commits and reusable verification dependencies.
+
+On resumption: audit all remaining unexecuted fixture branches against the actual
+Server/Hub contracts read-only, correct explicit column mappings, run focused
+installed checks through the lifecycle owner, then repeat mandatory cumulative
+verification including sdist checks, obtain fresh independent whole-stage review,
+finalize the tracker and outstanding repository commits before Stage 6.
+
+
+### Acceptance-harness repair and separate client regression
+
+The remaining Stage 5 workflow fixtures were audited against the actual Server
+and Hub contracts. The staged-table assertions now check the documented `data`
+wrapper, literal columns and types, and complete explicit import-target coverage.
+The format-import fixture preserves the distinct blank `row-a` and populated
+`row-b` optional values. The stale-plan and restore fixtures refresh handles
+after the documented invalidation points while retaining their negative conflict
+and stale-plan assertions. The fixtures' target mappings and later recovery,
+history, deletion and expiry expectations remain unchanged in product semantics.
+
+Focused installed-package live checks completed through the lifecycle owner:
+Seed passed 2 selected tests and post-restart Verify passed the same 2 selected
+tests (11 tests explicitly deselected in each phase). In the subsequent complete
+Stage 5 run `20261028T100312520Z-5b7fc65d`, all wheel groups and probes passed;
+the Server suite passed all nine selections (90 tests); Seed passed 11 tests
+with two phase-specific skips. Verify passed 10 tests and then exposed a separate
+Python client regression in
+`src/deposit/client.py::_invoke_client_rows`: the pinned Neo4j 6.4.1 `Record`
+uses tuple value-containment, so `column not in record` checks values rather
+than result keys and rejects valid rows. The namespace-deletion fixture correctly
+expects the deleted UUID to be absent and must not be weakened. No product code
+was changed under this bounded harness-repair task.
+
+The complete runner did not reach its later Verify nodes for table-load expiry
+and child-program AST validation, nor the subsequent sdist install, import and
+test checks. The sdist artifact itself was built. No command timed out. The
+lifecycle owner cleaned up successfully, with no remaining owner or Java
+process. Architect independently reviewed the harness corrections and evidence,
+found no blocking harness defect, and verified all 71 files across the focused,
+full-gate inner and outer archives by size and SHA-256 with zero mismatches.
+
+Stage 5 remains verification-incomplete and paused; this record does not mark it
+complete or ready to resume. The focused workflow repair is verified, but the
+separate client regression must be resolved before the full mandatory gate can
+pass. After that, rerun focused installed live checks and the complete Stage 5
+gate through post-restart Verify and all sdist checks, then retain and review the
+new evidence. Preserve all unrelated edits, pending Stage 5 implementation,
+existing commits and verification dependencies. Do not push.
+
+
+### Final bounded acceptance-harness repair (2026-10-28)
+
+This final entry supersedes the earlier pending-client-regression and incomplete
+acceptance-gate status recorded above.
+
+The remaining workflow fixtures were audited against the live Server and Hub
+contracts. Three demonstrated fixture assumptions were corrected without
+changing Server behavior or weakening assertions: namespace recreation refreshes
+the original token's server observation after deletion through a separate
+Store token; Verify scratch recovery paths are reserved without ordinary
+`mkdir()` so `ProtectedStore` creates them with its current-user-only ACL; and
+the staged-table page result is fully consumed so its transactional lease
+renewal commits before the strict expiry comparison. The scratch-root check
+confirmed the final directories are owned by the lifecycle user's SID.
+
+The installed-wheel Verify also exposed a separate Python client regression:
+Neo4j `Record` membership checks values, not result keys. `_invoke_client_rows`
+now checks `record.keys()`, with a regression test using a real `neo4j.Record`.
+No recovery ACL validation or staged-table expiry contract was relaxed.
+
+Focused lifecycle checks passed for the namespace deletion/recreation flow and
+the table-load expiry flow, each with its fresh-runtime setup in both Seed and
+post-restart Verify. The final complete Stage 5 runner passed as
+`20261028T142602746Z-e8fa2621`; all 27 commands exited 0 with no timeouts. All
+nine Server selections passed (90 tests), Seed passed 11 with two
+phase-specific skips in 349.84 seconds, and post-restart Verify passed all 13
+tests in 1364.04 seconds. Subsequent sdist install, import, and test checks also
+passed. The final wheel SHA-256 is
+`661EF50C2AA97042EB7AADF4F5759C9B2945FBC3C6C113539C12B68E53716541`; the sdist
+SHA-256 is `8521BA54090F0C983ACE7C145E7A8154B0EDBABE0F51EBBC1D96324F8A8E768E`.
+
+Architect independently reviewed the final harness and client changes and the
+final evidence, with no blocking findings. All 124 retained final-run files
+matched their manifest lengths and SHA-256 hashes. The lifecycle owner reached
+`cleaned`, `terminalCleanup=true`, and `cleanupError=null`; no Java process
+remained.
+
+This completes the bounded harness-repair task and its acceptance verification.
+Project-run Stage 5 remains verification-incomplete and is not marked complete;
+the project run may now resume with its other pending Stage 5 work. No push was
+performed. Preserve unrelated edits, pending implementation, existing commits,
+and verification dependencies.

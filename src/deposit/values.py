@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time
 import math
+import os
 from typing import Any, Mapping
 
 from neo4j.spatial import CartesianPoint, Point, WGS84Point
@@ -152,48 +153,113 @@ class DGeometry(DType):
         if name in {"geometry_id", "geometry_type", "geometryType"} or prop == "geometryId":
             raise AttributeError(f"{name} is read-only")
         if prop in {"wkt", "coordinates", "srid", "verticalSrid", "axisOrder", "dimensions"} and hasattr(self, "_value"):
+            candidate = dict(self._value)
             if prop == "wkt":
-                self._value["wkt"] = value
-                self._value["coordinates"] = None
-                self._value["geometryType"] = None
+                candidate["wkt"] = value
+                candidate["coordinates"] = None
+                candidate["geometryType"] = None
             elif prop == "coordinates":
-                if not self._value.get("geometryType"):
+                if not candidate.get("geometryType"):
                     raise ValueError("coordinates require a geometry_type")
-                self._value["coordinates"] = value
-                self._value["wkt"] = None
+                candidate["coordinates"] = value
+                candidate["wkt"] = None
             else:
-                self._value[prop] = value
-            encode_value("DGeometry", self._value)
+                candidate[prop] = value
+            encode_value("DGeometry", candidate)
+            self._value = candidate
             return
         object.__setattr__(self, name, value)
 
     def resolve(self, store):
         if self._value.get("wkt") is None and self._value.get("coordinates") is None:
             raise ValueError("Geometry has neither WKT nor coordinates")
-        options = {"srid": self._value.get("srid"), "verticalSrid": self._value.get("verticalSrid"),
-                   "axisOrder": self._value.get("axisOrder", "xy"), "dimensions": self._value.get("dimensions", 2)}
+        # The Server conversion procedures accept only these spatial reference
+        # options. Axis order and dimensions are supplied by the authoritative
+        # conversion result when available, otherwise the caller metadata is
+        # retained locally for the subsequent descriptor write.
+        options = {"srid": self._value.get("srid"), "verticalSrid": self._value.get("verticalSrid")}
         if self._value.get("wkt") is None:
             result = store._client.coordinates_to_wkt(store._token, self._value["geometryType"],
                                                        self._value["coordinates"], options)
             if not isinstance(result, Mapping) or not isinstance(result.get("wkt"), str):
                 raise TypeError("Server returned no geometry WKT")
+            self._merge_server_metadata(result)
             self._value["wkt"] = result["wkt"]
         else:
             result = store._client.wkt_to_coordinates(store._token, self._value["wkt"], options)
             if not isinstance(result, Mapping) or "coordinates" not in result:
                 raise TypeError("Server returned no geometry coordinates")
+            self._merge_server_metadata(result)
             self._value["coordinates"] = result["coordinates"]
-            self._value["geometryType"] = result.get("geometryType", self._value.get("geometryType"))
         return self
+
+    def _merge_server_metadata(self, result: Mapping[str, Any]) -> None:
+        """Retain authoritative conversion metadata without guessing from WKT."""
+        identity = result.get("geometryId")
+        if identity is not None and self._geometry_id is not None and identity != self._geometry_id:
+            raise ValueError("Geometry conversion changed geometry identity")
+        for key in ("geometryType", "srid", "verticalSrid", "axisOrder", "dimensions"):
+            if key in result:
+                self._value[key] = result[key]
+        if identity is not None:
+            self._geometry_id = identity
+            self._value["geometryId"] = identity
 
 
 class DResource(DType):
-    """Detached resource reference; file transfer support is introduced in Stage 5."""
+    """Detached resource reference or a local source awaiting upload."""
 
-    def __init__(self, *, from_dict: Mapping[str, Any] | None = None):
+    def __init__(self, *, path=None, stream=None, filename=None, from_dict: Mapping[str, Any] | None = None):
+        if from_dict is not None and any(value is not None for value in (path, stream, filename)):
+            raise TypeError("from_dict cannot be combined with a local resource source")
+        if path is not None and stream is not None:
+            raise TypeError("supply path or stream, not both")
         super().__init__(from_dict=from_dict)
+        self._path = None
+        self._stream = None
+        self._transfer_id = None
         if from_dict is None:
-            self._value = {}
+            if path is None and stream is None:
+                self._value = {}
+                return
+            if path is not None:
+                path = os.fspath(path)
+                if not isinstance(path, str):
+                    raise TypeError("resource path must resolve to a string path")
+                self._path = path
+                inferred = os.path.basename(path)
+            else:
+                if not callable(getattr(stream, "read", None)):
+                    raise TypeError("resource stream must be readable")
+                self._stream = stream
+                inferred = None
+            selected = filename if filename is not None else inferred
+            if selected is not None and (not isinstance(selected, str) or not selected):
+                raise ValueError("resource filename must be a nonempty string")
+            self._value = {"filename": selected}
+
+    @property
+    def filename(self):
+        return self._value.get("filename")
+
+    @filename.setter
+    def filename(self, value):
+        if not isinstance(value, str) or not value:
+            raise ValueError("resource filename must be a nonempty string")
+        self._value["filename"] = value
+
+    @property
+    def resource_id(self):
+        return self._value.get("resourceId")
+
+    @property
+    def is_image(self):
+        value = self._value.get("isImage")
+        return value if type(value) is bool else None
+
+    def open(self, store):
+        """Open a checked, closable chunked reader for a stored resource."""
+        return store._open_resource(self)
 
 
 def encode_value(type_name: str, value: Any, *, item_type: str | None = None) -> Any:
