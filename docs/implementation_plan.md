@@ -27,23 +27,22 @@ to the knowledge hub. Shared public contracts remain owned by that hub:
   [procedure reference](../../deposit-server/doc/procedures.md), and
   [public catalog](../../deposit-server/runtime/public-api.json).
 
-Source and executed tests establish actual behavior. The current hub Python
-specification predates the proposal's Client/Store split, direct procedure-based
-names and entirely internal recovery keys. Stage 1 must reconcile those concrete
-differences, retaining the proposal's choices while preserving server contracts.
-A contradiction requiring a change to agreed scope, compatibility or semantics
-needs architect advice and a user decision; neither this plan nor catalog
-generation silently resolves it. Update shared specifications only for this
-wrapper's agreed interface and contract clarifications, not unrelated server status.
+Source and executed tests establish actual behavior. The Hub remains the
+read-only authority for shared contracts. For this resumed run, the only writable
+locations are `deposit-python` and `../test_harness`; do not modify `deposit-hub`
+or `deposit-server`. Compare their current specifications as read-only inputs and
+record any discrepancy as an unresolved limitation rather than duplicating or
+editing their documentation. A contradiction requiring a change to agreed scope,
+compatibility or semantics needs architect advice and a user decision.
 
-Inspected baseline: branch `main`, HEAD
-`3c61d21822d71182416b8f8f5cca7e2a7da295ba`. The repository contains packaging,
-`src/deposit/__init__.py` and `_meta.py`; no operational wrapper, tests or Python
-acceptance runner exists. `_version.py` is generated/ignored. Packaging currently
-declares Python >=3.10,<4, no runtime dependencies, and overlapping setuptools
-configuration. These are starting facts, not a tested support promise. The server
-catalog currently contains 123 entries; discovery `deposit.get.info` is additional.
-Recompute this inventory against the selected server snapshot in Stage 1.
+Inspected baseline at plan creation: branch `main`; the initial source state had
+packaging, `src/deposit/__init__.py` and `_meta.py`; no operational wrapper,
+tests or Python acceptance runner existed. `_version.py` is generated/ignored.
+Packaging declared Python >=3.10,<4, no runtime dependencies, and overlapping
+setuptools configuration. These were starting facts, not a tested support promise.
+The Server catalog contained 123 entries; discovery `deposit.get.info` was
+additional. Recompute this inventory against current checked-out Server files
+without reading commit history.
 
 ## Fixed design and implementation boundaries
 
@@ -131,14 +130,15 @@ test-related and temporary files have not escaped the permitted root.
 
 Production source, durable public specifications, the implementation plan,
 status tracker and version-controlled non-test documentation remain in their
-owning repositories: they are not test/temporary files. Existing authoritative
-server test scripts and suites may be **read or invoked in place** as external
-inputs, but this project run must not add or modify test-specific files there,
-or permit them to generate files outside `../test_harness`. Harness-side
-adapters and an owner-approved invocation path must satisfy server lifecycle
-requirements without creating a second launcher. New/modified test source in
-`../test_harness` needs durable version-control and review ownership; establish
-that ownership in Stage 1 without creating an unapproved repository.
+owning repositories: they are not test/temporary files. Server source, runtime
+and documentation may be read as current inputs, but **no test owned by
+`deposit-server` may be run** in any stage, including unit, integration,
+scenario, suite, setup/probe or regression tests. Python wrapper acceptance may
+connect to a Server runtime, but its tests and assertions must be owned by the
+Python harness. Any runtime lifecycle control must not execute Server tests,
+and every generated file must remain under `../test_harness`. New/modified test
+source in `../test_harness` needs durable version-control and review ownership;
+establish that ownership in Stage 1 without creating an unapproved repository.
 
 ## Module and evidence ownership
 
@@ -157,19 +157,20 @@ APIs. Stage planning may refine filenames without changing these responsibilitie
 | `../test_harness/deposit-python/tests/{unit,contract,integration,recovery,installed}/` | All wrapper test sources, assertions and independent observations |
 | `../test_harness/deposit-python/{scripts,fixtures,config}/` | Wrapper test runner, acceptance map/ledger tooling, test adapters, synthetic fixtures and test configuration |
 | `../test_harness/deposit-python/{env,build,cache,runs,evidence}/` | Test environments, installed-package staging, temporary files, diagnostics, results, journals/spools, checkpoints and retained evidence |
-| Existing sibling `deposit-server/scripts/` | Invoke authoritative server tools read-only; redirect every generated file to the permitted harness root; test-only integration adapters belong under `../test_harness` |
+| Current sibling `deposit-server/` files | Read current runtime source and documentation only; never execute Server-owned tests; Python test adapters and outputs belong under `../test_harness` |
 | Sibling `../test_harness` | Exclusive root for every new/modified test-related file and every temporary file; use existing lifecycle ownership, not a second test repository or server launcher |
 | Sibling `deposit-hub` | Shared Python signatures and cross-component contract documentation |
 
-Do not add a separate server launcher or bypass existing server lifecycle
-ownership. Prefer a client transport barrier for reply-loss tests; any server
-diagnostic hook must remain test-only, reside under `../test_harness`, and be
-installed/restored by the existing probe owner. Do not modify or create
-server-repository test files to implement the hook. If the existing owner cannot
-support a harness-side hook with redirected output, resolve that conflict before
-executing tests. Changes to server behavior are not presumed necessary:
-investigate discrepancies and obtain a scope decision before expanding into
-product server fixes.
+Do not add a separate server launcher or bypass existing runtime lifecycle
+ownership. No Server-owned test may be invoked, including when a lifecycle owner
+normally bundles tests with runtime startup. Use a supported runtime control only
+when it can provide the Server runtime without executing Server tests; otherwise
+fail closed and record Python live acceptance as unavailable. Prefer a client
+transport barrier for reply-loss tests; any server diagnostic hook must remain
+test-only, reside under `../test_harness`, and be installed/restored without
+running Server tests. Do not modify or create server-repository test files.
+Changes to server behavior are not presumed necessary: investigate discrepancies
+and obtain a scope decision before expanding into product server fixes.
 
 ## Verification infrastructure and common completion gate
 
@@ -178,12 +179,15 @@ Stage 1 must implement and document a stable wrapper runner, proposed as
 `-Mode Focused` and `-Mode StageGate`, `-Stage 1..6`, `-ListOnly`, `-Root`, and
 selection/group arguments. These are **planned commands**, not commands currently
 available. Its listings show exact tests and required runtime/probe/elevation
-conditions. It delegates server lifecycle to the existing owner through a
-harness-side hook added in Stage 1, runs the harness Python environment,
-propagates every failure/timeout, retains stdout/stderr and machine-readable test
-results exclusively under `../test_harness`, redacts secrets, and restores owned
-resources. Installed tests run outside the source tree from a harness-contained
-environment and must identify the installed artifact.
+conditions. It may use a supported runtime lifecycle control through a
+harness-side hook added in Stage 1, but it must run only Python-owned tests and
+must never invoke or indirectly trigger a Server-owned test. If the available
+lifecycle control couples startup with Server tests, it must be rejected until a
+compliant runtime-only path is available. The runner uses the harness Python
+environment, propagates every failure/timeout, retains stdout/stderr and
+machine-readable test results exclusively under `../test_harness`, redacts
+secrets, and restores owned resources. Installed tests run outside the source
+tree from a harness-contained environment and identify the installed artifact.
 
 **Mandatory two-level testing cadence:**
 
@@ -201,8 +205,9 @@ environment and must identify the installed artifact.
    individual features. The stage-end suite is cumulative: it includes all
    wrapper unit, contract, integration, recovery and installed-package tests
    applicable through Stage N, complete applicable acceptance for Stage N,
-   and the relevant server/harness regression and toolchain checks. Future-stage
-   tests not yet implemented are not required. Stage 6 additionally runs the
+   and the relevant Python-harness lifecycle and toolchain checks. No
+   `deposit-server` test selection is part of a stage gate. Future-stage tests not
+   yet implemented are not required. Stage 6 additionally runs the
    entire release acceptance and advertised support matrix. Do not claim a
    stage has passed based on focused runs alone.
 3. If the independent architect review or end-of-stage suite requires changes,
@@ -231,38 +236,20 @@ Stage 1 must turn every acceptance ID below into an assertion-to-test map,
 marking the focused feature checkpoint(s) and the cumulative stage-end acceptance
 that will prove it. Later stages extend that map before implementation,
 identifying error branches as well as success. Missing tests, skip-only results
-and Java-only evidence are not passes. Fixtures use disposable Namespaces/accounts
+and Server-runtime-only checks without Python assertions are not passes. Fixtures use disposable Namespaces/accounts
 and independent sessions or direct public procedures to verify effects; they
 must not derive expected values solely through the same wrapper decoder being
 tested. Test sources and fixtures live under `../test_harness`; test secrets stay
 in protected harness storage, not command lines or tracked fixtures.
 
-Existing authoritative server entry points, run from `deposit-server`, include
-the following *illustrative stage-end selections*. The harness-side orchestrator
-must set the exclusive writable root for **every** entry point, including commands
-that do not expose a `-Root` parameter. Do not invoke any example before verifying
-that its build outputs, scratch state, child processes and logs are redirected to
-`../test_harness`:
-
-```powershell
-.\scripts\Invoke-IntegrationSuite.ps1 -ListOnly -Root ..\test_harness
-.\scripts\Invoke-IntegrationSuite.ps1 -SetupOnly -Root ..\test_harness
-.\scripts\Invoke-Tests.ps1 -Kind Unit -Test 'DepositInfoTest'
-.\scripts\Invoke-Tests.ps1 -Kind Integration -Test 'PreparedActionReplayIT,AccountAuthorizationIT'
-.\scripts\Invoke-TestScenario.ps1 -SeedTest 'ActionReplayRecoveryIT#seed' -VerifyTest 'ActionReplayRecoveryIT#verify' -Transition Restart
-.\scripts\Invoke-TestScenario.ps1 -SeedTest 'ActionReplayRecoveryIT#seed' -VerifyTest 'ActionReplayRecoveryIT#verify' -Transition KillRestart
-```
-
-These server selections are used through the permitted runner at the **end of a
-stage** as applicable, not as full-suite invocations after individual features.
-
-Reinspect current parameters, artifact/probe requirements, writable-output
-redirection and coupled seed/verify fixtures before execution. These Java
-selections support harness/recovery changes; they do not replace Python-process
-scenarios. Service/crash/probe scenarios need their documented owner and elevation.
-Never infer a successful scenario before its post-transition verifier finishes.
-Never run unit selection `-Test '*'`. At stage-end, invoke the verified full
-selection through the harness runner rather than a broad unsafe wildcard.
+No `deposit-server` test entry point or test selection is authorized by this
+plan. Do not invoke Server unit, integration, scenario, setup/probe, watchdog-test,
+or full-suite commands. Python acceptance may exercise the Server as a runtime
+dependency only through a runtime-only lifecycle control that is verified not to
+start Server tests. If such a control is unavailable, do not substitute a Server
+test suite; record the affected Python live acceptance as unverified. All Python
+test sources, fixtures, generated files, logs, child-process state and runtime
+outputs remain under `../test_harness`.
 
 During an authorized project-run, every stage completes only after the following
 gates. Standalone project-stage/project-task use retains its requested phase and
@@ -276,9 +263,9 @@ this execution sequence.
    implemented feature**, execute and record **only its focused integration tests**;
    correct and repeat only those focused tests as needed.
 3. **At the end of the stage**, after all features and focused checks are complete,
-   run the **full cumulative wrapper stage selection** and all applicable
-   server/harness regression and lifecycle/journal/packaging checks from the
-   verification guide. This is the only routine full-suite execution point in
+   run the **full cumulative Python wrapper stage selection** and applicable
+   Python-harness lifecycle/journal/packaging checks. No Server-owned test may
+   run. This is the only routine full-suite execution point in
    the stage. Parse changed PowerShell and run `git diff --check` in each changed
    repo. Audit all generated/temp/test-file paths against `../test_harness`.
 4. Independent post-implementation architect review examines the actual source,
@@ -294,7 +281,7 @@ this execution sequence.
 ## Stage 1 - Contracts, package foundation and live acceptance infrastructure
 
 **Dependency:** none. **Outcome:** an installable, version-gated foundation and
-working real-server acceptance path before domain implementation.
+working Python acceptance path against the Server runtime before domain implementation.
 
 Ordered work:
 
@@ -344,7 +331,7 @@ Ordered work:
 7. Create the acceptance map and procedure coverage ledger with independent fields
    for dispatch, Python convenience behavior and executed integration evidence.
    Store their test-owned machine-readable working copies under `../test_harness`.
-   Reconcile only relevant shared KB signatures, with architect consistency review.
+   Compare relevant shared KB signatures as read-only inputs; record drift and do not edit Hub files in this run.
 
 Acceptance:
 
@@ -372,13 +359,13 @@ Acceptance:
   output-location audit detects and fails any escaped writes.
 
 **Feature checkpoints:** After each Stage 1 feature, run only its selected focused
-real-server integration tests; no full foundation/regression selection yet.
+Python integration tests against the Server runtime; no full
+foundation/regression selection yet.
 
 **End-of-stage gate:** runner `-Mode StageGate -Stage 1` executes the **full**
-Stage 1 foundation/acceptance suite, including build/install and parity groups,
-relevant existing server discovery and modified harness regression, and the
-exclusive-output audit. Stage 1 records exact resolved tool versions, command
-selections, focused-test results and retained stage-end logs in the tracker.
+Stage 1 foundation/acceptance suite, including build/install and manifest parity,
+Python discovery/live-smoke assertions, modified harness regression, and the
+exclusive-output audit. No Server-owned tests run.
 
 ## Stage 2 - Safe end-to-end core and durable prepared recovery
 
@@ -423,8 +410,9 @@ Ordered work:
 5. Extend harness barriers for before/after preparation, commit, local result
    persistence and release. Actually terminate/relaunch Python with the same
    protected journal. Verify effect counts/UUIDs through an independent session.
-   Add real server restart/kill-restart tests under existing runtime owners;
-   all barrier configurations, disposable processes, journals and logs reside
+   Add Python-owned scenarios that exercise graceful and forced Server restarts;
+   never run Server-owned tests. All barrier configurations, disposable processes,
+   journals and logs reside
    under `../test_harness`.
 
 Acceptance:
@@ -461,10 +449,10 @@ relevant focused integration tests (for example create/read, conflict, or
 interrupted prepared action), not the full core/recovery regression.
 
 **End-of-stage gate:** runner `-Mode StageGate -Stage 2` executes the **full
-cumulative** foundation/core unit, contract, integration, state-transition and
-live restart acceptance suite, plus supporting selected `PreparedActionReplayIT`,
-`AccountAuthorizationIT` and action recovery seed/transition/verifier when the
-harness boundary changes. All test outputs remain under `../test_harness`.
+cumulative** foundation/core Python unit, contract, integration, recovery,
+state-transition and live restart acceptance suite. This gate does not select or
+run Server unit, integration, scenario or suite tests. All test outputs remain
+under `../test_harness`.
 
 ## Stage 3 - Complete procedure gateway and controlled advanced access
 
@@ -536,14 +524,15 @@ Acceptance:
   the approved deferred action procedures remain explicitly listed as pending.
 
 **Feature checkpoints:** After each Stage 3 feature or procedure family,
-execute only its selected focused real-server integration tests; do not rerun
+execute only its selected focused Python integration tests against the Server
+runtime; do not rerun
 all-entry parity or cumulative regressions at feature checkpoints.
 
 **End-of-stage gate:** runner `-Mode StageGate -Stage 3` executes the **full
 cumulative** suite including all-entry parity/binding tests and installed live
-family representatives. Include relevant server authorization/cancellation/replay
-regression for any shared hook or behavior touched, with all outputs under
-`../test_harness`.
+family representatives. Python acceptance asserts authorization, cancellation and replay behavior
+through the Server runtime when applicable; it does not run Server-owned
+regression tests. All outputs remain under `../test_harness`.
 
 ## Stage 4 - Typed domain API, snapshots, queries and atomic batches
 
@@ -593,10 +582,8 @@ batch behavior; reserve exhaustive unit and cross-domain regression for stage en
 
 **End-of-stage gate:** runner `-Mode StageGate -Stage 4` executes the **full
 cumulative** suite including exhaustive value/snapshot/batch unit and contract
-tests plus installed domain workflows. Supporting server selections when affected:
-`ValueCodecTest`, `StrictValuesTest`, `TypedDataModelIT`, `BatchMutationIT`,
-`QueryLanguageIT`. All fixtures and generated outputs reside under
-`../test_harness`.
+tests plus installed Python domain workflows. No Server-owned test selections
+are run. All fixtures and generated outputs reside under `../test_harness`.
 
 ## Stage 5 - Resources and extended server workflows
 
@@ -621,10 +608,10 @@ Ordered work:
    Explicitly route server-scoped and destructive operations; retain confirmations,
    authorization and observations from the public contract.
 5. Add per-family installed workflows and failure/recovery cases under
-   `../test_harness`. Reuse existing server crash lifecycle owners for actual
-   restart/diagnostic probes, redirecting their output to the same root; verify
-   wrapper continuation after transitions. Complete relevant Python usage and
-   shared signature documentation.
+   `../test_harness`. Use runtime-only lifecycle controls for actual restart and diagnostic probes,
+   without running any Server-owned tests; verify Python wrapper continuation
+   after transitions. If no compliant runtime-only control exists, keep those
+   acceptance items unverified. Complete relevant Python usage documentation.
 
 Acceptance:
 
@@ -646,8 +633,9 @@ Acceptance:
   numeric/temporal/JSON values, blank-cell semantics, diagnostics, empty/limit cases,
   CRS/mixed geometry and output member names per the format contract.
 - **5E:** Exported resource URLs contain no Store token. Browser links use independent
-  authentication; exercise first login, repeat download and denial through the
-  existing browser harness. Unavailable listener fails export without publication.
+  authentication; exercise first login, repeat download and denial through
+  Python-owned browser acceptance only; no Server-owned browser test may run. An
+  unavailable listener fails export without publication.
 - **5F:** History modes/epochs, undo/redo/restore conflicts and version tags work
   through Python; access revocation, password/session invalidation, Namespace
   rename/deletion, administrative mode and server-scope recovery obey the contract.
@@ -660,21 +648,23 @@ also deferred a companion-content API for resource-bearing `from_dict` inputs;
 dictionary/subtree helpers must reject missing resource bytes before upload or
 analysis. Complete resource transfer and the Server's verified Exchange-package
 route remain in scope. `DResource.is_image` remains unknown without verified
-classification metadata. Python's exact supported Server version will be
-retargeted to the committed Stage 5 artifact, with equality checks retained and
-clean committed-artifact verification required before finalization.
+classification metadata. Python's exact supported Server version remains bound
+to the approved Stage 5 artifact, with equality checks retained. Do not inspect old
+commits or run a build tool that traverses Git history. If no currently available
+artifact has verifiable current-source provenance without history access, leave
+version/artifact acceptance unverified; do not bypass the clean-artifact check.
 
 **Feature checkpoints:** After each Stage 5 feature, run only focused
 integration workflows exercising the specific resource, geometry, Pattern,
 transfer, format, import, history or administration behavior; do not run the
 entire workflow suite until stage end.
 
-**End-of-stage gate:** runner `-Mode StageGate -Stage 5` executes the **full
-cumulative** suite, including family-specific workflows and actual interrupted
-transfer/import scenarios. Relevant server selections come from the verification
-guide (resource/geometry, Patterns, formats, history, clone/import, authorization,
-browser). Diagnostic tests run with probe artifacts only through their owner;
-all such artifacts remain under `../test_harness`. Record each failed test
+**End-of-stage gate:** runner `-Mode StageGate -Stage 5` executes the **full**
+cumulative Python suite, including family-specific workflows and actual
+interrupted transfer/import scenarios. No `deposit-server` tests or selections
+are run. Python live acceptance may use a Server runtime through a verified
+runtime-only lifecycle control; otherwise record those items as unverified.
+Diagnostic artifacts remain under `../test_harness`. Record each failed test
 individually and finish post-transition verification.
 
 ## Stage 6 - Optional graph conversion and release acceptance
@@ -700,15 +690,16 @@ Ordered work:
    Python/driver/server combination. Test supported minimum and upper bounds or
    narrow the advertised bounded matrix to evidenced combinations with a user
    decision where that changes agreed compatibility.
-5. At the **end of Stage 6 only**, run complete cumulative wrapper regression,
-   real process/restart/crash recovery, installed lifecycle/resource/browser
-   acceptance, relevant full server regression for shared changes, and
-   package/version/dependency/license checks. Before that gate, run only focused
-   integration tests after each individual release feature. Finalize installation,
-   migration-from-1.x, compatibility, recovery/result access and cleanup
-   documentation. Record evidence limits rather than claiming new deployment scope.
-   Keep all test sources, temporary artifacts, logs and release-test packages
-   under `../test_harness`; audit for escaped files.
+5. At the **end of Stage 6 only**, run complete cumulative Python wrapper
+   regression, real process/restart/crash recovery, installed lifecycle/resource/
+   browser acceptance and package/version/dependency/license checks. Do not run
+   any Server-owned test, including a full Server regression, even for shared
+   changes. Before that gate, run only focused integration tests after each
+   individual release feature. Finalize installation, migration-from-1.x,
+   compatibility, recovery/result access and cleanup documentation. Record evidence
+   limits rather than claiming new deployment scope. Keep all test sources,
+   temporary artifacts, logs and release-test packages under `../test_harness`;
+   audit for escaped files.
 
 Acceptance:
 
@@ -724,20 +715,24 @@ Acceptance:
   separately visible. No skipped acceptance is counted as verified.
 - **6D:** Clean installed artifacts pass the full declared matrix and reject
   unsupported combinations. 2.x identity, sdist build, version generation and
-  optional dependencies work outside the checkout.
-- **6E:** Full wrapper regression and relevant shared-tooling/server acceptance
-  pass with logs, source/artifact identities, independent effect checks and successful
-  cleanup/restoration. Documentation matches tested behavior; limitations are explicit.
+  optional dependencies work outside the checkout. Version generation must use
+  current files only; history-dependent generation remains unverified.
+- **6E:** Full Python wrapper regression and Python-harness acceptance pass with
+  logs, source/artifact identities, independent effect checks and successful
+  cleanup/restoration. The Server may be exercised as a runtime dependency, but
+  no Server-owned tests run. Documentation matches tested behavior; limitations
+  are explicit.
 
 **Feature checkpoints:** After each Stage 6 feature, run only its focused
 installed integration scenarios (for example a graph round trip or invalid-key
 case); no complete regression or support-matrix sweep before stage end.
 
-**End-of-stage gate:** runner `-Mode StageGate -Stage 6` executes the **full
-cumulative suite (all groups)**, installed support matrix, complete coverage
-ledger and required server/harness selections, all using `../test_harness` for
-test sources and generated files. Release readiness does not authorize upload
-to PyPI, pushes, deployment or changing existing installations.
+**End-of-stage gate:** runner `-Mode StageGate -Stage 6` executes the **full**
+cumulative Python suite (all groups), installed support matrix, complete
+coverage ledger and Python-harness lifecycle checks. No Server-owned tests run.
+All test sources and generated files use `../test_harness`. Release readiness
+does not authorize upload to PyPI, pushes, deployment or changing existing
+installations.
 
 ## Project-run execution and status contract
 
@@ -745,13 +740,15 @@ The authorized project run executes Stages 1 through 6 in the order defined
 here. The selected tracker records verified progress and commits; this plan
 remains the source for stage scope, dependencies and acceptance criteria.
 
-Select an explicit bounded sequence or next-N request. The plan and tracker are
-independent explicit inputs; do not substitute the hub's server status. Cross-repo
-work in the harness-side acceptance hook and relevant shared Python
-specifications is part of the selected stages, subject to each repository's
-instructions. External runtime changes still use existing lifecycle ownership
-and applicable runtime permissions; all test-only hooks, writable outputs,
-local working files and temporary state must be under `../test_harness`.
+Select an explicit bounded sequence or next-N request. The explicit plan and
+tracker remain authoritative. For this run, only `deposit-python` and
+`../test_harness` may be modified; `deposit-server` and `deposit-hub` are
+read-only. Shared-specification discrepancies remain findings and are not copied
+into Python documentation. Do not inspect, restore or read old commits in any
+repository. Reconcile only current checked-out files, the selected plan/tracker,
+the local checkpoint and retained evidence. Do not run build/version tools that
+traverse Git history; if current artifact provenance cannot be verified without
+history, keep that acceptance criterion unverified and do not bypass validation.
 
 Follow the deployed project-run skill for fresh stage workers, read-only planning,
 separate implementation dispatch, independent architect review, protected baselines,
@@ -768,8 +765,9 @@ an outside-root local file. Stage 1 must obtain a compatible, owner-approved
 checkpoint redirection if the deployed skill requires its old Git-path location;
 do not run with an out-of-root fallback. Store selected file hashes, baselines,
 current phase, decisions, focused and stage-end acceptance evidence, reviewed
-diff identity and pending/resulting commits under that schema. Reconcile
-checkpoint/source/tracker/history before resuming. A verified stage with pending
+diff identity and pending/resulting commits under that schema. Reconcile current
+source files, checkpoint, tracker and retained evidence before resuming; never
+inspect repository history or old commit objects. A verified stage with pending
 commits cannot advance. Evidence is reusable only while inputs match. Document
 real external blockers and required actions under AGENTS.md; missing tooling/tests
 or ordinary failures remain implementation work.
