@@ -25,7 +25,7 @@ acceptance.
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
 | 4 | Typed domain, queries and batches | Finalized | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Server, Hub and Python commits verified; tracker follow-up committed |
-| 5 | Resources and extended workflows | Verified and reviewed (finalization pending) | 5A-5F complete; cumulative StageGate passed against provenance-recorded `.15.g7610e45-SNAPSHOT` | Fresh independent architect review READY, no blocking findings | Tracker and stage commits pending |
+| 5 | Resources and extended workflows | Finalized | 5A-5F complete; cumulative StageGate passed against provenance-recorded `.15.g7610e45-SNAPSHOT` | Fresh independent architect review READY, no blocking findings | Python and test-harness Stage 5 commits verified; IDs recorded below |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
 Allowed states: Not started; Planning; Implementing; Verification incomplete;
@@ -1056,7 +1056,7 @@ window. Stage 5 remains incomplete; the mandatory cumulative StageGate 5 and
 whole-stage final review remain pending. Stage 6 has not started. No stage
 completion commit was made and no push occurred.
 
-### Stage 5 final verification and review (2026-10-30; finalization pending)
+### Stage 5 final verification and review (2026-10-30; finalized)
 
 This entry supersedes the earlier Stage 5 interruption and natural-expiry-pending
 statements. The corrected Server artifact was built from the user-reported fix;
@@ -1098,5 +1098,11 @@ read-only; no tests were rerun by the reviewer and no Server-owned tests ran.
 The runner restored the ordinary runtime after both instrumented checks. After
 the gate completed, the remaining harness-owned normal Neo4j runtime on
 `127.0.0.1:17770` was stopped with the supported Server lifecycle script; its
-process tree and listener were confirmed absent. Stage 5 tracker update and
-separate Python/test-harness stage commits remain pending finalization.
+process tree and listener were confirmed absent.
+
+Stage 5 commits, both on their respective `main`/harness worktree branches:
+
+- Python manifest and tracker: `2331014074aa5423f84218eeba73ec056c6e59b9`.
+- Re-created test harness and test dependencies: `6ec190189ce2ffb9a0f1f0ebbd8905c6489847aa`.
+- This tracker follow-up records both commit IDs; Stage 5 is finalized. No
+  Server or Hub files were modified, and no push was performed.
