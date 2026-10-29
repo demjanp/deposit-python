@@ -16,7 +16,7 @@
     "neo4j_version": "2026.05.0"
   },
   "support": {
-    "target_server_version": "2.0.0-dev.77-post.12.g5123588-SNAPSHOT",
+    "target_server_version": "2.0.0-dev.77-post.15.g7610e45-SNAPSHOT",
     "target_neo4j_version": "2026.05.0",
     "target_python": "3.14.x (Windows x64)",
     "supported_python": ">=3.14,<3.15",

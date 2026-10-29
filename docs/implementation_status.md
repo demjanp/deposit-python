@@ -1,6 +1,6 @@
 # Deposit Python 2 implementation status
 
-Updated: 2026-10-29.
+Updated: 2026-10-30.
 
 ## Authority and baseline
 
@@ -25,7 +25,7 @@ acceptance.
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
 | 4 | Typed domain, queries and batches | Finalized | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Server, Hub and Python commits verified; tracker follow-up committed |
-| 5 | Resources and extended workflows | Interrupted | 5A-5C and 5E verified; available .12 runtime fails 5D CSV save with TYPE_CONFLICT and prior format checks reproduce blank-cell matching failures; 5F natural expiry pending | Harness corrections reviewed READY; architect approves handoff for fixed Server artifact and natural expiry; whole-stage review pending | No stage commits |
+| 5 | Resources and extended workflows | Verified and reviewed (finalization pending) | 5A-5F complete; cumulative StageGate passed against provenance-recorded `.15.g7610e45-SNAPSHOT` | Fresh independent architect review READY, no blocking findings | Tracker and stage commits pending |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
 Allowed states: Not started; Planning; Implementing; Verification incomplete;
@@ -39,7 +39,7 @@ finalization fails; resume pending work without duplicating commits.
 
 Stage 1 acceptance IDs 1A-1E and Stage 2 acceptance IDs 2A-2F are verified and
 reviewed as recorded below. Stages 3 and 4 are also verified and reviewed;
-Stages 5-6 remain pending. Record separate states for supported dispatch, convenient
+Stage 6 remains pending. Record separate states for supported dispatch, convenient
 Python behavior and executed integration acceptance. A catalog count or Java
 regression result cannot satisfy the latter two fields. No specialized scenario
 can remain unassigned beyond its stage or be waived at release.
@@ -1055,3 +1055,48 @@ provenance-matching Server source/runtime artifact and the pending natural-expir
 window. Stage 5 remains incomplete; the mandatory cumulative StageGate 5 and
 whole-stage final review remain pending. Stage 6 has not started. No stage
 completion commit was made and no push occurred.
+
+### Stage 5 final verification and review (2026-10-30; finalization pending)
+
+This entry supersedes the earlier Stage 5 interruption and natural-expiry-pending
+statements. The corrected Server artifact was built from the user-reported fix;
+the Python manifest now binds strictly to
+`2.0.0-dev.77-post.15.g7610e45-SNAPSHOT`. Exact version matching remains enabled.
+The gate records the installed plugin SHA-256
+`fd0469c152b8495260f69facffb2c3ff7abb8157fb723919f946a23a349be09b` and records
+`server_tests_invoked=false`.
+
+The mandatory cumulative StageGate 5 passed in run
+`20261029T214350498Z-b255b8a0`; all 21 recorded commands exited 0, no command
+timed out, and the failure list is empty. Python 3.14.4 results: local tests
+73 passed / 3 deselected; ordinary live acceptance 68 passed / 1 deselected;
+the listener-failure case passed (1), post-listener resource download passed
+(1), and the dedicated accelerated-expiry case passed (1). Wheel and sdist
+installed-package suites each passed 2 tests. The expiry case is deliberately
+deselected from ordinary live acceptance and run once through its instrumented
+clock path. No Server-owned tests ran. Wheel SHA-256 is
+`6a2543ab9f3067d008058514e71b15fbc9224e51262d7597a8bf55fb2cfb0f56`; sdist
+SHA-256 is `d083fdd3e39b21af24f1a8f2de1b868b6c6010cf1950e9d257eaa3a95e9ea9b8`.
+Full command, timeout, test-result and cleanup evidence is retained at
+`../test_harness/runs/stage5-clean-current-20261029/test_harness/runs/python-20261029T214350498Z-b255b8a0/results.json`.
+The gate ran from `2026-10-29T21:43:50Z` to `2026-10-29T23:22:34Z` with the
+explicit 7200-second runner bound. An earlier default-bound attempt timed out
+after 30 minutes at 52% without a test failure; the completed longer-bound run
+passed. Focused Stage 5 cases also passed in
+`20261029T210210215Z-4226c809`.
+
+Stage 5F used the harness-owned accelerated clock and passed the public expiry,
+renewal, pinned-plan, reauthentication and accessible-control assertions. The
+fresh architect confirmed that this satisfies the approved plan's accelerated
+expiry requirement. The historical `.12` natural-expiry seed remains preserved
+as historical evidence; it is not current acceptance and no real-time wait is
+required. The architect reviewed current production and harness changes, the
+workflow assertions, clock-agent provenance and cleanup, the result record and
+JUnit reports, and returned READY with no blocking findings. Review was
+read-only; no tests were rerun by the reviewer and no Server-owned tests ran.
+
+The runner restored the ordinary runtime after both instrumented checks. After
+the gate completed, the remaining harness-owned normal Neo4j runtime on
+`127.0.0.1:17770` was stopped with the supported Server lifecycle script; its
+process tree and listener were confirmed absent. Stage 5 tracker update and
+separate Python/test-harness stage commits remain pending finalization.
