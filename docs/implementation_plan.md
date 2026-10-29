@@ -649,6 +649,26 @@ Acceptance:
   through Python; access revocation, password/session invalidation, Namespace
   rename/deletion, administrative mode and server-scope recovery obey the contract.
   Interrupted analysis/export/staging preserves operational IDs and expiry behavior.
+  Verify table, import-plan and exported-resource expiry without waiting 24 hours
+  of real time: use a test-only clock control owned by `../test_harness` in an
+  isolated disposable Server process and database, without changing the host OS
+  clock, production lease durations or Server repository. Create operational
+  state through public Python calls, advance the Server's relevant clock across
+  the actual expiry boundaries,
+  and observe the resulting access and expiry through public Python calls. Cover
+  validity before expiry, table lease renewal and plan pinning where applicable,
+  and rejection after expiry; use separate records where an access would renew a
+  lease. Plan pinning preserves staged content; it does not renew the table's
+  public lease or grant access after that lease expires. Reauthenticate after
+  advancing time when necessary and confirm the Namespace and an unexpired
+  control remain accessible so a missing Namespace or
+  expired session cannot masquerade as successful expiry. Verify the clock control
+  affects the Server expiry checks, restore it and the runtime during cleanup,
+  and retain evidence of the original and advanced times, exact runtime identity,
+  assertions and cleanup. Do not edit stored expiry timestamps, mock expiry
+  results or count a seed-only run as expiry verification. If no compliant clock
+  control can be established, record expiry acceptance as unverified rather than
+  waiting 24 hours or weakening the check.
 
 Approved execution clarifications for `deposit-python-20261025-01`: retain the
 earlier deferral of full-Namespace clone and Client-owned server-scope mutation
