@@ -53,7 +53,7 @@ _DOMAIN_VALUE_TYPES = {
 }
 _DEFINITIVE_DOMAIN_FAILURE_CODES = frozenset({
     "VALIDATION_FAILED", "TYPE_CONFLICT", "NOT_FOUND", "ALREADY_EXISTS",
-    "HISTORY_UNAVAILABLE", "IMPORT_CONFLICT", "PLAN_STALE",
+    "HISTORY_UNAVAILABLE", "IMPORT_CONFLICT", "PLAN_STALE", "LIMIT_EXCEEDED",
 })
 
 
@@ -754,9 +754,9 @@ class Store:
         page_size: int = 200,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        """Request one server-matched Pattern page, including its diagnostics."""
+        """Request one server-matched Pattern page using an ID-only selector."""
         if not isinstance(pattern, Mapping):
-            raise TypeError("Pattern search requires the server Pattern mapping")
+            raise TypeError("Pattern search requires an {id: UUID} selector mapping")
         if values is not None and not isinstance(values, Mapping):
             raise TypeError("Pattern values must be a mapping")
         if rules is not None and not isinstance(rules, Mapping):
@@ -770,7 +770,7 @@ class Store:
             page["cursor"] = cursor
         result = self._call_one(
             "deposit.get.objectsByPatternPage",
-            _portable_input(dict(pattern)),
+            _pattern_id_selector(pattern),
             _portable_input(dict(values or {})),
             _portable_input(dict(rules or {})),
             page,
@@ -785,15 +785,15 @@ class Store:
         values: Mapping[str, Any],
         rules: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Submit form data to the server's Pattern import workflow."""
+        """Submit form data for an ID-selected Pattern through the server workflow."""
         if not isinstance(pattern, Mapping) or not isinstance(values, Mapping):
-            raise TypeError("Pattern and form values must be mappings")
+            raise TypeError("Pattern must be an {id: UUID} selector and form values must be a mapping")
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("Pattern rules must be a mapping")
         result = self._run_action(
             "deposit.import.dataByPattern",
             [
-                _portable_input(dict(pattern)),
+                _pattern_id_selector(pattern),
                 _portable_input(dict(values)),
                 _portable_input(dict(rules or {})),
             ],
@@ -817,7 +817,10 @@ class Store:
         )
         if not isinstance(result, dict):
             raise DepositError("INVALID_RESPONSE", "Server returned no layout result")
-        return result
+        positions = result.get("positions")
+        if not isinstance(positions, dict):
+            raise DepositError("INVALID_RESPONSE", "Server returned an invalid layout result")
+        return positions
 
     def import_rows(self, rows, relationships=None, *, targets=None, rules=None) -> dict[str, Any]:
         """Analyze a frozen tabular submission; matching remains server-owned."""
@@ -2138,6 +2141,13 @@ def _pattern_selector(value: str | Mapping[str, Any]) -> str | dict[str, Any]:
         if set(selector) == {"name"} and isinstance(selector["name"], str) and selector["name"]:
             return selector
     raise TypeError("Pattern selector must be a nonempty name or an {id: UUID} mapping")
+
+
+def _pattern_id_selector(value: Mapping[str, Any]) -> dict[str, str]:
+    selector = dict(value)
+    if set(selector) != {"id"} or not isinstance(selector["id"], str) or not selector["id"]:
+        raise TypeError("Pattern selector must contain only a nonempty 'id' string")
+    return {"id": selector["id"]}
 
 
 def _freeze_import_rows(rows: Any) -> list[dict[str, Any]]:

@@ -191,15 +191,22 @@ tree from a harness-contained environment and identify the installed artifact.
 
 **Mandatory two-level testing cadence:**
 
-1. **After each completed feature, run only focused integration tests.** Select
-   the smallest real-server Python integration scenario(s) that directly exercise
-   the newly implemented feature and its essential success/failure behavior.
-   Use the runner's focused mode with explicit test identifiers; do not run the
-   complete integration group, cumulative regression, broad unit/contract suites,
-   a whole-stage selection, or the full compatibility matrix at this checkpoint.
-   Write or update the focused test first if none exists. Record its exact command,
-   expected effects, result and evidence. If it fails, correct the feature and
-   repeat only the affected focused integration tests until they pass.
+1. **After implementing, fixing or otherwise modifying a feature, run only
+   focused tests for that change.** Select the smallest Python test cases that
+   directly exercise the changed behavior and its essential success and failure
+   paths, using real-server integration when the behavior requires it. Unit and
+   contract cases may also be selected when they directly cover the change.
+   Before execution, inspect the exact cases selected by the command, including
+   every case expanded from an acceptance ID or group. A label such as `5D` is
+   not itself evidence that the selection is focused. If the runner expands a
+   selection to unrelated cases, narrow it to explicit test cases or add a
+   focused selection path before running it. Write or update a focused test first
+   if none exists. Record the exact command, selected cases, expected effects,
+   result and evidence. If a test fails, correct the feature and repeat only
+   the affected focused tests until they pass.
+   Do not run a larger batch, whole feature family, cumulative regression,
+   broad unit/contract suite, whole-stage selection or compatibility matrix at
+   this checkpoint. Reserve larger batches until the whole stage is implemented.
 2. **Only after all work for a stage is implemented, run its full stage-end suite.**
    Use `-Mode StageGate -Stage N` exactly at the end-of-stage gate, not after
    individual features. The stage-end suite is cumulative: it includes all
@@ -211,8 +218,9 @@ tree from a harness-contained environment and identify the installed artifact.
    entire release acceptance and advertised support matrix. Do not claim a
    stage has passed based on focused runs alone.
 3. If the independent architect review or end-of-stage suite requires changes,
-   run focused integration tests for the corrected feature(s), then rerun the
-   **full stage-end suite as the final gate**. Do not run full suites at interim
+   run focused tests for the corrected feature(s), then, once the entire stage
+   is implemented again, rerun the **full stage-end suite as the final gate**.
+   Do not run full suites at interim
    implementation checkpoints. `-ListOnly` and static inspection do not execute
    tests and may be used for planning.
 
@@ -260,7 +268,8 @@ this execution sequence.
    planning; root arranges architect advice and resolves material questions.
 2. Implementation follows a separate dispatch. Preflight compares public/durable
    contracts and maps each acceptance ID to concrete assertions. After **each
-   implemented feature**, execute and record **only its focused integration tests**;
+   implemented, fixed or otherwise modified feature**, execute and record **only
+   tests focused on that change**;
    correct and repeat only those focused tests as needed.
 3. **At the end of the stage**, after all features and focused checks are complete,
    run the **full cumulative Python wrapper stage selection** and applicable
@@ -270,8 +279,8 @@ this execution sequence.
    repo. Audit all generated/temp/test-file paths against `../test_harness`.
 4. Independent post-implementation architect review examines the actual source,
    tests, diff and evidence with no unresolved blocking findings; correct and
-   reverify findings. After any corrective change, rerun its focused integration
-   tests and then the full cumulative stage-end suite; earlier design advice does
+   reverify findings. After any corrective change, rerun its focused tests and,
+   once the whole stage is implemented, the full cumulative stage-end suite; earlier design advice does
    not satisfy this review.
 5. Root updates the selected tracker with actual focused-test evidence,
    stage-end full-suite evidence, output-location audit, deviations, cleanup,
@@ -650,14 +659,20 @@ analysis. Complete resource transfer and the Server's verified Exchange-package
 route remain in scope. `DResource.is_image` remains unknown without verified
 classification metadata. Python's exact supported Server version remains bound
 to the approved Stage 5 artifact, with equality checks retained. Do not inspect old
-commits or run a build tool that traverses Git history. If no currently available
-artifact has verifiable current-source provenance without history access, leave
+commits directly. The user has authorized the documented Server runtime launcher
+`Run_Server.ps1` as a narrow exception for its internal version-history traversal
+needed to prepare and identify the runtime. No history access outside that launcher
+is allowed. The launcher may build with Server tests skipped; no Server-owned test
+or test selection may run. If no currently available artifact has verifiable
+current-source provenance without running the authorized launcher, leave
 version/artifact acceptance unverified; do not bypass the clean-artifact check.
 
-**Feature checkpoints:** After each Stage 5 feature, run only focused
-integration workflows exercising the specific resource, geometry, Pattern,
-transfer, format, import, history or administration behavior; do not run the
-entire workflow suite until stage end.
+**Feature checkpoints:** After implementing or changing a Stage 5 feature, run
+only test cases that directly exercise the changed resource, geometry, Pattern,
+transfer, format, import, history or administration behavior. Inspect the
+expanded cases before running: a broad acceptance ID such as `5D` must not select
+unrelated format tests for a single export fix. Reserve broader batches and the
+entire workflow suite until the whole stage is implemented.
 
 **End-of-stage gate:** runner `-Mode StageGate -Stage 5` executes the **full**
 cumulative Python suite, including family-specific workflows and actual

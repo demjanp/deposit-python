@@ -1,6 +1,6 @@
 # Deposit Python 2 implementation status
 
-Updated: 2026-10-27.
+Updated: 2026-10-29.
 
 ## Authority and baseline
 
@@ -25,7 +25,7 @@ acceptance.
 | 2 | Safe core and durable recovery | Finalized | 2A-2F complete | Final cumulative gates passed; independent architect PASS, no blocking findings | Python, server and hub commits verified; tracker follow-up committed |
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
 | 4 | Typed domain, queries and batches | Finalized | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Server, Hub and Python commits verified; tracker follow-up committed |
-| 5 | Resources and extended workflows | Verification incomplete | Implemented in approved scope; 5A-5F acceptance pending | Focused units/probes passed; cumulative verification and independent review pending | No stage commits |
+| 5 | Resources and extended workflows | Interrupted | 5A-5C and 5E verified; available .12 runtime fails 5D CSV save with TYPE_CONFLICT and prior format checks reproduce blank-cell matching failures; 5F natural expiry pending | Harness corrections reviewed READY; architect approves handoff for fixed Server artifact and natural expiry; whole-stage review pending | No stage commits |
 | 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
 
 Allowed states: Not started; Planning; Implementing; Verification incomplete;
@@ -739,3 +739,319 @@ Project-run Stage 5 remains verification-incomplete and is not marked complete;
 the project run may now resume with its other pending Stage 5 work. No push was
 performed. Preserve unrelated edits, pending implementation, existing commits,
 and verification dependencies.
+
+
+### Stage 5 resumed fixture and environment update (2026-10-28)
+
+This update records the current plan constraints and current non-elevated test
+environment. Historical runner evidence above remains historical; its Server
+test selections do not satisfy the current Stage 5 gate, which excludes all
+Server-owned tests. No Server-owned test was run for this update.
+
+Stage 5 Python acceptance fixtures were recreated under `test_harness` from
+current source and new test files; none were restored from old commits. The
+workflow fixture currently has SHA-256
+`90906F264E4AC6E47748BB365716AF963C6F6FCECF326DE9BD4B63F983653AFF`. An
+independent focused architect review confirmed the reviewed additions after
+one row-limit diagnostic expectation was corrected. This is readiness for
+focused verification, not whole-stage review or acceptance approval.
+
+Harness-local verification passed `compileall`, collected 52 integration and
+recovery tests, and passed 11 focused local runner/contract tests. The complete
+unit folder collected 29 tests: 25 passed and four protected-storage/transfer
+tests failed before their assertions because DPAPI `CryptProtectData` returns
+WinError 2 in this session. Their LocalAppData and pytest outputs were isolated
+under `test_harness`; the first attempt without LocalAppData isolation also
+encountered an ACL denial at `C:\Users\demjan` and is not treated as product
+test evidence. The current process is `DEMJAN-PC\CodexSandboxOffline`, has no
+loaded user profile, and the user cannot change this session identity.
+
+Live Stage 5 acceptance and browser verification remain unrun. PowerShell
+execution policy is `Restricted`; the authorized runtime install marker is
+absent; Playwright provisioning failed with PyPI WinError 10013. Current
+read-only source comparison also confirms the unresolved Hub/Server export
+link-label mismatch (`storedFilename` versus original filename) and undefined
+GeoPackage SRID mismatch (Hub expects absent/`None`; Server returns `-1`). The
+public staged-table API provides page data and a continuation cursor but no
+lease metadata; Server uses a fixed 24-hour lease and no approved deterministic
+public control is available to prove renewal/expiry behavior.
+
+Stage 5 remains verification-incomplete; this entry does not certify 5A-5F,
+update the stage state to complete, or authorize Stage 6. No stage completion
+commit was created. Resume live acceptance only when the identity, compliant
+runtime/provenance and dependency prerequisites are available and the contract
+discrepancies are resolved or explicitly decided.
+
+
+### Stage 5 interruption and architect SRID advice (2026-10-28)
+
+The current session remains `DEMJAN-PC\CodexSandboxOffline`; a direct DPAPI
+probe still returns WinError 2, and the user cannot change the session identity.
+PowerShell's effective policy remains `Restricted` (all policy scopes are
+Undefined), so the runtime launcher cannot be used by bypassing or changing that
+policy. The runtime install marker and Playwright package are absent. A previous
+Playwright provisioning attempt failed with PyPI WinError 10013. No Server
+runtime or browser acceptance was run.
+
+The independent architect advises against normalizing `srid=-1` in the generic
+Python `DGeometry` decoder. That path has no GeoPackage provenance; normalization
+would also alter ordinary Deposit geometry values while leaving Server-side
+GeoPackage staging/import unchanged. Keep the stronger GeoPackage assertion and
+resolve the `-1` versus absent-SRID discrepancy in the Server adapter or through
+an explicit contract decision. The exported-resource label mismatch likewise
+requires the Server owner or an explicit decision; neither Server nor Hub may
+be modified under this run's scope.
+
+Stage 5 is interrupted, not complete. Resume after a usable DPAPI profile,
+policy-compliant runtime/artifact provenance, Playwright availability, and
+resolution of the two contract discrepancies. If lease renewal/expiry remains
+in scope, first establish an approved public deterministic control; do not
+inspect private Server records or manipulate system time. No Stage 5 completion
+commit was created and Stage 6 remains unstarted.
+
+
+### Stage 5 resumed after access-mode change; Server build interruption (2026-10-28)
+
+The active Codex process now runs as `demjan-pc\demjan`. The full
+harness-local unit suite passed: 29 tests. The protected harness admin
+credential decrypts under this profile, confirming the prior DPAPI failure was
+specific to the previous sandbox identity. PowerShell remains effectively
+`Restricted` with all scopes `Undefined`. At the user's direction to try the
+authorized launcher, its existing process-scoped `-ExecutionPolicy Bypass`
+invocation was used; no persistent execution-policy scope was changed.
+
+The launcher downloaded pinned runtime dependencies only under `test_harness`
+and invoked Maven with `-DskipTests`. Maven versioned the current Server source
+as `2.0.0-dev.77-post.9.gd493057-SNAPSHOT`, then stopped before compilation or
+any test phase. Maven reported that `deposit-server/integration-tests` was
+missing. Read-only inspection after failure found that the tracked root
+`pom.xml` currently lists only `plugin` and `runtime-probe` (SHA-256
+`4C0EB4588249D8055241F3AADFF5AEC4B5AD0489DD85A71D01A089071AB8D583`), while
+the ignored current `.git-versioned-pom.xml` lists `integration-tests` (SHA-256
+`21B305440CD1943FCD6CAF3207581103A241ABC694D8B921D2DE8296FC1FBD93`). The
+effective/versioned model therefore disagrees with the tracked root POM; the
+Server owner needs to reconcile the generated build model before retrying. The
+`integration-tests` directory is absent. No Server-owned test ran. No
+Java/Neo4j process remains, and the runtime installation marker was not
+created. Downloaded archives and setup evidence remain in `test_harness`; the
+launcher lock handle is closed.
+
+Per the user's interruption condition, stop runtime setup here. Resume only
+after the Server owner provides a reconciled current-source build model or an
+approved runtime artifact path that does not require reading old commits or
+running Server tests. The existing filename-label and undefined-SRID
+Server/Hub discrepancies also remain unresolved. Stage 5 is still interrupted;
+there is no stage completion commit, and Stage 6 has not started.
+
+
+### Stage 5 resumed verification and Server contract interruption (2026-10-29)
+
+The Server plugin artifact SHA-256 is
+`1B6F2A862EBD02A080DF70D66B20A8C4F7F1D03BB59E2AD4796B4EAF61B03B6E`; it is
+installed under `test_harness`, and build metadata matches
+`2.0.0-dev.77-post.10.gbe68483-SNAPSHOT`. Python live
+acceptance used that runtime as a dependency; no Server-owned test ran and no
+test files were restored from old commits. Git-history access was limited to
+the explicitly authorized launcher path. The supported launcher was used for
+Server lifecycle actions, with process-scoped PowerShell execution-policy
+bypass; no persistent policy change was made.
+
+Focused evidence:
+
+- 5A: the runner passed all five selected live acceptance cases.
+- 5B: Pattern create/search/form import and invalid-geometry diagnostics passed.
+  The required GeoPackage export/import contract fails because undefined SRS is
+  returned as `srid: -1` rather than absent/`None`.
+- 5C: the runner passed 10 selected live acceptance cases, including recovery,
+  package/subtree import, and resource-byte transfer.
+- 5D: 12 independent live format checks passed, including CSV/XLSX/GPKG empty
+  tables, size limits, diagnostics, and geometry checks. The required full
+  tabular path remains blocked: nested `DDict` Integers staged from canonical
+  JSON are rejected during import with `TYPE_CONFLICT`, despite the table read
+  preserving the exact integer.
+- 5E: four independent Python HTTP browser checks passed after correcting
+  fixture metadata hydration and same-origin `Origin` headers. The required
+  exported-link check fails because Server emits the original filename while
+  Hub requires `storedFilename`. The real-browser acceptance was not run; its
+  helper has the same strict filename expectation before browser launch.
+  Playwright and Edge are available.
+- 5F: the runner passed all 12 selected live acceptance cases, including
+  Namespace lifecycle, session-scoped administration, recovery, and
+  history/versioning workflows.
+
+Run evidence is retained under `test_harness/runs`: 5A
+`python-20261028T232046941Z-6e56ff7d`; 5B blocker
+`python-20261029T000603112Z-5fc27871`; 5C
+`python-20261028T234535593Z-f89e023d`; 5E filename blocker
+`python-20261029T002041491Z-d9950b1e`; 5F
+`python-20261028T235820371Z-edc2fa01`; 5D independent checks
+`python-manual-5D-independent-5a258a4f`; 5E independent HTTP checks
+`python-manual-5E-http-a8a038bf`; local unit suite
+`python-unit-stage5-resume-beeb35ae`.
+
+The 29-test local Python unit suite passed with per-run `LOCALAPPDATA`, `TEMP`,
+and pytest output isolated under `test_harness`. Stage 5 Python changes also
+include ID-only selectors for Pattern search/form import, terminal handling of
+`LIMIT_EXCEEDED` after confirmed rollback, and fixture corrections for lazy
+results, canonical Pattern comments and WKT formatting. XLSX row/column-limit
+failures were verified to close cleanly and not leave unresolved actions.
+
+Independent architect review found no blocking issue in the Python Store
+changes and approved interruption for the Server-owned blockers. The three
+remaining contract defects are: undefined GeoPackage SRS normalization, nested
+typed JSON Integer decoding at tabular import, and resource export/attachment
+filenames using the original rather than stored filename. Python-only
+normalization would weaken or bypass the Server-owned contract and is not an
+acceptable remedy. The Server owner must correct these behaviors and provide a
+current-source rebuilt runtime before the affected Python acceptance can pass.
+
+Stage 5 is interrupted and incomplete. No cumulative Stage 5 gate, complete
+real-browser acceptance, final stage review pass, tracker completion, or stage
+commit exists. Stage 6 remains unstarted. Resume after the Server fixes and a
+verified replacement runtime are available; then rerun the affected 5B/5D/5E
+checks, the full Stage 5 gate, independent review and required commits.
+
+### Stage 5 resumed; source fixes confirmed, runtime artifact pending (2026-10-29)
+
+The current read-only Server checkout is clean at `f6846c98861bae22b31ddccf91a2fe6bbbbe0670`.
+An independent architect's source review confirms the three previous contract
+defects are corrected in that checkout: undefined GeoPackage SRS maps to no
+SRID, canonical nested List/DDict integers are decoded recursively, and exports
+use `storedFilename` for resource labels and browser attachments. This is source
+evidence only; Python live acceptance has not run against those fixes.
+
+All available plugin copies under `test_harness` still have version
+`2.0.0-dev.77-post.10.gbe68483-SNAPSHOT`, SHA-256
+`1B6F2A862EBD02A080DF70D66B20A8C4F7F1D03BB59E2AD4796B4EAF61B03B6E`, from
+source commit `be68483e05d713f5bc9057cf40d2c566046999fc`. The installed runtime
+therefore remains stale. No Server-owned tests ran. A Python 3.14.4 isolated
+unit run passed 29 tests (`test_harness/runs/python-unit-resume-20261029T101611761Z`);
+focused runner listing for 5B confirmed it selects Python-owned tests only.
+
+The original runtime and Server checkout were preserved. A replacement needs a
+current-source artifact with verifiable provenance. Running the launcher from an
+isolated current-source snapshot requires disposable Git metadata under
+`test_harness`; user direction on that build path or a provenance-backed
+replacement artifact is pending. Stage 5 remains incomplete; affected 5B/5D/5E
+live checks, real-browser acceptance, cumulative StageGate 5, independent final
+review, and stage commits remain outstanding. Stage 6 has not started.
+
+
+### Stage 5 resumed against current-source Server runtime (2026-10-29)
+
+This update supersedes the artifact-pending notes above for the present
+resumption. The user authorized an isolated current-source snapshot under
+`test_harness`; its 262 tracked files match the clean Server checkout at
+`f6846c98861bae22b31ddccf91a2fe6bbbbe0670`. The isolated launcher built and
+installed `2.0.0-dev.77-post.11.gf6846c9-SNAPSHOT` from that source. The
+plugin SHA-256 is
+`d7643465880868bb5ca53c560f68b8e5f81054a071a9a4fdac2082eb652768fb`.
+Maven used `-DskipTests`; no Server tests ran. The original `.10` runtime and
+Server checkout were preserved.
+
+Focused Python-owned verification against this runtime:
+
+- **5A:** 5 selected cases passed (`python-20261029T112054249Z-87fd32b0`).
+- **5B:** 5 selected cases passed, including strict layout envelope handling
+  (`python-20261029T105257113Z-c63e6280`).
+- **5C:** 10 selected live cases passed, including import recovery and resource
+  transfer (`python-20261029T112541747Z-bfe91ab9`). The runner records
+  `server_tests_invoked: false`.
+- **5D:** the required blank-cell reuse assertion fails: applying a staged row
+  with an empty value creates a duplicate (`createdObjects == 1`, expected 0).
+  Supplemental live checks reproduced the same failure for CSV, XLSX and
+  GeoPackage; 13 other independent format checks passed. Evidence is under
+  `test_harness/runs/stage5-resume-f6846c9/test_harness/runs/`.
+- **5E:** 8 selected checks passed, including browser/authentication and
+  download flows (`python-20261029T104756077Z-077859e3`). The unavailable
+  listener/no-publication branch remains unverified because the supported
+  runtime exposes no way to disable that listener while keeping Bolt available
+  or publicly observe whether a failed export published output/grant state.
+- **5F:** the existing 12 lifecycle/history cases passed. A separate
+  public-API expiry seed passed and persists only IDs/timestamps/version at
+  `test_harness/runs/stage5-resume-f6846c9/test_harness/runs/stage5-expiry/expiry-state.json`.
+  Do not reset or delete this state. Its natural-expiry verification must wait
+  until at least `2026-10-30 11:21:42 UTC`; it will then assert table, plan and
+  export access expire through public calls.
+- The full Python unit folder passed 34/34. The first direct invocation failed
+  during collection because its `PYTHONPATH` was omitted; the corrected run
+  supplied the source path and passed all tests. The expiry test collected as
+  one test after its teardown was corrected so verify-phase setup failures
+  preserve seeded state.
+
+Fresh independent architect review returned **CHANGES REQUIRED**. It found no
+further product-code correction. The 5F fixture teardown finding was corrected
+and accepted on review: verification cleanup remains disabled until every
+expiry assertion passes. The confirmed Server defect is tabular matching:
+Server matching must ignore missing, null and empty staged-table cells as keys,
+preserve existing values, and continue treating whitespace-only strings as
+supplied values while preserving ambiguity and atomicity behavior.
+
+The user clarified that functionality needed only to test a behavior belongs in
+this implementation. The documented live 5E behavior remains that a
+resource-bearing export fails without publishing a resource or grant when the
+authenticated download service is unavailable. Current evidence does not show
+that Server violates this behavior, so no Server code change is required for
+5E. The listener-failure simulation and publication observation belong in the
+Python test harness; the 5E failure path remains unverified until that harness
+coverage is implemented and run.
+
+The cumulative StageGate 5 and 5F natural-expiry verification remain pending.
+Stage 5 is interrupted/incomplete and has no completion commit. Stage 6 depends
+on finalized Stage 5 and has not started. Resume after the natural-expiry
+window, then run the expiry verification and cumulative gate; completion still
+requires the two Server-side items above, a rebuilt matching runtime, final
+verification/review and separate stage commits. No push was performed.
+
+
+### Stage 5 resumed: listener harness correction and runtime evidence (2026-10-29)
+
+This entry supersedes earlier Stage 5 statements that the 5E listener-failure
+branch was unverified; the current focused run covers that branch and cleanup.
+
+The Stage 5 listener harness corrections are implemented under
+`test_harness/deposit-python`. The runner now fails closed on unknown child exit
+status, confirms process-tree termination before lifecycle cleanup, refuses to
+restart after an unsuccessful stop, preserves a prior unconfirmed-process state,
+and skips post-cleanup bootstrap/download checks unless normal runtime restoration
+and `JAVA_TOOL_OPTIONS` restoration both succeeded. The diagnostic readiness
+check requires a fresh record; the prior readiness file is retained, but its port
+is not listening. The Server launcher wrapper propagates thrown failures and
+native exit codes. Windows PowerShell 5.1 parser checks passed on four scripts.
+Runner contract tests passed 9/9, including injected monitoring, cleanup-stop,
+post-cleanup validation, launcher throw and exit-code cases. Subprocess probes
+passed for exit 0/7, inherited stdout/stderr logging without hanging, and timeout
+process-tree termination.
+
+Focused 5E passed against the isolated `.12` runtime: 8 ordinary Python live
+cases, the unavailable-listener/no-publication case, and the post-cleanup resource
+download passed. All 11 recorded commands exited 0 without timeout; bootstrap
+passed before and after the diagnostic run, normal `.12` metadata was preserved,
+the diagnostic listener port was closed, and `server_tests_invoked` was false.
+Evidence: `test_harness/runs/stage5-server-5123588/test_harness/runs/python-20261029T145815394Z-fdf11465`.
+The focused runner smoke on the default paths also passed local contracts and its
+live smoke (`test_harness/runs/python-20261029T150952697Z-9859dd61`).
+
+The user reported that the Server fix is in place. The available isolated runtime
+and its source snapshot do not contain that fix: the clean local Server checkout
+and snapshot remain at `5123588265906aa974f13def4484703411963454`, and the matching
+runtime is `2.0.0-dev.77-post.12.g5123588-SNAPSHOT`. Focused Python 5D against that
+runtime failed at `deposit.save.csv` with `TYPE_CONFLICT: Value does not match
+Integer` for the canonical nested Integer value. Evidence is in
+`test_harness/runs/stage5-server-5123588/test_harness/runs/python-20261029T142733332Z-2de972e3`.
+Earlier focused format probes against the same source also reproduced blank-cell
+matching failures. No Python normalization or fixture relaxation is acceptable;
+the architect found no Python/harness remedy. No Server-owned tests ran.
+
+The preserved 5F natural-expiry seed remains tied to `.12` at
+`test_harness/runs/stage5-server-5123588/test_harness/runs/stage5-expiry/expiry-state.json`
+(SHA-256 `2F3DB1128C9A7030087431E81751E32808C083A295B82D1797DBCED584897052`).
+Do not modify or recreate it. Its earliest verification time is
+`2026-10-30 12:45:39 UTC`.
+
+The independent architect reviewed the final harness corrections and marked them
+ready. The architect approved an incomplete-work handoff for a corrected,
+provenance-matching Server source/runtime artifact and the pending natural-expiry
+window. Stage 5 remains incomplete; the mandatory cumulative StageGate 5 and
+whole-stage final review remain pending. Stage 6 has not started. No stage
+completion commit was made and no push occurred.

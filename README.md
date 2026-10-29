@@ -87,8 +87,8 @@ CSV/XLSX/GeoPackage load/save, table paging, history, undo/redo and confirmed
 restore use `store.call(...)` with the exact public Server arguments. Returned
 browser download URLs use independent browser authentication; never append a
 Store token. See the [shared Python contract](https://github.com/demjanp/deposit-hub/blob/main/deposit-python.md)
-for method signatures and the [acceptance map](tests/acceptance_map.md) for
-verification status.
+for method signatures. The project acceptance map is maintained in the adjacent
+`test_harness/deposit-python/config/acceptance_map.json` checkout.
 
 ## Contact: <a name="contact"></a>
 Peter Demján (peter.demjan@gmail.com)
