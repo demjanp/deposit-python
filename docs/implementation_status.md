@@ -26,7 +26,7 @@ acceptance.
 | 3 | Complete procedure gateway | Finalized | 3A-3E complete | Cumulative gate passed; independent architect PASS, no blocking findings | Python, server and hub implementation commits verified; tracker follow-up recorded |
 | 4 | Typed domain, queries and batches | Finalized | 4A-4E complete | Cumulative Python gate and affected Server regressions passed; independent architect PASS | Server, Hub and Python commits verified; tracker follow-up committed |
 | 5 | Resources and extended workflows | Finalized | 5A-5F complete; cumulative StageGate passed against provenance-recorded `.15.g7610e45-SNAPSHOT` | Fresh independent architect review READY, no blocking findings | Python and test-harness Stage 5 commits verified; IDs recorded below |
-| 6 | NetworkX and release acceptance | Not started | 6A-6E pending | Not run / no implementation review | No stage commits |
+| 6 | NetworkX and release acceptance | Finalized under user-approved gate exception | Failed minimum-driver identity probe passed after correction; full matrix not claimed as passed; remaining limits recorded below | Prior cumulative checks passed; fresh whole-stage architect review READY; no production blockers | Python and test-harness Stage 6 commits recorded below; no push |
 
 Allowed states: Not started; Planning; Implementing; Verification incomplete;
 Review corrections; Verified and reviewed (finalization pending); Finalized;
@@ -39,10 +39,13 @@ finalization fails; resume pending work without duplicating commits.
 
 Stage 1 acceptance IDs 1A-1E and Stage 2 acceptance IDs 2A-2F are verified and
 reviewed as recorded below. Stages 3 and 4 are also verified and reviewed;
-Stage 6 remains pending. Record separate states for supported dispatch, convenient
-Python behavior and executed integration acceptance. A catalog count or Java
-regression result cannot satisfy the latter two fields. No specialized scenario
-can remain unassigned beyond its stage or be waived at release.
+Record separate states for supported dispatch, convenient Python behavior and
+executed integration acceptance. A catalog count or Java regression result
+cannot satisfy the latter two fields. Stage 6 is in final review under the
+user's validation exception. Read its evidence entry below; the declared
+support matrix must not be described as fully passed. The independent review
+and separate repository commits are complete; only the user-directed evidence
+exception limits remain.
 
 ## Stage evidence records
 
@@ -1106,3 +1109,68 @@ Stage 5 commits, both on their respective `main`/harness worktree branches:
 - Re-created test harness and test dependencies: `6ec190189ce2ffb9a0f1f0ebbd8905c6489847aa`.
 - This tracker follow-up records both commit IDs; Stage 5 is finalized. No
   Server or Hub files were modified, and no push was performed.
+
+### Stage 6 / `deposit-python-20261025-01` / finalized under user-approved gate exception
+
+The user approved the architect's compatibility recommendation: raise the
+Neo4j Python driver minimum from 6.0.0 to 6.1.0, retain the upper tested
+endpoint 6.4.1, and advertise `neo4j>=6.1,<7`. This is consistent across
+`pyproject.toml`, the installed procedure manifest, `Client.discover()`, the
+README, and `test_harness/deposit-python/config/release_matrix.json`.
+`Client.discover()` rejects driver 6.0 before issuing a Server request. The
+release matrix wheelhouse pins and contract assertions use 6.1.0 and 6.4.1.
+
+The prior full StageGate 6 run was
+`python-20261030T043159363Z-d72171eb`. It ran for 2 hours, 10 minutes,
+20.677 seconds and failed ordinarily, not by timeout, in the first release
+matrix wheel identity probe: Python 3.14.0, Neo4j driver 6.0.0, NetworkX
+absent. The import raised `AttributeError` because `socket.EAI_ADDRFAMILY`
+was unavailable. The earlier cumulative/local, live, bootstrap, listener,
+expiry, wheel-installed and sdist-installed checks passed in that run; no
+later matrix cells ran. Full gate results are retained at
+`../test_harness/runs/stage5-clean-current-20261029/test_harness/runs/python-20261030T043159363Z-d72171eb/results.json`.
+
+After the user explicitly directed that only the failed case be rerun and
+that the gate be considered finished if it succeeded, the corrected package
+wheel was built in `test_harness/runs/stage6-min-driver-identity-20261030T113326369Z`.
+The previously failing identity probe ran once under Python 3.14.0 with
+Neo4j 6.1.0 and NetworkX absent. It returned exit code 0, no timeout, confirmed
+process termination, and the expected `deposit==2.0.0.dev0` identity imported
+from the isolated environment's `site-packages`. Evidence is in
+`../test_harness/runs/stage6-min-driver-identity-20261030T113326369Z/results.json`.
+The tested wheel is
+`../test_harness/runs/stage6-min-driver-identity-20261030T113326369Z/artifacts/deposit-2.0.0.dev0-py3-none-any.whl`,
+SHA-256 `d4a86c40a79209dc2f2ca4fa6ff36efb1b8ba93f8ade7be8eaeca765bffbbe55`.
+
+This exception closes the gate by user direction; it does **not** mean the
+full declared matrix passed. The remaining 23 wheel/sdist matrix executions
+and the post-matrix public-coverage audit were not run. A runner `-Case`
+attempt also executed all four tests in the selected contract file despite
+reporting one expanded case; all four passed, then the intended exact node was
+run directly and passed 1/1.
+
+The fresh independent compatibility review returned READY with no blocking
+findings. The subsequent whole-stage review found that the dedicated expiry
+clock result was absent from the coverage ledger and that focused `-Case`
+execution discarded node suffixes. The harness now records an explicitly
+selected command/report pair, rejects failed, timed-out, skipped or mismatched
+case evidence, wires the dedicated expiry report into the ledger, and passes
+full node IDs to focused pytest commands. The retained StageGate run's
+`python-stage5-expiry-clock` command passed and its JUnit report contains the
+single expected passing case; that evidence was added to the ledger for the
+mapped workflows. Recorder and selector contract assertions were added but
+were not run under the user's exception. The fresh post-correction whole-stage
+architect review returned READY. Per the user's instruction, harness-only
+issues do not block the gate; no production defect remains. The corrected
+identity probe passed, so the user-approved exception closes the gate without
+another test or audit run. The other 23 wheel/sdist matrix acceptance
+executions and final coverage audit remain unverified; no claim is made that
+the complete matrix passed. No Server-owned tests ran. The leftover harness
+Neo4j runtime was stopped using its supported drain/console lifecycle; its
+process tree and listeners were verified absent. No Server or Hub files were
+modified, and no push occurred.
+
+- Production Stage 6 commit: `d12e578f431d9397df9d4a8b8275ec2f62658fa1`.
+- Test-harness Stage 6 commit: `e8c64bacfc5d4fa32949efada5e0c207c5892fed`.
+- This tracker follow-up records the final review and both commit IDs. No push
+  occurred.
