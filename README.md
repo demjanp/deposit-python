@@ -15,9 +15,11 @@ Deposit was created on 29. 4. 2013
 1. [About Deposit](#about)
 2. [Installation](#installation)
 3. [Resource and import workflows](#resource-and-import-workflows)
-4. [Contact](#contact)
-5. [Acknowledgements](#acknowledgements)
-6. [License](#license)
+4. [NetworkX graph conversion](#networkx-graph-conversion)
+5. [Compatibility and migration](#compatibility-and-migration)
+6. [Contact](#contact)
+7. [Acknowledgements](#acknowledgements)
+8. [License](#license)
 
 </details>
 
@@ -33,21 +35,29 @@ It serves as a backend for the following applications:
 
 ## Installation <a name="installation"></a>
 
-Planned release installation commands (available after Stage 6 and publication):
+Deposit 2.x has not been published to PyPI. After publication, install the
+client with:
+
 ```
 pip install "deposit>=2,<3"
 ```
 
-NetworkX graph conversion is planned for Stage 6; its optional extra will be:
+NetworkX is optional. Install the graph extra only when using graph conversion:
 
 ```
 pip install "deposit[networkx]>=2,<3"
 ```
 
-The initial integration support matrix targets Windows x64, Python 3.14.x,
-Neo4j Python driver 6.x, and the exact Deposit Server build recorded in the
-installed package's procedure manifest. Unsupported server builds fail before
-Deposit API calls.
+Package metadata requires Python 3.14.x and Neo4j Python driver >=6.1,<7. The
+`networkx` extra supports NetworkX 3.x, starting at 3.4. This client also checks
+the Deposit Server version against the exact build recorded in its installed
+procedure manifest; unsupported Server builds fail before Deposit API calls.
+The current manifest target is
+`2.0.0-dev.77-post.15.g7610e45-SNAPSHOT`.
+The declared release acceptance matrix targets Windows x64, Python 3.14.0 and
+3.14.10, Neo4j driver 6.1.0 and 6.4.1, NetworkX absent and versions 3.4 and
+3.7, with the manifest's exact Server build. Release acceptance is separate
+from PyPI publication.
 
 For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/deposit_gui/releases/latest)
 
@@ -89,6 +99,55 @@ browser download URLs use independent browser authentication; never append a
 Store token. See the [shared Python contract](https://github.com/demjanp/deposit-hub/blob/main/deposit-python.md)
 for method signatures. The project acceptance map is maintained in the adjacent
 `test_harness/deposit-python/config/acceptance_map.json` checkout.
+
+## NetworkX graph conversion <a name="networkx-graph-conversion"></a>
+
+Install `deposit[networkx]` to use `Store.to_networkx(...)` or
+`Store.from_networkx(...)`. The base package remains importable without
+NetworkX; calling either graph method without the extra raises an
+`ImportError` with the installation command.
+
+`to_networkx` returns a directed multigraph. Node keys are
+`(namespace_id, kind, id)` tuples, where `kind` is `Class` or `Object`. Edge
+keys retain relationship IDs, so parallel relationships and their direction
+remain distinct. Node and edge attributes retain the exported values,
+declarations and membership data. Graph metadata includes the source Namespace,
+revision, Patterns and the detached Exchange snapshot used for conversion.
+
+```python
+graph = store.to_networkx(roots=[root_object_id], max_hops=2)
+plan = store.from_networkx(graph)
+result = store.import_apply(plan["planId"])
+```
+
+Omit `roots` to export the Namespace. When roots are supplied, `max_hops` may
+be from 0 through 10 and `root_class_boundary` defaults to `True`. Import
+freezes the graph before analysis, so later caller edits do not change the
+submitted input. Deposit Server performs matching and assigns receiver-side
+identities; source IDs are not a promise that imported entities keep those IDs.
+Apply the returned plan explicitly with `store.import_apply(...)`.
+
+Graph conversion is not a complete backup or migration format. Resource content
+cannot be created from a graph, and resource-bearing imports are rejected. Use
+the Exchange resource workflow for content-bearing snapshots. The API also does
+not provide full-Namespace clone recovery or recover Client-owned Server-scope
+mutations; those workflows remain deferred.
+
+## Compatibility and migration <a name="compatibility-and-migration"></a>
+
+Deposit Python 2.x is a separate client generation from Deposit 1.x and does not
+promise API compatibility. There is no automatic 1.x-to-2.x migration; use
+separate environments when both generations are needed and migrate application
+code against the Deposit 2 client and Server contract.
+
+Operations return explicit analysis or action results. Import methods return a
+plan that must be applied; callers should retain its `planId` and returned
+mapping when they need to associate source records with receiver-side IDs.
+Store-scoped pending operations can be recovered through the Store recovery
+methods, subject to the configured protected recovery directory. Recovery does
+not cover full-Namespace clone workflows or Client-owned Server-scope mutations.
+Close Stores, resources and download readers when finished; incomplete resource
+downloads are reported when a reader closes before all bytes are consumed.
 
 ## Contact: <a name="contact"></a>
 Peter Demján (peter.demjan@gmail.com)

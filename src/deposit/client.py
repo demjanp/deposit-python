@@ -72,10 +72,11 @@ class Client:
         support = _manifest()["support"]
         driver_version = distribution_version("neo4j")
         try:
-            driver_major = int(driver_version.split(".", 1)[0])
-        except (TypeError, ValueError) as exc:
+            driver_components = driver_version.split(".")
+            driver_major, driver_minor = int(driver_components[0]), int(driver_components[1])
+        except (IndexError, TypeError, ValueError) as exc:
             raise CompatibilityError(driver_version, support["neo4j_driver"], "Neo4j Python driver") from exc
-        if driver_major != 6:
+        if driver_major != 6 or driver_minor < 1:
             raise CompatibilityError(driver_version, support["neo4j_driver"], "Neo4j Python driver")
         record = self._single("CYPHER 25 CALL deposit.get.info() YIELD data RETURN data")
         data = record.get("data")

@@ -739,9 +739,8 @@ class Store:
         """Iterate server-paged Pattern records without interpreting definitions."""
         if name is not None and (not isinstance(name, str) or not name):
             raise ValueError("Pattern name filter must be a nonempty string")
-        selection = None if name is None else {"name": name}
         return self._entity_page(
-            "deposit.get.patternPage", selection, page_size=page_size,
+            "deposit.get.patternPage", name, page_size=page_size,
             transform=lambda item, _revision: item,
         )
 
@@ -822,6 +821,60 @@ class Store:
             raise DepositError("INVALID_RESPONSE", "Server returned an invalid layout result")
         return positions
 
+    def get_subtree(
+        self, roots=None, *, max_hops: int | None = None, root_class_boundary: bool = True
+    ) -> dict[str, Any]:
+        """Return a revision-pinned public graph export for roots or the Namespace."""
+        if roots is None:
+            if max_hops is not None or root_class_boundary is not True:
+                raise ValueError("max_hops and root_class_boundary apply only when roots are supplied")
+            data = self._call_one("deposit.get.namespaceData", {})
+        else:
+            if isinstance(roots, (str, bytes)):
+                raise TypeError("roots must be an iterable of Object UUID strings")
+            try:
+                root_ids = list(roots)
+            except TypeError as exc:
+                raise TypeError("roots must be an iterable of Object UUID strings") from exc
+            if not root_ids:
+                if max_hops is not None or root_class_boundary is not True:
+                    raise ValueError("Traversal options apply only to a nonempty root selection")
+                data = self._call_one("deposit.get.namespaceData", {})
+                from .networkx import read_export_result
+                return read_export_result(self, data)
+            if any(not isinstance(value, str) or not value for value in root_ids):
+                raise ValueError("roots must contain nonempty Object UUID strings")
+            if len(set(root_ids)) != len(root_ids):
+                raise ValueError("roots cannot contain duplicate Object UUIDs")
+            if max_hops is not None and (type(max_hops) is not int or not 0 <= max_hops <= 10):
+                raise ValueError("max_hops must be an integer from 0 through 10")
+            if type(root_class_boundary) is not bool:
+                raise TypeError("root_class_boundary must be bool")
+            options = {"rootClassBoundary": root_class_boundary}
+            if max_hops is not None:
+                options["maxHops"] = max_hops
+            data = self._call_one("deposit.get.data", root_ids, options)
+        from .networkx import read_export_result
+        return read_export_result(self, data)
+
+    def to_networkx(
+        self, roots=None, *, max_hops: int | None = None, root_class_boundary: bool = True
+    ):
+        """Export the selected snapshot as an optional NetworkX MultiDiGraph."""
+        from .networkx import require_networkx, to_networkx
+        require_networkx()
+        return to_networkx(self.get_subtree(
+            roots, max_hops=max_hops, root_class_boundary=root_class_boundary
+        ))
+
+    def from_networkx(self, graph, *, rules: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Freeze a Deposit MultiDiGraph and submit it to Server import analysis."""
+        from .networkx import from_networkx, require_networkx
+        require_networkx()
+        if rules is not None and not isinstance(rules, Mapping):
+            raise TypeError("rules must be a mapping")
+        snapshot = from_networkx(graph)
+        return self._analyze_import_snapshot(snapshot, rules=rules, require_subgraph=False)
     def import_rows(self, rows, relationships=None, *, targets=None, rules=None) -> dict[str, Any]:
         """Analyze a frozen tabular submission; matching remains server-owned."""
         frozen_rows = _freeze_import_rows(rows)
@@ -1296,7 +1349,9 @@ class Store:
         return self._call_one("deposit.get.userTool", selection)
 
     def user_tools(self, name: str | None = None, *, page_size=200):
-        selection = None if name is None else {"name": name}
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ValueError("User Tool name filter must be a nonempty string")
+        selection = name
         return self._entity_page("deposit.get.userToolPage", selection, page_size=page_size)
 
     def _begin_batch_collection(self, batch) -> None:

@@ -126,9 +126,15 @@ class Batch:
         return reference
 
     def set_class(self, selector: Any, patch: dict[str, Any]) -> BatchReference:
+        if _is_entity_handle(selector, "Class"):
+            self._pin_handle(selector, "Class")
+            selector = {"id": selector.id}
         return self.call("deposit.set.class", selector, patch)
 
     def delete_class(self, selector: Any) -> BatchReference:
+        if _is_entity_handle(selector, "Class"):
+            self._pin_handle(selector, "Class")
+            selector = {"id": selector.id}
         return self.call("deposit.delete.class", selector)
 
     def create_object(self, class_selector: Any, properties: dict[str, Any] | None = None) -> BatchReference:

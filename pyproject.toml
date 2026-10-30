@@ -20,7 +20,7 @@ classifiers = [
     "Operating System :: Microsoft :: Windows :: Windows 10"
 ]
 version = "2.0.0.dev0"
-dependencies = ["neo4j>=6.0,<7"]
+dependencies = ["neo4j>=6.1,<7"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.3,<9", "build>=1.2,<2"]

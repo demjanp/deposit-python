@@ -20,7 +20,7 @@
     "target_neo4j_version": "2026.05.0",
     "target_python": "3.14.x (Windows x64)",
     "supported_python": ">=3.14,<3.15",
-    "neo4j_driver": ">=6.0,<7"
+    "neo4j_driver": ">=6.1,<7"
   },
   "procedures": [
     {
