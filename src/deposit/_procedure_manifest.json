@@ -2563,13 +2563,67 @@
       "columns": [
         "data"
       ],
-      "mode": "WRITE",
+      "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "batch_exclusion": "versioned plan inspection",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.importResultV1",
+      "args": [
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        }
+      ],
+      "columns": ["data"],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "versioned import result retrieval",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.importResultPageV1",
+      "args": [
+        {"name": "resultId", "type": "String", "binding": "resultId"},
+        {"name": "collection", "type": "String", "binding": "collection"},
+        {"name": "cursor", "type": "Map<String,Object>", "binding": "cursor"},
+        {"name": "limit", "type": "Integer", "binding": "limit"}
+      ],
+      "columns": ["data"],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "versioned import result retrieval",
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.importResultEntryV1",
+      "args": [
+        {"name": "resultId", "type": "String", "binding": "resultId"},
+        {"name": "collection", "type": "String", "binding": "collection"},
+        {"name": "key", "type": "String", "binding": "key"}
+      ],
+      "columns": ["data"],
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "versioned import result retrieval",
       "invocation_owner": "Store"
     },
     {

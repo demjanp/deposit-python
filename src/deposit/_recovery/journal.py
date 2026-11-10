@@ -14,23 +14,29 @@ import uuid
 from contextlib import nullcontext
 from typing import Any
 
+from ..errors import DepositError
 from .identity import DeploymentIdentity
-from .storage import ProtectedStorageError, ProtectedStore
+from .storage import ProtectedStorageError, ProtectedStore, StorageAdmissionCoordinator
 
 
 FORMAT_VERSION = 1
 RESULT_FORMAT_NAMED_ROWS_V1 = "named_rows_v1"
+RESULT_FORMAT_IMPORT_V1 = "import_result_v1"
 MAX_UNRESOLVED = 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
-MAX_USER_BYTES = 1024 * 1024 * 1024
 RESULT_RETENTION = timedelta(days=30)
-UNRESOLVED_STATES = frozenset({"intent", "prepare_sent", "prepared", "executing", "outcome_saved", "release_sent", "conflicted", "failure_saved"})
+IMPORT_RESULT_PAGE_LIMIT = 128
+_MAX_SAFE_INTEGER = (1 << 53) - 1
+UNRESOLVED_STATES = frozenset({"intent", "prepare_sent", "prepared", "executing",
+                               "COMMITTED_RESULT_PENDING", "outcome_saved", "release_sent",
+                               "conflicted", "failure_saved"})
 PENDING_STATES = UNRESOLVED_STATES | {"failed"}
 _TRANSITIONS = {
-    "intent": {"prepare_sent", "prepared", "outcome_saved", "conflicted"},
-    "prepare_sent": {"prepared", "executing", "outcome_saved", "conflicted"},
-    "prepared": {"executing", "outcome_saved", "conflicted"},
-    "executing": {"prepared", "outcome_saved", "conflicted", "failure_saved"},
+    "intent": {"prepare_sent", "prepared", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted"},
+    "prepare_sent": {"prepared", "executing", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted"},
+    "prepared": {"executing", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted"},
+    "executing": {"prepared", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted", "failure_saved"},
+    "COMMITTED_RESULT_PENDING": {"COMMITTED_RESULT_PENDING", "outcome_saved"},
     "outcome_saved": {"release_sent", "released"},
     "release_sent": {"outcome_saved", "released"},
     "released": {"released"},
@@ -118,7 +124,7 @@ class ProtectedJournal:
         key: str | None = None,
     ) -> dict[str, Any]:
         if result_format is not None and (
-            type(result_format) is not str or result_format != RESULT_FORMAT_NAMED_ROWS_V1
+            type(result_format) is not str or result_format not in {RESULT_FORMAT_NAMED_ROWS_V1, RESULT_FORMAT_IMPORT_V1}
         ):
             raise JournalError("Recovery result format is unsupported")
         key = str(uuid.uuid4()) if key is None else key
@@ -198,6 +204,422 @@ class ProtectedJournal:
         self._write(record)
         return record
 
+    def persist_import_result(self, identity: DeploymentIdentity, key: str, envelope: dict[str, Any], fetch_page):
+        """Persist the exact immutable result before the prepared action is released."""
+        if not _is_uuid(key) or not valid_import_result_envelope(envelope):
+            raise JournalError("Import result envelope is invalid")
+        if envelope["namespaceId"] != identity.namespace_id:
+            raise JournalError("Import result belongs to a different Namespace")
+        index_name = _import_result_index_name(key)
+        prior = None
+        if self.storage.has_record(index_name):
+            try:
+                prior = _strict_json_loads(self.storage.read(index_name))
+            except Exception as exc:
+                raise JournalError("Protected import result index is corrupt") from exc
+        if prior is not None and prior.get("envelope") != envelope:
+            raise JournalError("Prepared action is bound to a different committed result")
+
+        for collection, descriptor in envelope["collections"].items():
+            self._ensure_import_collection_meta(key, envelope["resultId"], collection,
+                                                descriptor["kind"], descriptor["count"], None)
+        prefix = f"import-result-{key}-collection-"
+        from collections import deque
+        pending = deque()
+        for name in self.storage.list_records():
+            if name.startswith(prefix) and name.endswith("-meta"):
+                meta = _strict_json_loads(self.storage.read(name))
+                if meta.get("complete") is not True:
+                    pending.append(meta["collection"])
+        queued = set(pending)
+        while pending:
+            collection = pending.popleft()
+            queued.discard(collection)
+            meta_name = _import_collection_meta_name(key, collection)
+            meta = _strict_json_loads(self.storage.read(meta_name))
+            if meta.get("complete") is True:
+                continue
+            nested = self._persist_import_collection_page(key, envelope, meta, fetch_page)
+            if meta.get("complete") is not True and collection not in queued:
+                pending.append(collection)
+                queued.add(collection)
+            for child in reversed(nested):
+                if child not in queued:
+                    pending.appendleft(child)
+                    queued.add(child)
+
+        self._validate_import_mapping_keys(key)
+
+        root_index = {"version": 1, "key": key, "resultId": envelope["resultId"],
+                      "envelope": envelope, "collections": envelope["collections"]}
+        self._write_import_segments(key, {_import_result_index_name(key): _json_bytes(root_index)})
+        return root_index
+
+    def get_or_create_local_import_result(self, identity: DeploymentIdentity, result_id: str) -> str:
+        """Return a durable local key for read-only plan inspection, without an action record."""
+        if not isinstance(result_id, str) or not result_id or len(result_id) > 512:
+            raise JournalError("Import result reference is invalid")
+        payload = _json_bytes(identity.to_dict()) + b"\0" + result_id.encode("utf-8")
+        reference_name = _import_result_ref_name(payload)
+        with self.storage.lock("journal-index"):
+            if self.storage.has_record(reference_name):
+                reference = self._read_local_import_result_ref(reference_name)
+                if reference["identity"] != identity.to_dict() or reference["resultId"] != result_id:
+                    raise JournalError("Local import result reference is bound to different data")
+                if self._local_import_result_expired(reference, datetime.now(timezone.utc)):
+                    if not self._cleanup_import_result_locked(reference["key"]):
+                        return reference["key"]
+                    self.storage.delete(reference_name)
+                else:
+                    return reference["key"]
+            key = str(uuid.uuid4())
+            reference = {"version": 1, "key": key, "resultId": result_id,
+                         "identity": identity.to_dict(), "state": "pending",
+                         "createdAt": _utc_now(), "completedAt": None,
+                         "planObservation": None}
+            self.storage.write(reference_name, _json_bytes(reference))
+            return key
+
+    def complete_local_import_result(self, identity: DeploymentIdentity, key: str,
+                                     envelope: dict[str, Any], plan_observation: dict[str, Any]) -> dict[str, Any]:
+        if not _is_uuid(key) or not valid_import_result_envelope(envelope):
+            raise JournalError("Local import result is invalid")
+        if envelope["namespaceId"] != identity.namespace_id:
+            raise JournalError("Local import result belongs to another Namespace")
+        reference_name = _import_result_ref_name(
+            _json_bytes(identity.to_dict()) + b"\0" + envelope["resultId"].encode("utf-8"))
+        with self.storage.lock("journal-index"):
+            reference = self._read_local_import_result_ref(reference_name)
+            if (reference["key"] != key or reference["identity"] != identity.to_dict()
+                    or reference["resultId"] != envelope["resultId"]):
+                raise JournalError("Local import result reference does not match the saved envelope")
+            if not _valid_plan_observation(plan_observation, envelope):
+                raise JournalError("Current import plan observation is invalid")
+            index = self.read_import_index(key)
+            if index["envelope"] != envelope:
+                raise JournalError("Local import result index does not match its envelope")
+            reference["planObservation"] = plan_observation
+            if reference["state"] != "complete":
+                reference["state"] = "complete"
+                reference["completedAt"] = _utc_now()
+            self.storage.write(reference_name, _json_bytes(reference))
+            return reference
+
+    def _read_local_import_result_ref(self, name: str) -> dict[str, Any]:
+        try:
+            reference = _strict_json_loads(self.storage.read(name))
+            if (not isinstance(reference, dict)
+                    or set(reference) != {"version", "key", "resultId", "identity", "state", "createdAt", "completedAt", "planObservation"}
+                    or reference.get("version") != 1 or not _is_uuid(reference.get("key"))
+                    or not isinstance(reference.get("resultId"), str)
+                    or not isinstance(reference.get("identity"), dict)
+                    or reference.get("state") not in {"pending", "complete"}
+                    or (reference["state"] == "pending") != (reference.get("completedAt") is None)
+                    or (reference.get("planObservation") is not None
+                        and not _valid_plan_observation(reference["planObservation"]))):
+                raise ValueError("invalid local result reference")
+            DeploymentIdentity.from_dict(reference["identity"])
+            _aware_datetime(reference["createdAt"])
+            if reference["completedAt"] is not None:
+                _aware_datetime(reference["completedAt"])
+            return reference
+        except Exception as exc:
+            raise JournalError("Protected local import result reference is corrupt") from exc
+
+    @staticmethod
+    def _local_import_result_expired(reference: dict[str, Any], now: datetime) -> bool:
+        anchor = reference["completedAt"] if reference["completedAt"] is not None else reference["createdAt"]
+        return _aware_datetime(anchor) <= now - RESULT_RETENTION
+
+    def _prune_local_import_results_locked(self, cutoff: datetime) -> int:
+        removed = 0
+        for name in self.storage.list_records():
+            if not name.startswith("import-result-ref-"):
+                continue
+            reference = self._read_local_import_result_ref(name)
+            anchor = reference["completedAt"] if reference["completedAt"] is not None else reference["createdAt"]
+            if _aware_datetime(anchor) <= cutoff:
+                if not self._cleanup_import_result_locked(reference["key"]):
+                    continue
+                self.storage.delete(name)
+                removed += 1
+        return removed
+
+    def _ensure_import_collection_meta(self, key, result_id, collection, kind, count, text_bytes):
+        if not isinstance(collection, str) or not collection or len(collection) > 512:
+            raise JournalError("Import result collection identifier is invalid")
+        meta_name = _import_collection_meta_name(key, collection)
+        created = not self.storage.has_record(meta_name)
+        if not created:
+            try:
+                meta = _strict_json_loads(self.storage.read(meta_name))
+                if (not isinstance(meta, dict) or meta.get("resultId") != result_id or meta.get("collection") != collection
+                        or meta.get("kind") != kind or meta.get("count") != count
+                        or meta.get("textBytes") != text_bytes):
+                    raise JournalError("Saved import collection metadata changed")
+            except JournalError:
+                raise
+            except Exception as exc:
+                raise JournalError("Protected import collection metadata is corrupt") from exc
+        else:
+            meta = {"version": 1, "resultId": result_id, "collection": collection,
+                    "kind": kind, "count": count, "textBytes": text_bytes,
+                    "pageCount": 0, "entryCount": 0, "nextCursor": None, "complete": False}
+            self._write_import_segments(key, {meta_name: _json_bytes(meta)})
+        return meta, created
+
+    def _persist_import_collection_page(self, key, envelope, meta, fetch_page):
+        collection, kind, count, text_bytes = (meta["collection"], meta["kind"], meta["count"], meta["textBytes"])
+        nested_collections = []
+        try:
+            request_cursor = meta["nextCursor"]
+            response = fetch_page(collection, request_cursor, IMPORT_RESULT_PAGE_LIMIT)
+            _validate_import_page(response, envelope["resultId"], collection, kind,
+                                  request_cursor, meta["entryCount"], count, text_bytes)
+            page_index = meta["pageCount"]
+            page_payload = {"requestCursor": request_cursor, "response": response}
+            page_name = _import_result_page_name(key, collection, page_index)
+            encoded_page = _json_bytes(page_payload)
+            if self.storage.has_record(page_name):
+                try:
+                    saved_page = _strict_json_loads(self.storage.read(page_name))
+                except Exception as exc:
+                    raise JournalError("Saved import page is corrupt") from exc
+                if saved_page != page_payload:
+                    raise JournalError("Immutable import result page changed at a saved cursor")
+            else:
+                self._write_import_segments(key, {page_name: encoded_page})
+            for value in _collection_values(response["entries"], kind):
+                nested_collections.extend(_ensure_nested_import_collections(
+                    self, key, envelope["resultId"], value))
+            if response["nextCursor"] is None and text_bytes is not None:
+                actual_bytes = sum(
+                    len(chunk["value"].encode("utf-8"))
+                    for index in range(meta["pageCount"])
+                    for chunk in self._read_import_page_with_meta(key, collection, index, meta)["response"]["entries"]
+                )
+                actual_bytes += sum(len(chunk["value"].encode("utf-8")) for chunk in response["entries"])
+                if actual_bytes != text_bytes:
+                    raise JournalError("Import text collection byte count is invalid")
+            meta["pageCount"] += 1
+            meta["entryCount"] += len(response["entries"])
+            meta["nextCursor"] = response["nextCursor"]
+            meta["complete"] = response["nextCursor"] is None
+            self._write_import_segments(key, {_import_collection_meta_name(key, collection): _json_bytes(meta)})
+            if meta["complete"] and count is not None and meta["entryCount"] != count:
+                raise JournalError("Import result collection count does not match its envelope")
+            return nested_collections
+        except (JournalError, DepositError):
+            raise
+        except Exception as exc:
+            raise JournalError("Import result retrieval did not complete") from exc
+
+    def _validate_import_mapping_keys(self, key: str) -> None:
+        prefix = f"import-result-{key}-collection-"
+        for name in self.storage.list_records():
+            if not name.startswith(prefix) or not name.endswith("-meta"):
+                continue
+            meta = _strict_json_loads(self.storage.read(name))
+            collection = meta["collection"]
+            if meta["kind"] != "mapping":
+                continue
+            meta = self.read_import_collection_meta(key, collection)
+            for page_index in range(meta["pageCount"]):
+                entries = self.read_import_page(key, collection, page_index)["response"]["entries"]
+                for entry_index, pair in enumerate(entries):
+                    key_descriptor = pair["key"]
+                    signature = self._mapping_key_signature(key, key_descriptor)
+                    signature_hash = hashlib.sha256(_json_bytes([
+                        item.hex() if isinstance(item, bytes) else item for item in signature
+                    ])).hexdigest()
+                    collection_hash = hashlib.sha256(collection.encode("utf-8")).hexdigest()
+                    marker = f"import-result-{key}-mapkey-{collection_hash}-{signature_hash}"
+                    location = {"collection": collection, "page": page_index, "entry": entry_index}
+                    if self.storage.has_record(marker):
+                        prior = _strict_json_loads(self.storage.read(marker))
+                        if prior != location:
+                            raise JournalError("Import result mapping contains duplicate keys")
+                    else:
+                        self._write_import_segments(key, {marker: _json_bytes(location)})
+
+    def _mapping_key_signature(self, action_key: str, descriptor: dict[str, Any]):
+        _validate_import_value(descriptor)
+        if descriptor["type"] == "scalar":
+            scalar = descriptor["value"]
+            if isinstance(scalar, str):
+                data = scalar.encode("utf-8")
+                return ("text", len(data), hashlib.sha256(data).hexdigest())
+            raise JournalError("Import mapping scalar keys must be strings")
+        if descriptor["type"] != "text":
+            raise JournalError("Import result mapping key must be scalar or text")
+        collection = descriptor["collection"]
+        meta = self.read_import_collection_meta(action_key, collection)
+        if meta["kind"] != "text" or meta["textBytes"] != descriptor["bytes"]:
+            raise JournalError("Import result mapping text key descriptor is inconsistent")
+        digest = hashlib.sha256()
+        byte_count = 0
+        for page_index in range(meta["pageCount"]):
+            page = self.read_import_page(action_key, collection, page_index)["response"]
+            for chunk in page["entries"]:
+                encoded = chunk["value"].encode("utf-8")
+                digest.update(encoded)
+                byte_count += len(encoded)
+        return ("text", byte_count, digest.hexdigest())
+
+    def read_import_index(self, key: str) -> dict[str, Any]:
+        if not _is_uuid(key):
+            raise JournalError("Recovery action key is invalid")
+        try:
+            index = _strict_json_loads(self.storage.read(_import_result_index_name(key)))
+        except Exception as exc:
+            raise JournalError("Protected import result index is unavailable") from exc
+        if (not isinstance(index, dict) or set(index) != {"version", "key", "resultId", "envelope", "collections"}
+                or type(index["version"]) is not int or index["version"] != 1 or index["key"] != key
+                or not valid_import_result_envelope(index["envelope"])
+                or index["resultId"] != index["envelope"]["resultId"]
+                or index["collections"] != index["envelope"]["collections"]):
+            raise JournalError("Protected import result index is corrupt")
+        return index
+
+    def pin_import_result(self, key: str):
+        """Hold a process lock and durable marker while a lazy reader is live."""
+        if not _is_uuid(key):
+            raise JournalError("Recovery action key is invalid")
+        pin_id = uuid.uuid4().hex
+        pin_name = f"import-result-{key}-pin-{pin_id}"
+        owner_lock = self.storage.lock(f"import-result-pin-{pin_id}")
+        with self.storage.lock("journal-index"):
+            # Do not publish a pin for a missing, corrupt, or different result.
+            self.read_import_index(key)
+            owner_lock.acquire()
+            try:
+                self.storage.write(pin_name, _json_bytes({"version": 1, "key": key, "pinId": pin_id}))
+            except BaseException:
+                owner_lock.release()
+                raise
+        return pin_name, owner_lock
+
+    def release_import_result_pin(self, pin_name: str, owner_lock) -> None:
+        try:
+            with self.storage.lock("journal-index"):
+                self.storage.delete(pin_name)
+        finally:
+            owner_lock.release()
+
+    def _cleanup_import_result_locked(self, key: str) -> bool:
+        """Delete expired result segments only when no reader owns a pin."""
+        prefix = f"import-result-{key}-"
+        for name in self.storage.list_records():
+            if not name.startswith(prefix) or "-pin-" not in name:
+                continue
+            try:
+                pin = _strict_json_loads(self.storage.read(name))
+                if (not isinstance(pin, dict) or set(pin) != {"version", "key", "pinId"}
+                        or pin["version"] != 1 or pin["key"] != key
+                        or not isinstance(pin["pinId"], str) or not re.fullmatch(r"[0-9a-f]{32}", pin["pinId"])):
+                    raise ValueError("invalid result pin")
+                lock = self.storage.lock(f"import-result-pin-{pin['pinId']}")
+                try:
+                    lock.acquire()
+                except ProtectedStorageError:
+                    return False
+                else:
+                    lock.release()
+                    self.storage.delete(name)
+            except ProtectedStorageError:
+                raise
+            except Exception as exc:
+                raise JournalError("Import result reader pins cannot be assessed safely") from exc
+        for name in self.storage.list_records():
+            if name.startswith(prefix):
+                self.storage.delete(name)
+        for name in self.storage.list_records():
+            if not name.startswith("import-result-ref-"):
+                continue
+            reference = self._read_local_import_result_ref(name)
+            if reference["key"] == key:
+                self.storage.delete(name)
+        return True
+
+    def read_import_collection_meta(self, key: str, collection: str) -> dict[str, Any]:
+        try:
+            meta = _strict_json_loads(self.storage.read(_import_collection_meta_name(key, collection)))
+        except Exception as exc:
+            raise JournalError("Protected import collection index is unavailable") from exc
+        if (not isinstance(meta, dict)
+                or set(meta) != {"version", "resultId", "collection", "kind", "count", "textBytes",
+                                 "pageCount", "entryCount", "nextCursor", "complete"}
+                or meta.get("version") != 1 or not isinstance(meta.get("resultId"), str)
+                or meta.get("collection") != collection or not isinstance(meta.get("kind"), str)
+                or meta.get("kind") not in {"sequence", "mapping", "text"}
+                or meta.get("complete") is not True
+                or type(meta.get("pageCount")) is not int or not 0 <= meta["pageCount"] <= _MAX_SAFE_INTEGER
+                or type(meta.get("entryCount")) is not int or not 0 <= meta["entryCount"] <= _MAX_SAFE_INTEGER
+                or (meta["count"] is not None and (type(meta["count"]) is not int
+                    or not 0 <= meta["count"] <= _MAX_SAFE_INTEGER))
+                or (meta["textBytes"] is not None and (type(meta["textBytes"]) is not int
+                    or not 0 <= meta["textBytes"] <= _MAX_SAFE_INTEGER))
+                or (meta["kind"] == "text") != (meta["textBytes"] is not None)
+                or (meta["kind"] != "text" and meta["count"] != meta["entryCount"])
+                or (meta["kind"] == "text" and meta["count"] is not None)):
+            raise JournalError("Protected import collection index is corrupt or incomplete")
+        return meta
+
+    def read_import_page(self, key: str, collection: str, page_index: int) -> dict[str, Any]:
+        meta = self.read_import_collection_meta(key, collection)
+        return self._read_import_page_with_meta(key, collection, page_index, meta)
+
+    def _read_import_page_with_meta(self, key: str, collection: str, page_index: int,
+                                    meta: dict[str, Any]) -> dict[str, Any]:
+        if type(page_index) is not int or not 0 <= page_index < meta["pageCount"]:
+            raise IndexError("Import result page index is out of range")
+        try:
+            payload = _strict_json_loads(self.storage.read(_import_result_page_name(key, collection, page_index)))
+        except Exception as exc:
+            raise JournalError("Protected import result page is unavailable") from exc
+        if not isinstance(payload, dict) or set(payload) != {"requestCursor", "response"}:
+            raise JournalError("Protected import result page is corrupt")
+        response = payload["response"]
+        request_cursor = payload["requestCursor"]
+        if request_cursor is not None and not isinstance(request_cursor, dict):
+            raise JournalError("Protected import page cursor is corrupt")
+        start = 0 if request_cursor is None else request_cursor.get("position")
+        if type(start) is not int or (page_index == 0 and payload["requestCursor"] is not None):
+            raise JournalError("Protected import page cursor is corrupt")
+        if page_index > 0:
+            prior = _strict_json_loads(self.storage.read(_import_result_page_name(key, collection, page_index - 1)))
+            prior_response = prior.get("response") if isinstance(prior, dict) else None
+            if (not isinstance(prior_response, dict)
+                    or prior_response.get("nextCursor") != payload["requestCursor"]):
+                raise JournalError("Protected import page cursor chain is corrupt")
+        _validate_import_page(response, meta["resultId"], collection, meta["kind"],
+                              payload["requestCursor"], start, meta["count"], meta["textBytes"])
+        if not isinstance(response, dict) or response.get("resultId") != meta["resultId"] or response.get("collection") != collection:
+            raise JournalError("Protected import result page is corrupt")
+        return payload
+
+    def _write_import_segments(self, action_key: str, segments: dict[str, bytes]) -> None:
+        coordinator = StorageAdmissionCoordinator(self.storage)
+        for name, payload in segments.items():
+            if len(payload) > MAX_RECORD_BYTES:
+                raise ProtectedStorageError("Import result segment exceeds the 16 MiB protected-record limit")
+            reservation = coordinator.acquire(name, "import-result-segment", {str(self.storage.root): 0})
+            try:
+                with coordinator.writer(reservation):
+                    estimate = len(payload) + 65536
+                    coordinator.grow(reservation, {str(self.storage.root): estimate})
+                    self.storage.write(name, payload)
+                    actual = self.storage.record_size(name)
+                    coordinator.materialized(reservation, self.storage.root, actual)
+                    coordinator.release(reservation, {str(self.storage.root): estimate - actual})
+                    coordinator.close(reservation)
+                self.storage.delete(f"admission-{reservation['id']}")
+            except Exception:
+                # Keep the durable reservation and any pages already written;
+                # exact retrieval resumes from their saved cursor positions.
+                raise
+
+
     def records(self, identity: DeploymentIdentity) -> list[dict[str, Any]]:
         prefix = f"op-{_endpoint_scope(identity)}-"
         result: list[dict[str, Any]] = []
@@ -253,8 +675,12 @@ class ProtectedJournal:
                 if resolved.tzinfo is None:
                     raise JournalError("Resolved journal record has invalid retention metadata")
                 if resolved <= cutoff and _record_name(identity, record["key"]) not in dependencies:
+                    if record.get("result_format") == RESULT_FORMAT_IMPORT_V1:
+                        if not self._cleanup_import_result_locked(record["key"]):
+                            continue
                     self.storage.delete(_record_name(identity, record["key"]))
                     removed += 1
+            removed += self._prune_local_import_results_locked(cutoff)
         return removed
 
     def _write(self, record: dict[str, Any], *, creating: bool = False) -> None:
@@ -356,7 +782,11 @@ class ProtectedJournal:
             except Exception as exc:
                 raise JournalError("An existing recovery journal record cannot be pruned safely") from exc
             if resolved <= cutoff and name not in dependencies:
+                if record.get("result_format") == RESULT_FORMAT_IMPORT_V1:
+                    if not self._cleanup_import_result_locked(record["key"]):
+                        continue
                 self.storage.delete(name)
+        self._prune_local_import_results_locked(cutoff)
 
     def _decode_record(
         self,
@@ -400,7 +830,7 @@ class ProtectedJournal:
             raise JournalError("Recovery journal record has an unsupported format")
         if "result_format" in record and (
             type(record["result_format"]) is not str
-            or record["result_format"] != RESULT_FORMAT_NAMED_ROWS_V1
+            or record["result_format"] not in {RESULT_FORMAT_NAMED_ROWS_V1, RESULT_FORMAT_IMPORT_V1}
         ):
             raise JournalError("Recovery journal record has an unsupported format")
         if (
@@ -451,11 +881,160 @@ class ProtectedJournal:
                 raise JournalError("Released recovery outcome is invalid")
         elif record["resolved_at"] is not None:
             raise JournalError("Unreleased recovery record has retention metadata")
-        if "result_format" in record and record["outcome"] is not None:
+        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS_V1 and record["outcome"] is not None:
             if not valid_named_rows_result(record["outcome"]):
                 raise JournalError("Advanced recovery result is invalid")
+        if record.get("result_format") == RESULT_FORMAT_IMPORT_V1 and record["outcome"] is not None:
+            if not valid_import_result_envelope(record["outcome"]):
+                raise JournalError("Import recovery result envelope is invalid")
+        if record["state"] == "COMMITTED_RESULT_PENDING" and (
+                record.get("result_format") != RESULT_FORMAT_IMPORT_V1
+                or not valid_import_result_envelope(record.get("outcome"))
+                or not isinstance(record.get("operation_id"), str)):
+            raise JournalError("Committed import result recovery state is invalid")
         return record
 
+
+
+def _json_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise JournalError("Import result contains a nonportable value") from exc
+
+
+def _import_result_index_name(key: str) -> str:
+    return f"import-result-{key}-index"
+
+
+def _import_result_ref_name(payload: bytes) -> str:
+    return f"import-result-ref-{hashlib.sha256(payload).hexdigest()}"
+
+
+def _import_collection_meta_name(key: str, collection: str) -> str:
+    digest = hashlib.sha256(collection.encode("utf-8")).hexdigest()
+    return f"import-result-{key}-collection-{digest}-meta"
+
+
+def _import_result_page_name(key: str, collection: str, page_index: int) -> str:
+    digest = hashlib.sha256(collection.encode("utf-8")).hexdigest()
+    return f"import-result-{key}-collection-{digest}-page-{page_index:012d}"
+
+
+def _validate_import_page(response: Any, result_id: str, collection: str, kind: str,
+                          request_cursor: Any, entry_count: int, expected_count: int | None,
+                          expected_text_bytes: int | None) -> None:
+    required = {"format", "resultId", "collection", "entries", "nextCursor"}
+    if (not isinstance(response, dict) or set(response) != required
+            or response.get("format") != "deposit.import-result-page/1"
+            or response.get("resultId") != result_id or response.get("collection") != collection
+            or not isinstance(response.get("entries"), list)
+            or len(response["entries"]) > IMPORT_RESULT_PAGE_LIMIT):
+        raise JournalError("Import result page has an invalid V1 envelope")
+    if request_cursor is not None and (
+            not isinstance(request_cursor, dict)
+            or set(request_cursor) != {"resultId", "collection", "position", "integrity"}
+            or request_cursor.get("resultId") != result_id
+            or request_cursor.get("collection") != collection
+            or type(request_cursor.get("position")) is not int
+            or not 0 <= request_cursor["position"] <= _MAX_SAFE_INTEGER
+            or not isinstance(request_cursor.get("integrity"), str)
+            or not request_cursor["integrity"]):
+        raise JournalError("Import result request cursor is invalid")
+    start = 0 if request_cursor is None else request_cursor["position"]
+    if type(start) is not int or start != entry_count:
+        raise JournalError("Import result cursor does not match the next unread position")
+    next_cursor = response["nextCursor"]
+    if next_cursor is not None:
+        if (not isinstance(next_cursor, dict)
+                or set(next_cursor) != {"resultId", "collection", "position", "integrity"}
+                or next_cursor.get("resultId") != result_id
+                or next_cursor.get("collection") != collection
+                or type(next_cursor.get("position")) is not int
+                or not 0 <= next_cursor["position"] <= _MAX_SAFE_INTEGER
+                or next_cursor["position"] != start + len(response["entries"])
+                or not isinstance(next_cursor.get("integrity"), str) or not next_cursor["integrity"]
+                or not response["entries"]):
+            raise JournalError("Import result cursor is invalid or made no progress")
+    if expected_count is not None:
+        next_count = entry_count + len(response["entries"])
+        if next_count > expected_count or (next_cursor is None and next_count != expected_count):
+            raise JournalError("Import result page count disagrees with its descriptor")
+    if kind == "text":
+        if any(not isinstance(chunk, dict) or set(chunk) != {"type", "value"}
+               or chunk.get("type") != "scalar" or not isinstance(chunk.get("value"), str)
+               for chunk in response["entries"]):
+            raise JournalError("Import text page contains a non-scalar-string chunk descriptor")
+        if any(len(chunk["value"].encode("utf-8")) > MAX_RECORD_BYTES for chunk in response["entries"]):
+            raise JournalError("Import text chunk exceeds its bounded record unit")
+    else:
+        for value in _collection_values(response["entries"], kind):
+            _validate_import_value(value)
+
+
+def _collection_values(entries: list[Any], kind: str):
+    if kind == "sequence":
+        yield from entries
+        return
+    if kind == "text":
+        return
+    if kind != "mapping":
+        raise JournalError("Import result collection kind is invalid")
+    for entry in entries:
+        if isinstance(entry, dict) and set(entry) == {"key", "value"}:
+            key, value = entry["key"], entry["value"]
+        else:
+            raise JournalError("Import mapping page entry is invalid")
+        if (not isinstance(key, dict) or not isinstance(key.get("type"), str)
+                or key["type"] not in {"scalar", "text"}):
+            raise JournalError("Import mapping key must be a scalar or lazy text descriptor")
+        yield key
+        yield value
+
+
+def _validate_import_value(value: Any) -> None:
+    if not isinstance(value, dict) or not isinstance(value.get("type"), str):
+        raise JournalError("Import result value is missing its tagged descriptor")
+    kind = value["type"]
+    if kind == "scalar":
+        if set(value) != {"type", "value"}:
+            raise JournalError("Import scalar descriptor has unsupported fields")
+        scalar = value["value"]
+        if (not isinstance(scalar, (str, int, float, bool, type(None)))
+                or isinstance(scalar, float) and not math.isfinite(scalar)
+                or type(scalar) is int and not -_MAX_SAFE_INTEGER <= scalar <= _MAX_SAFE_INTEGER):
+            raise JournalError("Import scalar descriptor is invalid")
+        if len(_json_bytes(scalar)) > MAX_RECORD_BYTES:
+            raise JournalError("Import scalar exceeds its bounded record unit")
+    elif kind in {"mapping", "sequence"}:
+        if (set(value) != {"type", "collection", "count"}
+                or not isinstance(value["collection"], str) or not value["collection"]
+                or len(value["collection"]) > 512 or type(value["count"]) is not int
+                or not 0 <= value["count"] <= _MAX_SAFE_INTEGER):
+            raise JournalError("Import collection descriptor is invalid")
+    elif kind == "text":
+        if (set(value) != {"type", "collection", "bytes"}
+                or not isinstance(value["collection"], str) or not value["collection"]
+                or len(value["collection"]) > 512 or type(value["bytes"]) is not int
+                or not 0 <= value["bytes"] <= _MAX_SAFE_INTEGER):
+            raise JournalError("Import text descriptor is invalid")
+    else:
+        raise JournalError("Import result value descriptor type is unsupported")
+
+
+def _ensure_nested_import_collections(journal: ProtectedJournal, key: str, result_id: str,
+                                     value: dict[str, Any]) -> list[str]:
+    _validate_import_value(value)
+    if value["type"] in {"mapping", "sequence"}:
+        journal._ensure_import_collection_meta(key, result_id, value["collection"],
+                                               value["type"], value["count"], None)
+        return [value["collection"]]
+    elif value["type"] == "text":
+        journal._ensure_import_collection_meta(key, result_id, value["collection"],
+                                               "text", None, value["bytes"])
+        return [value["collection"]]
+    return []
 
 def _valid_failure(failure: Any) -> bool:
     if not isinstance(failure, dict) or set(failure) != {"code", "message", "details", "request_id", "retryable"}:
@@ -487,6 +1066,70 @@ def valid_named_rows_result(value: Any) -> bool:
     ):
         return False
     return all(isinstance(row, dict) and set(row) == set(columns) for row in rows)
+
+
+def valid_import_result_envelope(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "format", "resultId", "operationId", "kind", "state", "namespaceId",
+        "planId", "revision", "expiresAt", "collections",
+    }:
+        return False
+    if (value["format"] != "deposit.import-result/1"
+            or not isinstance(value["resultId"], str) or not value["resultId"]
+            or (value["operationId"] is not None
+                and (not isinstance(value["operationId"], str) or not value["operationId"]))
+            or not isinstance(value["kind"], str) or value["kind"] not in {"analysis", "apply", "plan_inspection"}
+            or not isinstance(value["state"], str) or not value["state"]
+            or not isinstance(value["namespaceId"], str) or not value["namespaceId"]
+            or (value["planId"] is not None and not isinstance(value["planId"], str))
+            or type(value["revision"]) is not int or not 0 <= value["revision"] <= _MAX_SAFE_INTEGER
+            or type(value["expiresAt"]) is not int or not 0 <= value["expiresAt"] <= _MAX_SAFE_INTEGER
+            or not isinstance(value["collections"], dict)):
+        return False
+    for name, descriptor in value["collections"].items():
+        if (not isinstance(name, str) or not name or len(name) > 256
+                or name in {"format", "resultId", "operationId", "kind", "state", "namespaceId", "planId", "revision", "expiresAt"}
+                or not isinstance(descriptor, dict) or set(descriptor) != {"kind", "count"}
+                or not isinstance(descriptor["kind"], str) or descriptor["kind"] not in {"sequence", "mapping"}
+                or type(descriptor["count"]) is not int
+                or not 0 <= descriptor["count"] <= _MAX_SAFE_INTEGER):
+            return False
+    return True
+
+
+def _valid_plan_observation(value: Any, envelope: dict[str, Any] | None = None) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"planId", "namespaceId", "state", "targetRevision", "expiresAt"}
+            or not isinstance(value["planId"], str) or not value["planId"]
+            or not isinstance(value["namespaceId"], str) or not value["namespaceId"]
+            or not isinstance(value["state"], str) or value["state"] not in {"ready", "applied"}
+            or type(value["targetRevision"]) is not int
+            or not 0 <= value["targetRevision"] <= _MAX_SAFE_INTEGER
+            or type(value["expiresAt"]) is not int or not 0 <= value["expiresAt"] <= _MAX_SAFE_INTEGER):
+        return False
+    return (envelope is None or (value["planId"] == envelope["planId"]
+                                 and value["namespaceId"] == envelope["namespaceId"]
+                                 and value["targetRevision"] == envelope["revision"]
+                                 and value["expiresAt"] == envelope["expiresAt"]))
+
+
+def valid_import_plan_wrapper(value: Any, *, plan_id: str | None = None,
+                              namespace_id: str | None = None) -> bool:
+    if (not isinstance(value, dict) or set(value) != {"format", "plan", "analysisResult"}
+            or value.get("format") != "deposit.import-plan/1"
+            or not valid_import_result_envelope(value.get("analysisResult"))
+            or not _valid_plan_observation(value.get("plan"), value["analysisResult"])):
+        return False
+    envelope, plan = value["analysisResult"], value["plan"]
+    if (envelope["kind"] != "analysis" or envelope["state"] != "PLAN_READY"
+            or envelope["revision"] != plan["targetRevision"]
+            or envelope["expiresAt"] != plan["expiresAt"]):
+        return False
+    if plan_id is not None and plan["planId"] != plan_id:
+        return False
+    if namespace_id is not None and plan["namespaceId"] != namespace_id:
+        return False
+    return True
 
 
 def _is_uuid(value: str) -> bool:

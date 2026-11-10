@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import ExitStack, contextmanager
+import hashlib
+import json
 import os
 import re
 import secrets
@@ -13,6 +15,7 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 from typing import BinaryIO
+import shutil
 
 
 class ProtectedStorageError(RuntimeError):
@@ -485,7 +488,6 @@ class ProtectedStore:
     _MAGIC = b"DEPOSIT-DPAPI-1\0"
     MAX_RECORD_BYTES = 16 * 1024 * 1024
     MAX_PROTECTED_BYTES = MAX_RECORD_BYTES + 64 * 1024
-    MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 
     def __init__(self, root: str | Path):
         if os.name != "nt":
@@ -570,8 +572,6 @@ class ProtectedStore:
         payload = self._MAGIC + _crypt(plaintext, protect=True)
         if len(payload) > self.MAX_PROTECTED_BYTES:
             raise ProtectedStorageError("Protected recovery root index exceeds the 16 MiB limit")
-        if self._usage_bytes_for_roots_locked(roots) + len(payload) > self.MAX_TOTAL_BYTES:
-            raise ProtectedStorageError("Per-user recovery storage quota (1 GiB) is exhausted")
         temporary = path.with_name(f".{secrets.token_hex(16)}.tmp")
         try:
             with _private_file(temporary, create=True) as output:
@@ -614,12 +614,9 @@ class ProtectedStore:
         temporary = self.root / f".{secrets.token_hex(16)}.tmp"
         if len(payload) > self.MAX_PROTECTED_BYTES:
             raise ProtectedStorageError("Protected recovery record exceeds the 16 MiB limit")
-        # A shared per-user coordinator counts all registered custom roots and
-        # serializes the complete write, including its encrypted temporary copy.
+        # Serialize writes across registered roots while replacing the root
+        # registry. Capacity is determined by the filesystem, not a byte quota.
         with self.user_quota_lock():
-            projected = self._usage_bytes_locked() + len(payload)
-            if projected > self.MAX_TOTAL_BYTES:
-                raise ProtectedStorageError("Per-user recovery storage quota (1 GiB) is exhausted")
             with _private_file(temporary, create=True) as output:
                 _secure_acl(temporary, directory=False)
                 output.write(payload)
@@ -644,6 +641,13 @@ class ProtectedStore:
             raise ProtectedStorageError("Recovery record format is invalid")
         return _crypt(payload[len(self._MAGIC):], protect=False)
 
+    def record_size(self, name: str) -> int:
+        """Return the physical size of one existing protected record."""
+        try:
+            return self._path(name).stat().st_size
+        except OSError as exc:
+            raise ProtectedStorageError("Protected record size is unavailable") from exc
+
     def list_records(self) -> tuple[str, ...]:
         """List protected record names without decrypting their contents."""
         names = []
@@ -662,6 +666,19 @@ class ProtectedStore:
             raise ProtectedStorageError("Recovery journal records cannot be listed safely") from exc
         return tuple(sorted(names))
 
+    def has_record(self, name: str) -> bool:
+        """Check one protected record name without enumerating the root."""
+        path = self._path(name)
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ProtectedStorageError("Recovery record presence cannot be determined") from exc
+        if not stat.S_ISREG(details.st_mode):
+            raise ProtectedStorageError("Unexpected link in recovery storage")
+        return True
+
     def delete(self, name: str) -> None:
         """Delete one protected record after its retention policy permits cleanup."""
         path = self._path(name)
@@ -672,7 +689,7 @@ class ProtectedStore:
                 raise ProtectedStorageError("Recovery record cleanup failed") from exc
 
     def usage_bytes(self) -> int:
-        """Return per-user physical bytes across all registered roots."""
+        """Return measured physical bytes across all registered roots."""
         with self.user_quota_lock():
             return self._usage_bytes_locked()
 
@@ -705,3 +722,339 @@ class ProtectedStore:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
             raise ValueError("Lock name must be a safe 1-64 character identifier")
         return FileLock(self.root / f"{name}.lock", timeout)
+
+
+class StorageAdmissionCoordinator:
+    """Durable disk-space commitments shared by protected recovery roots.
+
+    Reservations are protected records written before callers create artifacts.
+    Materialized bytes are removed from future commitments because the
+    filesystem free-space reading already accounts for them.
+    """
+
+    def __init__(self, store: ProtectedStore):
+        self.store = store
+
+    @staticmethod
+    def _volume(path: str | Path) -> tuple[str, Path, str | None, str | None]:
+        target = _absolute_path(Path(path))
+        probe = target if target.exists() else target.parent
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        if not probe.exists():
+            raise ProtectedStorageError("Storage volume cannot be identified")
+        try:
+            if os.name == "nt":
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                create_file = kernel.CreateFileW
+                create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+                create_file.restype = wintypes.HANDLE
+                handle = create_file(str(probe), 0x80, 0x7, None, 3, 0x02000000, None)
+                if handle == ctypes.c_void_p(-1).value:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    resolve = kernel.GetFinalPathNameByHandleW
+                    resolve.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+                    resolve.restype = wintypes.DWORD
+
+                    def final_name(kind):
+                        needed = resolve(handle, None, 0, kind)
+                        if not needed:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                        target = ctypes.create_unicode_buffer(needed + 1)
+                        written = resolve(handle, target, len(target), kind)
+                        if not written or written >= len(target):
+                            raise ctypes.WinError(ctypes.get_last_error())
+                        return target.value
+
+                    guid_path = final_name(1)  # VOLUME_NAME_GUID
+                    nt_path = final_name(2)  # VOLUME_NAME_NT
+                    guid_match = re.match(r"^(\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\)", guid_path)
+                    nt_match = re.match(r"^(\\Device\\[^\\]+)", nt_path, re.IGNORECASE)
+                    if guid_match is None or nt_match is None:
+                        raise OSError("Windows did not return stable volume names")
+                    guid_root = guid_match.group(1).casefold()
+                    nt_root = nt_match.group(1).casefold()
+                    return f"nt:{nt_root}", probe, guid_root, nt_root
+                finally:
+                    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                    kernel.CloseHandle.restype = wintypes.BOOL
+                    kernel.CloseHandle(handle)
+            # This branch supports isolated filesystem tests. Production
+            # ProtectedStore refuses non-Windows hosts.
+            identity = f"device:{probe.stat().st_dev}"
+            return identity, probe, None, identity
+        except OSError as exc:
+            raise ProtectedStorageError("Storage volume cannot be identified") from exc
+
+    def acquire(self, owner_id: str, purpose: str,
+                commitments_by_volume: dict[str, int]) -> dict:
+        if not isinstance(owner_id, str) or not owner_id or not isinstance(purpose, str) or not purpose:
+            raise ValueError("Admission owner and purpose are required")
+        volumes, locations = self._normalize(commitments_by_volume)
+        reservation_id = secrets.token_hex(16)
+        record = {"version": 1, "id": reservation_id, "owner_id": owner_id,
+                  "purpose": purpose, "writer_pid": os.getpid(), "commitments": volumes,
+                  "locations": locations, "materialized": {}, "ownership_resolved": False}
+        with self.store.user_quota_lock():
+            self._check_capacity(volumes, locations)
+            self._save(record, creating=True)
+        return record
+
+    def grow(self, reservation: dict, additional_commitments_by_volume: dict[str, int]) -> dict:
+        with self.store.user_quota_lock():
+            record = self._load(reservation)
+            additional, locations = self._normalize(additional_commitments_by_volume)
+            proposed = dict(record["commitments"])
+            for volume, amount in additional.items():
+                proposed[volume] = proposed.get(volume, 0) + amount
+                record["locations"].setdefault(volume, locations[volume])
+            self._check_capacity(proposed, record["locations"], excluding=record["id"])
+            record["commitments"] = proposed
+            self._save(record)
+        reservation.update(record)
+        return record
+
+    def materialized(self, reservation: dict, volume: str | Path, actual_bytes: int) -> dict:
+        if type(actual_bytes) is not int or actual_bytes < 0:
+            raise ValueError("Materialized byte count must be a nonnegative integer")
+        volume_id, _, _, _ = self._volume(volume)
+        with self.store.user_quota_lock():
+            record = self._load(reservation)
+            committed = record["commitments"].get(volume_id, 0)
+            if actual_bytes > committed:
+                raise ProtectedStorageError("Materialized storage exceeded its admitted commitment")
+            record["commitments"][volume_id] = committed - actual_bytes
+            record["materialized"][volume_id] = record["materialized"].get(volume_id, 0) + actual_bytes
+            self._save(record)
+        reservation.update(record)
+        return record
+
+    def release(self, reservation: dict, unused_commitments: dict[str, int]) -> dict:
+        with self.store.user_quota_lock():
+            record = self._load(reservation)
+            unused, _ = self._normalize(unused_commitments)
+            for volume, amount in unused.items():
+                if amount > record["commitments"].get(volume, 0):
+                    raise ProtectedStorageError("Cannot release more than the unused commitment")
+                record["commitments"][volume] -= amount
+            self._save(record)
+        reservation.update(record)
+        return record
+
+    def close(self, reservation: dict) -> None:
+        with self.store.user_quota_lock():
+            record = self._load(reservation)
+            if any(record["commitments"].values()):
+                raise ProtectedStorageError("Unused commitments must be reconciled before closing")
+            record["ownership_resolved"] = True
+            self._save(record)
+
+    def reconcile(self) -> tuple[dict, ...]:
+        """Inspect writer ownership and artifacts without releasing uncertainty."""
+        observed = []
+        with self.store.user_quota_lock():
+            for root in self.store.registered_roots():
+                owner_store = self.store if root == self.store.root else object.__new__(ProtectedStore)
+                owner_store.root = root
+                coordinator = self if owner_store is self.store else StorageAdmissionCoordinator(owner_store)
+                for name in owner_store.list_records():
+                    if not name.startswith("admission-"):
+                        continue
+                    try:
+                        record = json.loads(owner_store.read(name))
+                        self._validate_reservation(record)
+                    except Exception as exc:
+                        raise ProtectedStorageError("Admission ownership cannot be reconciled safely") from exc
+                    if record.get("ownership_resolved"):
+                        continue
+                    lock = coordinator.writer(record)
+                    try:
+                        lock.acquire()
+                    except ProtectedStorageError:
+                        observed.append({"id": record["id"], "writer_alive": True,
+                                         "ownership_resolved": False, "commitments_retained": True})
+                        continue
+                    try:
+                        artifacts = coordinator._reconcile_owner(record)
+                        observed.append({"id": record["id"], "writer_alive": False,
+                                         "ownership_resolved": artifacts.get("resolved", False),
+                                         "artifacts": artifacts,
+                                         "commitments_retained": not artifacts.get("resolved", False)})
+                    finally:
+                        lock.release()
+        return tuple(observed)
+
+    def _normalize(self, values: dict[str, int]) -> tuple[dict[str, int], dict[str, dict[str, str | None]]]:
+        if not isinstance(values, dict):
+            raise TypeError("Commitments must be a mapping of paths to bytes")
+        totals: dict[str, int] = {}
+        locations: dict[str, dict[str, str | None]] = {}
+        for path, amount in values.items():
+            if type(amount) is not int or amount < 0:
+                raise ValueError("Commitments must be nonnegative integer byte counts")
+            volume, probe, guid, nt = self._volume(path)
+            totals[volume] = totals.get(volume, 0) + amount
+            locations[volume] = {"path": str(probe), "guid": guid, "nt": nt}
+        return totals, locations
+
+    def _check_capacity(self, requested: dict[str, int], locations: dict,
+                        *, excluding=None) -> None:
+        committed: dict[str, int] = {}
+        roots = self.store.registered_roots()
+        for root in roots:
+            probe_store = self.store if root == self.store.root else object.__new__(ProtectedStore)
+            probe_store.root = root
+            for name in probe_store.list_records():
+                if not name.startswith("admission-") or name == f"admission-{excluding}":
+                    continue
+                try:
+                    record = json.loads(probe_store.read(name))
+                    self._validate_reservation(record)
+                except Exception as exc:
+                    raise ProtectedStorageError("Existing storage commitments cannot be assessed") from exc
+                if record.get("ownership_resolved"):
+                    continue
+                for volume, amount in record.get("commitments", {}).items():
+                    committed[volume] = committed.get(volume, 0) + amount
+        for volume, amount in requested.items():
+            location = locations[volume]["path"]
+            try:
+                free = shutil.disk_usage(location).free
+            except OSError as exc:
+                raise ProtectedStorageError("Available storage cannot be assessed") from exc
+            if committed.get(volume, 0) + amount > free:
+                raise ProtectedStorageError("Insufficient available storage for the requested commitment")
+
+    def _save(self, record: dict, *, creating=False) -> None:
+        self.store.write(f"admission-{record['id']}", json.dumps(
+            record, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
+    def _load(self, reservation: dict) -> dict:
+        if not isinstance(reservation, dict) or not isinstance(reservation.get("id"), str):
+            raise ValueError("Admission reservation is invalid")
+        try:
+            record = json.loads(self.store.read(f"admission-{reservation['id']}"))
+        except Exception as exc:
+            raise ProtectedStorageError("Admission reservation is unavailable") from exc
+        self._validate_reservation(record)
+        if record["id"] != reservation["id"]:
+            raise ProtectedStorageError("Admission reservation is corrupt")
+        return record
+
+    @staticmethod
+    def _validate_reservation(record: dict) -> None:
+        required = {"version", "id", "owner_id", "purpose", "writer_pid", "commitments",
+                    "locations", "materialized", "ownership_resolved"}
+        if (not isinstance(record, dict) or set(record) != required or record.get("version") != 1
+                or not isinstance(record.get("id"), str) or not re.fullmatch(r"[0-9a-f]{32}", record["id"])
+                or not isinstance(record.get("owner_id"), str) or not record["owner_id"]
+                or not isinstance(record.get("purpose"), str) or not record["purpose"]
+                or type(record.get("writer_pid")) is not int or record["writer_pid"] < 1
+                or type(record.get("ownership_resolved")) is not bool
+                or not isinstance(record.get("commitments"), dict)
+                or not isinstance(record.get("materialized"), dict)
+                or not isinstance(record.get("locations"), dict)):
+            raise ProtectedStorageError("Admission reservation is corrupt")
+        for values in (record["commitments"], record["materialized"]):
+            if any(not isinstance(key, str) or type(value) is not int or value < 0
+                   for key, value in values.items()):
+                raise ProtectedStorageError("Admission reservation byte accounting is corrupt")
+        if not set(record["commitments"]) <= set(record["locations"]):
+            raise ProtectedStorageError("Admission reservation volume locators are incomplete")
+        for location in record["locations"].values():
+            if (not isinstance(location, dict) or set(location) != {"path", "guid", "nt"}
+                    or not isinstance(location.get("path"), str)
+                    or (location["guid"] is not None and not isinstance(location["guid"], str))
+                    or not isinstance(location.get("nt"), str)):
+                raise ProtectedStorageError("Admission reservation volume locator is corrupt")
+
+    def writer(self, reservation: dict):
+        """Return a process-lifetime lock retained while an owner writes files."""
+        return self.store.lock(f"admission-owner-{reservation['id']}", timeout=0.0)
+
+    def _reconcile_owner(self, record: dict) -> dict:
+        if record.get("purpose") == "import-result-segment":
+            name = record.get("owner_id")
+            if not isinstance(name, str) or Path(name).name != name or not name:
+                return {"state": "unknown", "reason": "invalid result segment owner"}
+            try:
+                if self._has_temporary_files():
+                    return {"state": "uncertain", "reason": "protected write temporary files remain"}
+                if name in self.store.list_records():
+                    self.store.read(name)  # authenticate and validate the completed segment
+                    segment_state = "materialized"
+                else:
+                    segment_state = "not_written"
+                for volume in tuple(record["commitments"]):
+                    record["commitments"][volume] = 0
+                record["ownership_resolved"] = True
+                self._save(record)
+                return {"state": segment_state, "resolved": True}
+            except Exception:
+                return {"state": "uncertain", "reason": "result segment artifacts are uncertain"}
+        owner = record.get("owner_id")
+        if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+            return {"state": "unknown", "reason": "unrecognized owner"}
+        try:
+            manifest = json.loads(self.store.read(f"transfer-{owner}-manifest"))
+        except Exception:
+            return {"state": "unknown", "reason": "owner manifest unavailable or corrupt"}
+        try:
+            if manifest.get("format_version") != 3 or manifest.get("transfer_id") != owner:
+                return {"state": "unknown", "reason": "unsupported owner manifest"}
+            count, total = manifest["chunk_count"], manifest["bytes"]
+            for index in range(count):
+                self._verify_chunk(owner, index, min(1024 * 1024, total - index * 1024 * 1024))
+            pending_length = manifest["staging_pending_length"]
+            if pending_length:
+                index = count
+                names = (f"transfer-{owner}-chunk-{index:08d}", f"transfer-{owner}-meta-{index:08d}")
+                present = [name in self.store.list_records() for name in names]
+                if present[0] != present[1]:
+                    return {"state": "uncertain", "reason": "partial pending chunk artifacts"}
+                if present[0]:
+                    self._verify_chunk(owner, index, pending_length, manifest["staging_pending_sha256"])
+                    actual = sum(self.store.record_size(name) for name in names)
+                    volume = next(iter(record["commitments"]), None)
+                    if volume is not None:
+                        outstanding = record["commitments"][volume]
+                        if actual > outstanding:
+                            return {"state": "uncertain", "reason": "pending bytes exceed commitment"}
+                        record["materialized"][volume] = record["materialized"].get(volume, 0) + actual
+                        record["commitments"][volume] = outstanding - actual
+                # No partial writer remains; unused reservation is now known.
+            for volume in tuple(record["commitments"]):
+                record["commitments"][volume] = 0
+            record["ownership_resolved"] = True
+            self._save(record)
+            return {"state": manifest.get("state"), "bytes": total, "chunk_count": count,
+                    "pending_length": pending_length, "resolved": True}
+        except Exception:
+            return {"state": "uncertain", "reason": "owned artifacts could not be verified"}
+
+    def _verify_chunk(self, owner: str, index: int, expected_length: int, expected_hash=None) -> None:
+        data_name = f"transfer-{owner}-chunk-{index:08d}"
+        meta_name = f"transfer-{owner}-meta-{index:08d}"
+        data = self.store.read(data_name)
+        metadata = json.loads(self.store.read(meta_name))
+        checksum = hashlib.sha256(data).hexdigest()
+        if (len(data) != expected_length or metadata != {"index": index, "bytes": expected_length,
+                "sha256": checksum} or (expected_hash is not None and checksum != expected_hash)):
+            raise ProtectedStorageError("Owned transfer artifacts failed reconciliation")
+
+    def _has_temporary_files(self) -> bool:
+        try:
+            with os.scandir(self.store.root) as entries:
+                for entry in entries:
+                    if not (entry.name.startswith(".") and entry.name.endswith(".tmp")):
+                        continue
+                    if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                        raise ProtectedStorageError("Unexpected temporary file in recovery storage")
+                    return True
+            return False
+        except ProtectedStorageError:
+            raise
+        except OSError as exc:
+            raise ProtectedStorageError("Protected temporary files cannot be reconciled") from exc

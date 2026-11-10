@@ -7,7 +7,10 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ._recovery.journal import RESULT_FORMAT_NAMED_ROWS_V1, valid_named_rows_result
+from ._recovery.journal import (
+    RESULT_FORMAT_IMPORT_V1, RESULT_FORMAT_NAMED_ROWS_V1,
+    valid_import_result_envelope, valid_named_rows_result,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +45,20 @@ def pending_operation(record: dict[str, Any]) -> PendingOperation:
     )
 
 
-def recovered_operation(record: dict[str, Any]) -> RecoveredOperation:
+def recovered_operation(record: dict[str, Any], *, journal=None) -> RecoveredOperation:
     if record["state"] != "released" or record["resolved_at"] is None:
         raise ValueError("Only released operations have a recovered result")
     result = record["outcome"]
     result_format = record.get("result_format")
-    if result_format is not None:
+    if result_format == RESULT_FORMAT_IMPORT_V1:
+        if not valid_import_result_envelope(result) or journal is None:
+            raise ValueError("Recovered import result is invalid or its protected index is unavailable")
+        index = journal.read_import_index(record["key"])
+        if index["envelope"] != result:
+            raise ValueError("Recovered import result index belongs to another action")
+        from ._paging import ImportResult
+        result = ImportResult(journal, record["key"], result)
+    elif result_format is not None:
         if result_format != RESULT_FORMAT_NAMED_ROWS_V1 or not valid_named_rows_result(result):
             raise ValueError("Advanced recovered operation has an invalid named result")
     return RecoveredOperation(

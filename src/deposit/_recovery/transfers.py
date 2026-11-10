@@ -11,7 +11,7 @@ from typing import Any, BinaryIO
 
 from .identity import DeploymentIdentity
 from .journal import JournalError, MAX_RECORD_BYTES, ProtectedJournal, _is_uuid, _valid_failure, _strict_json_loads
-from .storage import ProtectedStorageError
+from .storage import ProtectedStorageError, StorageAdmissionCoordinator
 
 
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -23,6 +23,10 @@ _MANIFEST_FIELDS = {
 }
 
 _MANIFEST_V2_FIELDS = _MANIFEST_FIELDS | {"failed_action_key", "failure"}
+_MANIFEST_V3_FIELDS = (_MANIFEST_FIELDS - {"chunks"}) | {
+    "chunk_count", "admission_id", "staging_pending_length", "staging_pending_sha256",
+    "failed_action_key", "failure"
+}
 
 
 class TransferError(RuntimeError):
@@ -32,9 +36,9 @@ class TransferError(RuntimeError):
 class ProtectedTransferSpool:
     """Store upload bytes as protected records beside a Store's action journal.
 
-    Every chunk remains below the existing 16 MiB protected-record cap. Writes
-    use the same ProtectedStore, per-user quota index, ACL and DPAPI backend as
-    prepared actions, so the existing 1 GiB aggregate quota applies unchanged.
+    Every chunk remains below the existing 16 MiB protected-record cap. Chunk
+    metadata is implicit in fixed-size content records, so operation size is
+    not bounded by a single manifest record.
     """
 
     def __init__(self, journal: ProtectedJournal, identity: DeploymentIdentity):
@@ -57,56 +61,80 @@ class ProtectedTransferSpool:
             raise TypeError("resource source must be a readable binary stream")
 
         transfer_id = uuid.uuid4().hex
-        chunks: list[dict[str, Any]] = []
+        admission = StorageAdmissionCoordinator(self._storage)
+        reservation = admission.acquire(transfer_id, "protected-upload-spool", {str(self._storage.root): 0})
         digest = hashlib.sha256()
-        total = 0
-        try:
-            while True:
-                block = source.read(TRANSFER_CHUNK_BYTES)
-                if block in (b"", None):
-                    if block is None:
-                        raise TypeError("resource stream returned None instead of bytes")
-                    break
-                if not isinstance(block, bytes):
-                    raise TypeError("resource stream must return bytes")
-                if len(block) > TRANSFER_CHUNK_BYTES:
-                    raise ValueError("resource stream returned more bytes than requested")
-                name = self._chunk_name(transfer_id, len(chunks))
-                self._storage.write(name, block)
-                chunks.append({"name": name, "bytes": len(block), "sha256": hashlib.sha256(block).hexdigest()})
-                digest.update(block)
-                total += len(block)
-            manifest = {
-                "format_version": 2,
-                "transfer_id": transfer_id,
-                "identity": self._identity.to_dict(),
-                "filename": filename,
-                "media_type": media_type,
-                "bytes": total,
-                "sha256": digest.hexdigest(),
-                "chunks": chunks,
-                "state": "staged",
-                "offset": 0,
-                "upload_id": None,
-                "begin_action_key": None,
-                "pending_action_key": None,
-                "pending_offset": None,
-                "pending_length": None,
-                "finish_action_key": None,
-                "failed_action_key": None,
-                "failure": None,
-            }
+        manifest = {
+            "format_version": 3, "transfer_id": transfer_id,
+            "identity": self._identity.to_dict(), "filename": filename, "media_type": media_type,
+            "bytes": 0, "sha256": digest.hexdigest(), "chunk_count": 0,
+            "admission_id": reservation["id"], "staging_pending_length": 0,
+            "staging_pending_sha256": None,
+            "state": "staging", "offset": 0, "upload_id": None,
+            "begin_action_key": None, "pending_action_key": None,
+            "pending_offset": None, "pending_length": None, "finish_action_key": None,
+            "failed_action_key": None, "failure": None,
+        }
+        with admission.writer(reservation):
             self._save(manifest, creating=True)
-            return manifest
-        except Exception:
-            # Staging has not prepared a server action yet, so these partial
-            # records cannot represent unresolved remote work.
-            for item in chunks:
-                try:
-                    self._storage.delete(item["name"])
-                except Exception:
-                    pass
-            raise
+            total = 0
+            pending = bytearray()
+            try:
+                while True:
+                    request_size = TRANSFER_CHUNK_BYTES - len(pending)
+                    part = source.read(request_size)
+                    if part is None:
+                        raise TypeError("resource stream returned None instead of bytes")
+                    if not isinstance(part, bytes):
+                        raise TypeError("resource stream must return bytes")
+                    if len(part) > request_size:
+                        raise ValueError("resource stream returned more bytes than requested")
+                    if not part:
+                        if pending:
+                            block = bytes(pending)
+                            self._write_staging_chunk(admission, reservation, manifest, block, digest)
+                            total += len(block)
+                        break
+                    pending.extend(part)
+                    if len(pending) == TRANSFER_CHUNK_BYTES:
+                        block = bytes(pending)
+                        self._write_staging_chunk(admission, reservation, manifest, block, digest)
+                        total += len(block)
+                        pending.clear()
+                if total != manifest["bytes"]:
+                    raise TransferError("Protected transfer checkpoint disagrees with consumed input")
+                manifest.update(state="staged", staging_pending_length=0, staging_pending_sha256=None)
+                self._save(manifest)
+                admission.close(reservation)
+                return manifest
+            except Exception:
+                # The manifest records any write intent. Retain owned chunks
+                # and commitments for restart diagnosis; never retry from a new
+                # caller stream under the old transfer identity.
+                raise
+
+    def _write_staging_chunk(self, admission, reservation, manifest, block: bytes, digest) -> None:
+        index = manifest["chunk_count"]
+        checksum = hashlib.sha256(block).hexdigest()
+        data_name = self._chunk_name(manifest["transfer_id"], index)
+        meta_name = self._chunk_meta_name(manifest["transfer_id"], index)
+        estimate = len(block) + 2 * 65536
+        admission.grow(reservation, {str(self._storage.root): estimate})
+        manifest["staging_pending_length"] = len(block)
+        manifest["staging_pending_sha256"] = checksum
+        self._save(manifest)
+        self._storage.write(data_name, block)
+        meta = json.dumps({"index": index, "bytes": len(block), "sha256": checksum},
+                          sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self._storage.write(meta_name, meta)
+        actual = self._storage.record_size(data_name) + self._storage.record_size(meta_name)
+        admission.materialized(reservation, self._storage.root, actual)
+        admission.release(reservation, {str(self._storage.root): estimate - actual})
+        digest.update(block)
+        manifest.update(bytes=manifest["bytes"] + len(block), sha256=digest.hexdigest(),
+                        chunk_count=index + 1, staging_pending_length=0,
+                        staging_pending_sha256=None)
+        self._save(manifest)
 
     def load(self, transfer_id: str) -> dict[str, Any]:
         if not isinstance(transfer_id, str) or not _TRANSFER_ID.fullmatch(transfer_id):
@@ -137,22 +165,53 @@ class ProtectedTransferSpool:
 
     def read_chunk(self, transfer_id: str, index: int) -> bytes:
         manifest = self.load(transfer_id)
-        if type(index) is not int or not 0 <= index < len(manifest["chunks"]):
+        if type(index) is not int or not 0 <= index < self.chunk_count(manifest):
             raise TransferError("Transfer chunk index is invalid")
-        entry = manifest["chunks"][index]
+        entry = self.chunk_metadata(manifest, index)
         try:
             block = self._storage.read(entry["name"])
         except (KeyError, ProtectedStorageError) as exc:
             raise TransferError("Protected upload spool is unavailable") from exc
-        if len(block) != entry["bytes"] or hashlib.sha256(block).hexdigest() != entry["sha256"]:
+        if (len(block) != entry["bytes"]
+                or hashlib.sha256(block).hexdigest() != entry["sha256"]):
             raise TransferError("Protected upload spool failed its checksum")
         return block
+
+    @staticmethod
+    def chunk_count(manifest: dict[str, Any]) -> int:
+        if manifest.get("format_version") == 3:
+            return manifest["chunk_count"]
+        return len(manifest["chunks"])
+
+    @staticmethod
+    def chunk_length(manifest: dict[str, Any], index: int) -> int:
+        if manifest.get("format_version") == 3:
+            remaining = manifest["bytes"] - index * TRANSFER_CHUNK_BYTES
+            return min(TRANSFER_CHUNK_BYTES, remaining)
+        return manifest["chunks"][index]["bytes"]
+
+    def chunk_metadata(self, manifest: dict[str, Any], index: int) -> dict[str, Any]:
+        if manifest.get("format_version") != 3:
+            return manifest["chunks"][index]
+        if type(index) is not int or not 0 <= index < manifest["chunk_count"]:
+            raise TransferError("Protected transfer chunk index is invalid")
+        try:
+            metadata = _strict_json_loads(self._storage.read(self._chunk_meta_name(manifest["transfer_id"], index)))
+        except Exception as exc:
+            raise TransferError("Protected upload chunk metadata is unavailable") from exc
+        expected_size = self.chunk_length(manifest, index)
+        if (not isinstance(metadata, dict) or set(metadata) != {"index", "bytes", "sha256"}
+                or metadata["index"] != index or metadata["bytes"] != expected_size
+                or not isinstance(metadata["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"])):
+            raise TransferError("Protected upload chunk metadata is invalid")
+        return {"name": self._chunk_name(manifest["transfer_id"], index), **metadata}
 
     def verify_content(self, manifest: dict[str, Any]) -> None:
         """Verify every protected chunk against the immutable whole-file digest."""
         digest = hashlib.sha256()
         total = 0
-        for index in range(len(manifest["chunks"])):
+        for index in range(self.chunk_count(manifest)):
             block = self.read_chunk(manifest["transfer_id"], index)
             digest.update(block)
             total += len(block)
@@ -160,20 +219,11 @@ class ProtectedTransferSpool:
             raise TransferError("Protected upload spool failed its whole-file checksum")
 
     def ensure_action_capacity(self, manifest: dict[str, Any]) -> None:
-        """Reserve quota headroom for the immutable chunk action records."""
-        limit = getattr(self._storage, "MAX_TOTAL_BYTES", None)
-        usage = getattr(self._storage, "usage_bytes", None)
-        if type(limit) is not int or not callable(usage):
-            raise ProtectedStorageError("Per-user recovery quota cannot be checked safely")
-        actions = 2  # begin and finish
-        required = actions * 8192
-        for chunk in manifest["chunks"]:
-            encoded_bytes = 4 * ((chunk["bytes"] + 2) // 3)
+        """Check only per-action representability; disk admission is incremental."""
+        for index in range(self.chunk_count(manifest)):
+            encoded_bytes = 4 * ((self.chunk_metadata(manifest, index)["bytes"] + 2) // 3)
             if encoded_bytes + 8192 > MAX_RECORD_BYTES:
                 raise ProtectedStorageError("Upload chunk action exceeds the 16 MiB recovery record limit")
-            required += encoded_bytes + 8192
-        if usage() + required > limit:
-            raise ProtectedStorageError("Protected upload plus recovery actions exceeds the 1 GiB per-user quota")
 
     def pending(self) -> tuple[dict[str, Any], ...]:
         """Find this deployment's unfinished manifests without exposing keys."""
@@ -192,10 +242,32 @@ class ProtectedTransferSpool:
                 if not identity.matches(self._identity):
                     continue
                 self._validate(manifest, match.group(1))
-                if manifest["state"] != "failed":
+                if manifest["state"] not in {"failed", "staging"}:
                     result.append(manifest)
             except TransferError:
                 raise
+            except Exception as exc:
+                raise TransferError("Protected transfer manifest is unavailable or corrupt") from exc
+        return tuple(sorted(result, key=lambda item: item["transfer_id"]))
+
+    def incomplete_staging(self) -> tuple[dict[str, Any], ...]:
+        """List frozen-input intents requiring explicit inspection.
+
+        Interrupted caller streams are never replaced with new stream bytes
+        during automatic upload recovery.
+        """
+        result = []
+        for name in self._storage.list_records():
+            match = re.fullmatch(r"transfer-([0-9a-f]{32})-manifest", name)
+            if match is None:
+                continue
+            try:
+                raw = _strict_json_loads(self._storage.read(name))
+                identity = DeploymentIdentity.from_dict(raw.get("identity", {}))
+                if identity.matches(self._identity):
+                    self._validate(raw, match.group(1))
+                    if raw["state"] == "staging":
+                        result.append(raw)
             except Exception as exc:
                 raise TransferError("Protected transfer manifest is unavailable or corrupt") from exc
         return tuple(sorted(result, key=lambda item: item["transfer_id"]))
@@ -208,9 +280,11 @@ class ProtectedTransferSpool:
             if manifest["state"] != "finished":
                 raise TransferError("Unresolved upload spool cannot be removed")
             with self._storage.lock("journal-index"):
-                for chunk in manifest["chunks"]:
-                    self._storage.delete(chunk["name"])
+                for index in range(self.chunk_count(manifest)):
+                    self._storage.delete(self._chunk_name(transfer_id, index))
                 self._storage.delete(self._manifest_name(transfer_id))
+                if manifest.get("admission_id"):
+                    self._storage.delete(f"admission-{manifest['admission_id']}")
 
     def _save(self, manifest: dict[str, Any], *, creating: bool = False) -> None:
         self._validate(manifest, manifest.get("transfer_id"))
@@ -228,8 +302,9 @@ class ProtectedTransferSpool:
     def _validate(self, manifest: Any, transfer_id: Any) -> None:
         if (
             not isinstance(manifest, dict)
-            or set(manifest) != (_MANIFEST_FIELDS if manifest.get("format_version") == 1 else _MANIFEST_V2_FIELDS)
-            or manifest.get("format_version") not in {1, 2}
+            or set(manifest) != (_MANIFEST_FIELDS if manifest.get("format_version") == 1 else
+                                 _MANIFEST_V2_FIELDS if manifest.get("format_version") == 2 else _MANIFEST_V3_FIELDS)
+            or manifest.get("format_version") not in {1, 2, 3}
             or type(manifest.get("format_version")) is not int
             or manifest.get("transfer_id") != transfer_id
             or not isinstance(transfer_id, str)
@@ -244,13 +319,14 @@ class ProtectedTransferSpool:
             or not isinstance(manifest.get("sha256"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])
             or manifest.get("state") not in ({"staged", "uploading", "finished"} if manifest.get("format_version") == 1
-                                             else {"staged", "uploading", "finished", "failed"})
+                                             else {"staged", "uploading", "finished", "failed"} if manifest.get("format_version") == 2
+                                             else {"staging", "staged", "uploading", "finished", "failed"})
             or type(manifest.get("offset")) is not int
             or not 0 <= manifest["offset"] <= manifest["bytes"]
-            or not isinstance(manifest.get("chunks"), list)
+            or (manifest.get("format_version") != 3 and not isinstance(manifest.get("chunks"), list))
         ):
             raise TransferError("Protected transfer manifest has an unsupported format")
-        if manifest["format_version"] == 2:
+        if manifest["format_version"] in {2, 3}:
             failed_key, failure = manifest["failed_action_key"], manifest["failure"]
             if manifest["state"] == "failed":
                 references = {manifest["begin_action_key"], manifest["pending_action_key"], manifest["finish_action_key"]}
@@ -259,7 +335,7 @@ class ProtectedTransferSpool:
             elif failed_key is not None or failure is not None:
                 raise TransferError("Active transfer manifest has terminal failure metadata")
         total = 0
-        for index, entry in enumerate(manifest["chunks"]):
+        for index, entry in enumerate(manifest.get("chunks", [])):
             if (
                 not isinstance(entry, dict)
                 or set(entry) != {"name", "bytes", "sha256"}
@@ -271,7 +347,23 @@ class ProtectedTransferSpool:
             ):
                 raise TransferError("Protected transfer manifest has invalid chunk metadata")
             total += entry["bytes"]
-        if total != manifest["bytes"] or (manifest["bytes"] and not manifest["chunks"]):
+        if manifest["format_version"] == 3:
+            count = manifest["chunk_count"]
+            pending_length = manifest["staging_pending_length"]
+            pending_digest = manifest["staging_pending_sha256"]
+            if (type(count) is not int or count < 0 or count != (manifest["bytes"] + TRANSFER_CHUNK_BYTES - 1) // TRANSFER_CHUNK_BYTES
+                    or not isinstance(manifest["admission_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", manifest["admission_id"])
+                    or type(pending_length) is not int
+                    or not 0 <= pending_length <= TRANSFER_CHUNK_BYTES
+                    or ((pending_length == 0) != (pending_digest is None))
+                    or (pending_digest is not None and (not isinstance(pending_digest, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", pending_digest)))
+                    or (manifest["state"] in {"staged", "uploading", "finished"} and pending_length != 0)
+                    or (manifest["state"] == "staging" and any(manifest[field] is not None for field in
+                        ("upload_id", "begin_action_key", "pending_action_key", "pending_offset",
+                         "finish_action_key")))):
+                raise TransferError("Protected transfer manifest has invalid segmented chunk metadata")
+        elif total != manifest["bytes"] or (manifest["bytes"] and not manifest["chunks"]):
             raise TransferError("Protected transfer manifest length does not match its chunks")
         for field in ("upload_id", "begin_action_key", "pending_action_key"):
             value = manifest.get(field)
@@ -312,6 +404,10 @@ class ProtectedTransferSpool:
     @staticmethod
     def _chunk_name(transfer_id: str, index: int) -> str:
         return f"transfer-{transfer_id}-chunk-{index:08d}"
+
+    @staticmethod
+    def _chunk_meta_name(transfer_id: str, index: int) -> str:
+        return f"transfer-{transfer_id}-meta-{index:08d}"
 
     @staticmethod
     def _lock_name(transfer_id: str) -> str:

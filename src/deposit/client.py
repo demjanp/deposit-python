@@ -97,6 +97,14 @@ class Client:
         self._version = version
         return dict(data)
 
+    def require_import_result_v1(self) -> dict[str, Any]:
+        """Gate V1 import mutations on the exact advertised result capability."""
+        data = self.discover()
+        if data.get("importResultFormats") != [1]:
+            raise CompatibilityError(str(data.get("importResultFormats", "missing")),
+                                     "importResultFormats [1]", "Deposit import result protocol")
+        return data
+
     def login(self, username: str, password: str) -> str:
         """Authenticate and return the session token; credentials are never logged."""
         self.discover()
@@ -393,7 +401,7 @@ class Client:
         journal = ProtectedJournal(recovery_directory)
         records = journal.records_all()
         self._recovery_journals.update({record["public_id"]: journal for record in records})
-        return tuple(recovered_operation(record) for record in records if record["state"] == "released")
+        return tuple(recovered_operation(record, journal=journal) for record in records if record["state"] == "released")
 
     def recover(self, operation: PendingOperation, *, username: str, password: str) -> RecoveredOperation:
         """Authenticate and resolve one operation reference without exposing its recovery key."""
@@ -453,7 +461,7 @@ class Client:
                 raise DepositError("IDENTITY_MISMATCH", "Recovery record belongs to a different server or database")
             record = journal.load(stored_identity, record["key"])
             if record["state"] == "released":
-                return recovered_operation(record)
+                return recovered_operation(record, journal=journal)
             if record["state"] == "failed":
                 raise _saved_failure_error(record["failure"])
 
@@ -464,7 +472,7 @@ class Client:
                     # the same prepared action while this receipt is being saved.
                     record = journal.load(stored_identity, record["key"])
                     if record["state"] == "released":
-                        return recovered_operation(record)
+                        return recovered_operation(record, journal=journal)
                     try:
                         state = recovery_client._recovery_control("deposit.action.status", record["key"], token)
                     except DepositError as exc:
@@ -513,7 +521,7 @@ class Client:
                 raise _saved_failure_error(record["failure"])
             if record["state"] != "released":
                 raise DepositError("RECOVERY_PENDING", "Operation remains unresolved after safe recovery")
-            result = recovered_operation(record)
+            result = recovered_operation(record, journal=journal)
             store.close()
             store = None
             return result
@@ -564,7 +572,7 @@ class Client:
             if released.get("value") is not True:
                 raise DepositError("RELEASE_UNCONFIRMED", "Prepared action release was not confirmed")
             current = journal.update(identity, record["key"], state="released")
-        return recovered_operation(current)
+        return recovered_operation(current, journal=journal)
 
     def close(self) -> None:
         if self._closed:

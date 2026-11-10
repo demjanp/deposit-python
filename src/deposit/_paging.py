@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+import threading
+from typing import Any, Iterator
+from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
+from types import MappingProxyType
 
 from .errors import DepositError
 
@@ -213,3 +216,282 @@ class EntityPageIterator:
 
     def __exit__(self, exc_type, exc, traceback):
         self.close()
+
+
+class ImportResult(MappingABC):
+    """Immutable scalar import envelope with locally persisted lazy collections."""
+
+    _FIELDS = ("format", "resultId", "operationId", "kind", "state", "namespaceId",
+               "planId", "revision", "expiresAt")
+
+    def __init__(self, journal, action_key: str, envelope: dict[str, Any], *, plan_observation=None,
+                 deferred_loader=None):
+        if plan_observation is not None:
+            from ._recovery.journal import _valid_plan_observation
+            if not _valid_plan_observation(plan_observation, envelope):
+                raise DepositError("INVALID_RESPONSE", "Import plan observation does not match its immutable result")
+        self._journal = journal
+        self._action_key = action_key
+        immutable = dict(envelope)
+        immutable["collections"] = MappingProxyType({
+            key: MappingProxyType(dict(value)) for key, value in envelope["collections"].items()
+        })
+        self._envelope = MappingProxyType(immutable)
+        self._plan_observation = (None if plan_observation is None
+                                  else MappingProxyType(dict(plan_observation)))
+        self._closed = False
+        self._deferred_loader = deferred_loader
+        self._attachment_lock = threading.RLock()
+        self._pin_name = None
+        self._pin_lock = None
+        if deferred_loader is None:
+            self._attach_backing()
+
+    def _attach_backing(self):
+        if self._pin_name is None:
+            self._pin_name, self._pin_lock = self._journal.pin_import_result(self._action_key)
+
+    def _ensure_attached(self):
+        if self._closed:
+            raise RuntimeError("ImportResult is closed")
+        with self._attachment_lock:
+            if self._pin_name is not None:
+                return
+            if self._deferred_loader is not None:
+                self._deferred_loader()
+                self._deferred_loader = None
+            self._attach_backing()
+
+    @property
+    def result_id(self):
+        return self._envelope["resultId"]
+
+    @property
+    def operation_id(self):
+        return self._envelope["operationId"]
+
+    @property
+    def action_key(self):
+        return self._action_key
+
+    @property
+    def state(self):
+        return self._envelope["state"]
+
+    @property
+    def plan_observation(self):
+        """The separately observed current plan lifecycle, if this is an inspection result."""
+        return self._plan_observation
+
+    @property
+    def plan_state(self):
+        return None if self._plan_observation is None else self._plan_observation["state"]
+
+    @property
+    def plan_id(self):
+        return self._envelope["planId"]
+
+    def __getitem__(self, key):
+        if self._closed:
+            raise RuntimeError("ImportResult is closed")
+        if key == "plan" and self._plan_observation is not None:
+            return self._plan_observation
+        if key == "plan":
+            raise KeyError(key)
+        if key in self._envelope:
+            return self._envelope[key]
+        descriptor = self._envelope["collections"].get(key)
+        if descriptor is None:
+            raise KeyError(key)
+        self._ensure_attached()
+        return _lazy_collection(self._journal, self._action_key, key, descriptor["kind"], descriptor["count"], self)
+
+    def __iter__(self):
+        plan = ("plan",) if self._plan_observation is not None else ()
+        return iter((*self._FIELDS, *plan, *self._envelope["collections"].keys()))
+
+    def __len__(self):
+        return len(self._FIELDS) + (self._plan_observation is not None) + len(self._envelope["collections"])
+
+    def close(self):
+        """Release this reader; protected result segments remain retained."""
+        with self._attachment_lock:
+            if not self._closed:
+                self._closed = True
+                if self._pin_name is not None:
+                    self._journal.release_import_result_pin(self._pin_name, self._pin_lock)
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def __enter__(self):
+        if self._closed:
+            raise RuntimeError("ImportResult is closed")
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
+def _lazy_collection(journal, action_key, collection, kind, count, owner):
+    if kind == "mapping":
+        return LazyResultMapping(journal, action_key, collection, count, owner)
+    return LazyResultSequence(journal, action_key, collection, count, owner)
+
+
+class _LazyResultBase:
+    def __init__(self, journal, action_key, collection, count, owner):
+        self._journal = journal
+        self._action_key = action_key
+        self._collection = collection
+        self._count = count
+        self._owner = owner
+
+    def _check_open(self):
+        if self._owner.closed:
+            raise RuntimeError("ImportResult is closed")
+
+    def _entries(self):
+        self._check_open()
+        meta = self._journal.read_import_collection_meta(self._action_key, self._collection)
+        for page_index in range(meta["pageCount"]):
+            response = self._journal.read_import_page(self._action_key, self._collection, page_index)["response"]
+            yield from response["entries"]
+
+
+class LazyResultSequence(_LazyResultBase, SequenceABC):
+    """Indexable, bounded-page sequence backed by protected local segments."""
+
+    def __len__(self):
+        return self._count
+
+    def __iter__(self):
+        for descriptor in self._entries():
+            yield _decode_import_value(descriptor, self)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            raise TypeError("Lazy result sequences do not materialize slices")
+        if type(index) is not int:
+            raise TypeError("Import result sequence indices must be integers")
+        resolved = index + self._count if index < 0 else index
+        if not 0 <= resolved < self._count:
+            raise IndexError(index)
+        for position, value in enumerate(self):
+            if position == resolved:
+                return value
+        raise IndexError(index)
+
+
+class LazyResultMapping(_LazyResultBase, MappingABC):
+    """Read-only mapping whose entries are decoded one bounded page at a time."""
+
+    def __len__(self):
+        return self._count
+
+    def _pairs(self):
+        for entry in self._entries():
+            if isinstance(entry, dict) and set(entry) == {"key", "value"}:
+                key, value = entry["key"], entry["value"]
+            else:
+                raise DepositError("INVALID_RESPONSE", "Import mapping entry is invalid")
+            yield _decode_import_value(key, self), _decode_import_value(value, self)
+
+    def __iter__(self):
+        for key, _value in self._pairs():
+            yield key
+
+    def items(self):
+        return self._pairs()
+
+    def __getitem__(self, key):
+        for actual_key, value in self._pairs():
+            if actual_key == key:
+                return value
+        raise KeyError(key)
+
+
+def _decode_import_value(descriptor: Any, parent: _LazyResultBase):
+    if not isinstance(descriptor, dict) or not isinstance(descriptor.get("type"), str):
+        raise DepositError("INVALID_RESPONSE", "Import result descriptor is invalid")
+    kind = descriptor["type"]
+    if kind == "scalar" and set(descriptor) == {"type", "value"}:
+        return descriptor["value"]
+    if kind in {"mapping", "sequence"} and set(descriptor) == {"type", "collection", "count"}:
+        return _lazy_collection(parent._journal, parent._action_key, descriptor["collection"],
+                                kind, descriptor["count"], parent._owner)
+    if kind == "text" and set(descriptor) == {"type", "collection", "bytes"}:
+        return LazyText(parent._journal, parent._action_key, descriptor["collection"],
+                        descriptor["bytes"], parent._owner)
+    raise DepositError("INVALID_RESPONSE", "Import result descriptor type is unsupported")
+
+
+class LazyText:
+    """Chunk-readable UTF-8 text that never joins the complete value implicitly."""
+
+    def __init__(self, journal, action_key, collection, byte_count, owner):
+        self._journal = journal
+        self._action_key = action_key
+        self._collection = collection
+        self._byte_count = byte_count
+        self._owner = owner
+        self._chunks = None
+        self._pending = ""
+
+    def __len__(self):
+        return self._byte_count
+
+    def iter_chunks(self) -> Iterator[str]:
+        if self._owner.closed:
+            raise RuntimeError("ImportResult is closed")
+        meta = self._journal.read_import_collection_meta(self._action_key, self._collection)
+        if meta["kind"] != "text" or meta["textBytes"] != self._byte_count:
+            raise DepositError("INVALID_RESPONSE", "Import text descriptor disagrees with its local index")
+        for page_index in range(meta["pageCount"]):
+            page = self._journal.read_import_page(self._action_key, self._collection, page_index)["response"]
+            for chunk in page["entries"]:
+                if (not isinstance(chunk, dict) or set(chunk) != {"type", "value"}
+                        or chunk.get("type") != "scalar" or not isinstance(chunk.get("value"), str)):
+                    raise DepositError("INVALID_RESPONSE", "Import text chunk is invalid")
+                yield chunk["value"]
+
+    def read(self, size: int) -> str:
+        if type(size) is not int or size < 0:
+            raise ValueError("LazyText.read requires a nonnegative character count")
+        if self._owner.closed:
+            raise RuntimeError("ImportResult is closed")
+        if size == 0:
+            return ""
+        if self._chunks is None:
+            self._chunks = iter(self.iter_chunks())
+        output = []
+        remaining = size
+        while remaining and self._pending:
+            part = self._pending[:remaining]
+            output.append(part)
+            self._pending = self._pending[len(part):]
+            remaining -= len(part)
+        while remaining:
+            try:
+                self._pending = next(self._chunks)
+            except StopIteration:
+                break
+            part = self._pending[:remaining]
+            output.append(part)
+            self._pending = self._pending[len(part):]
+            remaining -= len(part)
+        return "".join(output)
+
+    def __iter__(self):
+        return self.iter_chunks()
+
+    def __eq__(self, other):
+        if not isinstance(other, str):
+            return NotImplemented
+        offset = 0
+        for chunk in self.iter_chunks():
+            if other[offset:offset + len(chunk)] != chunk:
+                return False
+            offset += len(chunk)
+        return offset == len(other)
