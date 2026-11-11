@@ -875,14 +875,18 @@ class Store:
             roots, max_hops=max_hops, root_class_boundary=root_class_boundary
         ))
 
-    def from_networkx(self, graph, *, rules: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def from_networkx(self, graph, *, resources=None, resource_source=None,
+                      rules: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Freeze a Deposit MultiDiGraph and submit it to Server import analysis."""
         from .networkx import from_networkx, require_networkx
         require_networkx()
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("rules must be a mapping")
         snapshot = from_networkx(graph)
-        return self._analyze_import_snapshot(snapshot, rules=rules, require_subgraph=False)
+        return self._analyze_import_snapshot(
+            snapshot, resources=resources, resource_source=resource_source,
+            rules=rules, require_subgraph=False,
+        )
     def import_rows(self, rows, relationships=None, *, targets=None, rules=None):
         """Analyze a frozen tabular submission; matching remains server-owned."""
         frozen_rows = _freeze_import_rows(rows)
@@ -916,42 +920,57 @@ class Store:
         return result
 
     def import_subtree(
-        self, subtree: Mapping[str, Any], *, rules: Mapping[str, Any] | None = None
+        self, subtree: Mapping[str, Any], *, resources=None, resource_source=None,
+        rules: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Analyze a fixed, resource-free public subgraph snapshot."""
-        return self._analyze_import_snapshot(subtree, rules=rules, require_subgraph=True)
+        """Analyze a fixed public subgraph with optional checked resource content."""
+        return self._analyze_import_snapshot(
+            subtree, resources=resources, resource_source=resource_source,
+            rules=rules, require_subgraph=True,
+        )
 
     def from_dict(
-        self, data: Mapping[str, Any], *, rules: Mapping[str, Any] | None = None
+        self, data: Mapping[str, Any], *, resources=None, resource_source=None,
+        rules: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Analyze a fixed, resource-free public graph/package dictionary."""
-        return self._analyze_import_snapshot(data, rules=rules, require_subgraph=False)
+        """Analyze a fixed public graph/package with optional checked resource content."""
+        return self._analyze_import_snapshot(
+            data, resources=resources, resource_source=resource_source,
+            rules=rules, require_subgraph=False,
+        )
 
     def _analyze_import_snapshot(
         self,
-        source: Mapping[str, Any],
+        source,
         *,
+        resources=None,
+        resource_source=None,
         rules: Mapping[str, Any] | None,
         require_subgraph: bool,
     ) -> dict[str, Any]:
-        if not isinstance(source, Mapping):
-            raise TypeError("Import snapshot must be a manifest/graph mapping")
+        from ._imports import _checked_package_view
+        package_source = (_checked_package_view(source) is not None or
+                          ((callable(getattr(source, "iter_content", None))
+                           or callable(getattr(source, "open_resource", None))
+                           or callable(getattr(source, "resource_reader", None)))
+                          and (callable(getattr(source, "materialize", None))
+                               or (hasattr(source, "manifest") and hasattr(source, "graph")))))
+        if not isinstance(source, Mapping) and not package_source:
+            raise TypeError("Import snapshot must be a manifest/graph mapping or Exchange package")
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("rules must be a mapping")
         self._client.require_paged_import_results()
-        frozen_source = _portable_input(dict(source))
+        frozen_source = source if package_source else _portable_input(dict(source))
         frozen_rules = _portable_input(dict(rules or {}))
-        from ._imports import resource_free_exchange_package
-
-        package_bytes = resource_free_exchange_package(frozen_source, require_subgraph=require_subgraph)
-        from io import BytesIO
-
-        package_stream = BytesIO(package_bytes)
-        package_resource = DResource(stream=package_stream, filename="deposit-import.zip")
-        try:
+        from ._imports import prepared_import_package
+        with prepared_import_package(
+            frozen_source, resources=resources, resource_source=resource_source,
+            storage=self._journal.storage, require_subgraph=require_subgraph,
+        ) as package:
+            package_source = package._source
+            package_source.seek(0)
+            package_resource = DResource(stream=package_source, filename="deposit-import.zip")
             self.upload_resource(package_resource)
-        finally:
-            package_stream.close()
         resource_id = package_resource.resource_id
         if not isinstance(resource_id, str) or not resource_id:
             raise DepositError("INVALID_RESPONSE", "Exchange package upload returned no resource ID")

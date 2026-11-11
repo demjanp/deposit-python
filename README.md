@@ -85,13 +85,20 @@ unavailable. Close download readers after consuming all bytes; early close repor
 an incomplete download. The wrapper closes files it opens and leaves caller
 streams owned by the caller.
 
-`store.import_rows(...)`, `store.from_dict(...)`, `store.import_subtree(...)` and
-`store.import_data_by_pattern(...)` return analysis plans. Apply explicitly with
-`store.import_apply(plan["planId"])`. Inputs are frozen before analysis; a target
-revision conflict requires fresh analysis. Dictionary/subtree helpers currently
-accept resource-free Exchange snapshots. Resource-bearing dictionary imports,
-full-Namespace clone recovery and Client-owned server-scope mutation recovery
-remain deferred.
+`store.import_rows(...)`, `store.from_dict(...)`, `store.import_subtree(...)`
+and `store.from_networkx(...)` return lazy import analysis results. Apply
+explicitly with `store.import_apply(result["planId"])`. Inputs are frozen before
+analysis; a target revision conflict requires fresh analysis. Dictionary,
+subtree and NetworkX imports accept `resources` and `resource_source` providers.
+`resources` maps Exchange content entries to paths, bytes or
+caller-owned binary streams; streams are read from their current position and
+remain open. Explicit content takes precedence over `resource_source`, and bad
+content fails without fallback. A `resource_source` can be an authenticated
+source Store or checked Exchange bundle. Package bytes are staged and integrity-checked in protected
+storage before upload or analysis. A complete checked Exchange bundle can be
+passed directly as `data` without separate providers. Typed references and
+graph/domain semantics remain Server-validated. Full-Namespace clone recovery and Client-owned
+server-scope mutation recovery remain deferred.
 
 CSV/XLSX/GeoPackage load/save, table paging, history, undo/redo and confirmed
 restore use `store.call(...)` with the exact public Server arguments. Returned
@@ -110,9 +117,15 @@ NetworkX; calling either graph method without the extra raises an
 `to_networkx` returns a directed multigraph. Node keys are
 `(namespace_id, kind, id)` tuples, where `kind` is `Class` or `Object`. Edge
 keys retain relationship IDs, so parallel relationships and their direction
-remain distinct. Node and edge attributes retain the exported values,
-declarations and membership data. Graph metadata includes the source Namespace,
-revision, Patterns and the detached Exchange snapshot used for conversion.
+remain distinct. Node and edge attributes retain current values, declarations,
+Descriptor records and membership data. Each Object's `descriptors` attribute
+maps names to visible Descriptor records containing their current ID, name,
+value and provenance. A record is recognized only when it has the complete
+`Descriptor` shape (`kind`, `id`, `namespaceId`, `objectId`, `name`, and
+`value`) and its namespace, Object and name match the graph location; an
+ordinary scientific mapping with `kind="Descriptor"` remains a value. Graph metadata includes the source Namespace, revision,
+Server version, Patterns, resource records, geometries and User Tools; it does
+not contain a hidden Exchange snapshot or history.
 
 ```python
 graph = store.to_networkx(roots=[root_object_id], max_hops=2)
@@ -122,16 +135,19 @@ result = store.import_apply(plan["planId"])
 
 Omit `roots` to export the Namespace. When roots are supplied, `max_hops` may
 be from 0 through 10 and `root_class_boundary` defaults to `True`. Import
-freezes the graph before analysis, so later caller edits do not change the
-submitted input. Deposit Server performs matching and assigns receiver-side
+serializes the graph's current nodes and edges, including additions, deletions
+and edits, before analysis, so later caller edits do not change the submitted
+input. Deposit Server performs matching and assigns receiver-side
 identities; source IDs are not a promise that imported entities keep those IDs.
 Apply the returned plan explicitly with `store.import_apply(...)`.
 
-Graph conversion is not a complete backup or migration format. Resource content
-cannot be created from a graph, and resource-bearing imports are rejected. Use
-the Exchange resource workflow for content-bearing snapshots. The API also does
-not provide full-Namespace clone recovery or recover Client-owned Server-scope
-mutations; those workflows remain deferred.
+Graph conversion represents current data, not history or a complete backup.
+Resource bytes never appear in graph attributes; provide them with
+`store.from_networkx(graph, resources=...)` or `resource_source=...`. Python
+checks package shape, ZIP safety, lengths and checksums, while the Server checks
+resource references and graph semantics before creating an analysis plan. The
+API does not provide full-Namespace clone recovery or recover Client-owned
+Server-scope mutations; those workflows remain deferred.
 
 ## Compatibility and migration <a name="compatibility-and-migration"></a>
 

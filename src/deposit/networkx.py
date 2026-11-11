@@ -39,10 +39,6 @@ def to_networkx(snapshot: Mapping[str, Any]):
         revision=revision,
         depositVersion=manifest.get("depositVersion"),
         patterns=deepcopy(records["patterns"]),
-        descriptorMetadata=[
-            {name: deepcopy(value) for name, value in descriptor.items() if name != "value"}
-            for descriptor in records["descriptors"]
-        ],
         resources=deepcopy(records["resources"]),
         geometries=deepcopy(records["geometries"]),
         userTools=deepcopy(records["userTools"]),
@@ -57,7 +53,11 @@ def to_networkx(snapshot: Mapping[str, Any]):
             raise ValueError("Descriptor has a missing or invalid Object endpoint")
         if descriptor.get("name") in descriptor_values.setdefault(owner, {}):
             raise ValueError("Snapshot contains duplicate Object Descriptor names")
-        descriptor_values[owner][descriptor["name"]] = deepcopy(descriptor.get("value"))
+        # Descriptor identity and provenance are visible graph data. Keeping
+        # the complete current record here avoids a hidden snapshot sidecar.
+        visible = deepcopy(descriptor)
+        visible.update(kind="Descriptor", namespaceId=namespace_id, objectId=owner)
+        descriptor_values[owner][descriptor["name"]] = visible
 
     for record in records["classes"]:
         node = _node_record(record, namespace_id, "Class")
@@ -82,7 +82,6 @@ def to_networkx(snapshot: Mapping[str, Any]):
             if source not in known or target not in known:
                 raise ValueError(f"{kind} has a missing or invalid endpoint")
             _add_edge(graph, namespace_id, kind, source, target, record)
-    _validate_structural_completeness(records, namespace_id)
     return graph
 
 
@@ -242,7 +241,6 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
         else:
             record_lists["objects"].append(record)
     object_by_id = {item["id"]: item for item in record_lists["objects"]}
-    class_by_id = {item["id"]: item for item in record_lists["classes"]}
     object_descriptor_values = {
         record["id"]: deepcopy(record.get("descriptors", {}))
         for record in record_lists["objects"]
@@ -283,55 +281,28 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
     if not isinstance(patterns, list):
         raise TypeError("Graph patterns metadata must be a list")
     record_lists["patterns"] = deepcopy(patterns)
-    descriptor_metadata = metadata.get("descriptorMetadata", [])
-    if not isinstance(descriptor_metadata, list):
-        raise TypeError("Graph Descriptor metadata must be a list")
-    descriptor_metadata_by_owner_name = {}
-    for descriptor in descriptor_metadata:
-        if not isinstance(descriptor, Mapping):
-            raise TypeError("Graph Descriptor metadata rows must be mappings")
-        identity, owner, name = descriptor.get("id"), descriptor.get("objectId"), descriptor.get("name")
-        if (not isinstance(identity, str) or not identity or not isinstance(owner, str) or not owner
-                or not isinstance(name, str) or not name):
-            raise ValueError("Graph Descriptor metadata requires identity, owner and name")
-        key = (owner, name)
-        if key in descriptor_metadata_by_owner_name:
-            raise ValueError("Graph Descriptor metadata contains duplicate owners and names")
-        descriptor_metadata_by_owner_name[key] = descriptor
     for category in ("resources", "geometries", "userTools"):
         values = metadata.get(category, [])
         if not isinstance(values, list):
             raise TypeError(f"Graph {category} metadata must be a list")
         record_lists[category] = deepcopy(values)
-    declarations = {}
-    for record in record_lists["classes"]:
-        declarations[record["id"]] = {item.get("name"): item for item in record.get("descriptors", []) if isinstance(item, dict)}
     for record in record_lists["objects"]:
         object_id = record["id"]
-        class_id = record.get("classId")
-        if class_id not in declarations:
-            raise ValueError("Object references a missing Class declaration set")
         values = object_descriptor_values.get(object_id, {})
         if not isinstance(values, dict):
             raise TypeError("Object descriptors must be a mapping")
         for name, value in values.items():
-            declaration = declarations[class_id].get(name)
-            if declaration is None:
-                raise ValueError(f"Object Descriptor {name!r} has no included Class declaration")
-            from .values import decode_value
-            try:
-                decode_value(declaration.get("type"), value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Object Descriptor {name!r} does not match its declaration") from exc
-            prior_metadata = descriptor_metadata_by_owner_name.pop((object_id, name), None)
-            if prior_metadata is not None and prior_metadata.get("namespaceId", namespace_id) != namespace_id:
-                raise ValueError("Descriptor metadata Namespace contradicts graph metadata")
-            descriptor = deepcopy(dict(prior_metadata)) if prior_metadata is not None else {"id": str(uuid.uuid4())}
-            descriptor.update(namespaceId=namespace_id, objectId=object_id, name=name,
-                              value=deepcopy(value))
+            if _is_visible_descriptor_record(
+                    value, namespace_id=namespace_id, object_id=object_id, name=name):
+                descriptor = deepcopy(dict(value))
+            else:
+                # Accept direct value replacement as a convenient graph edit;
+                # new/legacy scalar values receive one identity at freeze time.
+                descriptor = {"id": str(uuid.uuid4()), "name": name, "value": deepcopy(value)}
+            if not isinstance(descriptor.get("id"), str) or not descriptor["id"]:
+                raise ValueError("Visible Descriptor records require a stable ID")
+            descriptor.update(namespaceId=namespace_id, objectId=object_id, name=name)
             record_lists["descriptors"].append(descriptor)
-    if record_lists["resources"] or _contains_resource_reference(record_lists):
-        raise ValueError("Resource-bearing NetworkX imports require the approved content mapping")
     version = metadata.get("depositVersion")
     if version is not None and (not isinstance(version, str) or not version):
         raise ValueError("Graph depositVersion must be a Server version String or null")
@@ -340,128 +311,26 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
         "name": "NetworkX graph", "description": "", "depositVersion": version,
         "historyMode": "disabled", "exportedRevision": revision,
         "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "rootIds": sorted(object_by_id), "scope": "namespace", "includeHistory": False,
+        "rootIds": sorted(object_by_id), "scope": "subgraph", "includeHistory": False,
         "files": {},
     }
-    _validate_structural_completeness(record_lists, namespace_id)
     return {"manifest": manifest, "graph": record_lists}
 
 
-def _validate_structural_completeness(records, namespace_id):
-    classes = {item.get("id"): item for item in records["classes"]}
-    objects = {item.get("id"): item for item in records["objects"]}
-    edge_ids = set()
-    for category in ("classes", "objects"):
-        identities = [item.get("id") for item in records[category]]
-        if any(not isinstance(item, str) or not item for item in identities) or len(set(identities)) != len(identities):
-            raise ValueError(f"{category} require unique stable IDs")
-        for item in records[category]:
-            if item.get("namespaceId", namespace_id) != namespace_id:
-                raise ValueError("Entity Namespace attribute contradicts graph metadata")
-    membership_by_object = {}
-    for membership in records["memberships"]:
-        if not isinstance(membership.get("id"), str) or membership["id"] in edge_ids:
-            raise ValueError("Membership edges require unique stable IDs")
-        edge_ids.add(membership["id"])
-        if membership.get("objectId") not in objects or membership.get("classId") not in classes:
-            raise ValueError("Membership endpoint is missing from the graph")
-        prior = membership_by_object.setdefault(membership["objectId"], membership["classId"])
-        if prior != membership["classId"]:
-            raise ValueError("Object has inconsistent Membership edges")
-    if set(membership_by_object) != set(objects):
-        raise ValueError("Every Object requires exactly one explicit Membership edge")
-    for object_id, item in objects.items():
-        if membership_by_object[object_id] != item.get("classId"):
-            raise ValueError("Membership edge contradicts Object classId")
-    declarations = {cid: {d.get("name"): d for d in record.get("descriptors", []) if isinstance(d, dict)} for cid, record in classes.items()}
-    declaration_ids = set()
-    for class_id, class_record in classes.items():
-        names = set()
-        for declaration in class_record.get("descriptors", []):
-            if (
-                not isinstance(declaration, Mapping)
-                or not isinstance(declaration.get("id"), str)
-                or not declaration["id"]
-                or not isinstance(declaration.get("name"), str)
-                or not declaration["name"]
-                or not isinstance(declaration.get("type"), str)
-                or not declaration["type"]
-                or type(declaration.get("order", 0)) is not int
-                or declaration.get("order", 0) < 0
-            ):
-                raise ValueError("Class declarations require stable IDs, names, types and valid order")
-            if declaration["id"] in declaration_ids or declaration["name"] in names:
-                raise ValueError("Class declarations must have unique IDs and names")
-            declaration_ids.add(declaration["id"])
-            names.add(declaration["name"])
-    descriptor_ids = set()
-    for descriptor in records["descriptors"]:
-        if (
-            not isinstance(descriptor.get("id"), str)
-            or not descriptor["id"]
-            or descriptor["id"] in descriptor_ids
-            or descriptor.get("namespaceId", namespace_id) != namespace_id
-        ):
-            raise ValueError("Descriptors require unique stable IDs in the graph Namespace")
-        descriptor_ids.add(descriptor["id"])
-        owner = descriptor.get("objectId")
-        if owner not in objects:
-            raise ValueError("Descriptor references a missing Object")
-        declaration = declarations[objects[owner]["classId"]].get(descriptor.get("name"))
-        if declaration is None:
-            raise ValueError("Descriptor has no included Class declaration")
-    geometry_by_id = {item.get("id"): item for item in records["geometries"]}
-    if len(geometry_by_id) != len(records["geometries"]) or None in geometry_by_id:
-        raise ValueError("Geometry records require unique stable IDs")
-    descriptor_by_id = {item.get("id"): item for item in records["descriptors"]}
-    geometry_descriptor_ids = set()
-    for descriptor in records["descriptors"]:
-        payload = descriptor.get("value")
-        if isinstance(payload, Mapping) and payload.get("geometryId"):
-            geometry = geometry_by_id.get(payload["geometryId"])
-            if (
-                geometry is None
-                or geometry.get("id") != payload["geometryId"]
-                or geometry.get("descriptorId") != descriptor.get("id")
-                or geometry.get("namespaceId", namespace_id) != namespace_id
-                or descriptor.get("id") in geometry_descriptor_ids
-            ):
-                raise ValueError("Geometry Descriptor reference is incomplete or inconsistent")
-            geometry_descriptor_ids.add(descriptor["id"])
-            for field in ("geometryType", "wkt", "srid", "verticalSrid", "axisOrder", "dimensions"):
-                if field not in geometry or field not in payload or geometry[field] != payload[field]:
-                    raise ValueError(f"Geometry Descriptor and geometry record disagree on {field}")
-            if not isinstance(geometry["wkt"], str) or not geometry["wkt"]:
-                raise ValueError("Geometry record requires nonempty WKT")
-            if type(geometry["dimensions"]) is not int or geometry["dimensions"] not in {2, 3}:
-                raise ValueError("Geometry record has invalid dimensions")
-            if geometry["axisOrder"] not in {"xy", "yx"}:
-                raise ValueError("Geometry record has invalid axis order")
-            if geometry["srid"] is not None and type(geometry["srid"]) is not int:
-                raise ValueError("Geometry record has invalid SRID")
-            if geometry["verticalSrid"] is not None and type(geometry["verticalSrid"]) is not int:
-                raise ValueError("Geometry record has invalid vertical SRID")
-    for geometry in records["geometries"]:
-        if geometry.get("descriptorId") not in descriptor_by_id or geometry.get("descriptorId") not in geometry_descriptor_ids:
-            raise ValueError("Geometry record has no matching Descriptor reference")
-    for category in ("relationships", "classRelationships"):
-        for edge in records[category]:
-            if not isinstance(edge.get("id"), str) or edge["id"] in edge_ids:
-                raise ValueError("Relationship edges require unique stable IDs")
-            edge_ids.add(edge["id"])
-            known = objects if category == "relationships" else classes
-            if edge.get("sourceId") not in known or edge.get("targetId") not in known:
-                raise ValueError("Relationship endpoint is missing from the graph")
-
-
-def _contains_resource_reference(value):
-    if isinstance(value, Mapping):
-        if "resourceId" in value or value.get("kind") in {"Resource", "DResource"} or value.get("entityKind") in {"Resource", "DResource"}:
-            return True
-        return any(_contains_resource_reference(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_resource_reference(item) for item in value)
-    return False
+def _is_visible_descriptor_record(value, *, namespace_id, object_id, name):
+    """Recognize only the complete visible-record shape, not a scientific map."""
+    return (
+        isinstance(value, Mapping)
+        and value.get("kind") == "Descriptor"
+        and isinstance(value.get("id"), str) and bool(value.get("id"))
+        and isinstance(value.get("namespaceId"), str) and bool(value.get("namespaceId"))
+        and isinstance(value.get("objectId"), str) and bool(value.get("objectId"))
+        and isinstance(value.get("name"), str) and bool(value.get("name"))
+        and "value" in value
+        and value.get("namespaceId") == namespace_id
+        and value.get("objectId") == object_id
+        and value.get("name") == name
+    )
 
 
 def read_export_result(store, result):
