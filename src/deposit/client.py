@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from importlib.metadata import version as distribution_version
 from importlib.resources import files
 from pathlib import Path
@@ -42,6 +43,7 @@ class Client:
         self._version: str | None = None
         self._stores = set()
         self._recovery_journals = {}
+        self._import_workflow_stores = {}
 
     def _session(self):
         if self._closed:
@@ -392,6 +394,248 @@ class Client:
         records = journal.records_all()
         self._recovery_journals.update({record["public_id"]: journal for record in records})
         return tuple(recovered_operation(record, journal=journal) for record in records if record["state"] == "released")
+
+    def pending_imports(self, *, recovery_directory: str | Path | None = None):
+        """Discover safe durable workflow references, including retained terminal outcomes."""
+        from ._import_workflows import ImportWorkflowStore
+        from ._recovery.journal import ProtectedJournal
+        journal = ProtectedJournal(recovery_directory)
+        workflows = ImportWorkflowStore(journal.storage)
+        pending = workflows.pending()
+        for workflow in pending:
+            self._import_workflow_stores[workflow.id] = workflows
+        return iter(pending)
+
+    def inspect_import(self, workflow):
+        """Inspect one local workflow record without authenticating or acting remotely."""
+        from ._import_workflows import ImportWorkflow, ImportWorkflowStore
+        if not isinstance(workflow, ImportWorkflow):
+            raise TypeError("workflow must be an ImportWorkflow reference")
+        workflows = self._import_workflow_stores.get(workflow.id)
+        if workflows is not None:
+            return workflows.status(workflow.id)
+        for store in tuple(self._stores):
+            if store._namespace_id == workflow.target_namespace_id:
+                workflows = ImportWorkflowStore(store._journal.storage)
+                self._import_workflow_stores[workflow.id] = workflows
+                return workflows.status(workflow.id)
+        raise ValueError("Open the receiving Store or supply its recovery directory to pending_imports")
+
+    def resume_import(self, workflow, *, target_store, source_store=None):
+        """Resume exact frozen work; PLAN_READY remains an explicit apply barrier."""
+        from ._import_workflows import ImportWorkflow, ImportWorkflowStore
+        from .exchange import ExchangeBundle
+        if not isinstance(workflow, ImportWorkflow):
+            raise TypeError("workflow must be an ImportWorkflow reference")
+        if getattr(target_store, "_client", None) is not self:
+            raise ValueError("target_store must belong to this Client")
+        workflows = ImportWorkflowStore(target_store._journal.storage)
+        with workflows.lock(workflow.id):
+            record = workflows.get(workflow.id)
+            self._check_import_bindings(record, target_store, source_store)
+            state = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
+            if state in {"ABANDON_REQUESTED", "ABANDON_PENDING"}:
+                return self._abandon_import_locked(workflows, workflow.id, target_store, source_store)
+            if state in {"APPLIED", "FAILED", "CANCELLED", "EXPIRED", "ABANDONED"}:
+                target_store._cleanup_import_workflow(workflows, workflow.id, source_store=source_store)
+                return workflows.status(workflow.id)
+            if state == "PLAN_READY":
+                # This bounded observation never analyzes or applies.
+                target_store._observe_import_plan(workflows, workflow.id)
+                return workflows.status(workflow.id)
+            try:
+                if record["apply_requested"]:
+                    result = target_store._apply_import_workflow(workflows, workflow.id)
+                    return workflows.status(workflow.id, result=result)
+                if state in {"TARGET_PACKAGE_READY", "ANALYSIS_REQUESTED"}:
+                    if record["routing_decision"] == "same_server_actor_grant" and source_store is not None:
+                        with ExchangeBundle(source_store, record["source_export_result"], workflow_id=workflow.id) as bundle:
+                            bundle._stage_id = record["source_stage_id"] or bundle._stage_id
+                            result = target_store._analyze_import_bundle(bundle, record["frozen_rules"], workflows,
+                                                                       workflows.reference(record))
+                    else:
+                        try:
+                            result = target_store._workflow_analysis(workflows, workflow.id)
+                        except DepositError as exc:
+                            if (record["routing_decision"] == "same_server_actor_grant"
+                                    and target_store._relay_after_direct_denial(workflows, workflow.id, exc)):
+                                return workflows.status(workflow.id)
+                            raise
+                    return workflows.status(workflow.id, result=result)
+                # A complete receiving stage no longer depends on a source session.
+                if record["package_stage_id"]:
+                    from .exchange import DurableExchangeFile
+                    storage = target_store._journal.storage
+                    manifest_name = f"import-stage-{record['package_stage_id']}-manifest"
+                    # Only a successful presence check proves the pre-manifest
+                    # crash window. Present corrupt/inaccessible checkpoints
+                    # remain errors and must never be replaced during recovery.
+                    if storage.has_record(manifest_name):
+                        stage = DurableExchangeFile(storage, record["package_stage_id"], identity=record["target_identity"])
+                        complete = stage.manifest["complete"]
+                        stage.close()
+                        if complete:
+                            result = target_store._continue_import_workflow(workflows, workflow.id)
+                            return workflows.status(workflow.id, result=result)
+                    if record["source_namespace_id"] is None:
+                        raise DepositError("IMPORT_FREEZE_INTERRUPTED", "Caller input was lost before the immutable freeze completed")
+                if record["source_namespace_id"] is not None:
+                    if source_store is None:
+                        return workflows.status(workflow.id)
+                    export_result = record["source_export_result"]
+                    if export_result is None:
+                        export_key = record["action_keys"].get("export")
+                        if not isinstance(export_key, str):
+                            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Source export action reference is missing")
+                        export_result = source_store._workflow_action(export_key, "deposit.save.data",
+                                                                     record["source_export_arguments"])
+                        workflows.update(workflow.id, state="SOURCE_REFERENCE_READY", phase="source_reference_ready",
+                                         source_export_result=export_result)
+                    with ExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
+                        bundle._stage_id = record["source_stage_id"] or bundle._stage_id
+                        result = target_store._import_exchange_workflow(bundle, record["frozen_rules"], workflows,
+                                                                       workflows.reference(record))
+                    return workflows.status(workflow.id, result=result)
+                if state in {"CREATED", "SOURCE_STAGING"}:
+                    raise DepositError("IMPORT_FREEZE_INTERRUPTED", "Caller input was lost before the immutable freeze completed")
+                result = target_store._continue_import_workflow(workflows, workflow.id)
+                return workflows.status(workflow.id, result=result)
+            except Exception as exc:
+                target_store._import_workflow_failure(workflows, workflow.id, exc)
+                raise
+
+    @staticmethod
+    def _check_import_bindings(record, target_store, source_store):
+        if (record["target_namespace_id"] != target_store.namespace_id
+                or record["target_identity"] != target_store._identity.to_dict()):
+            raise DepositError("IDENTITY_MISMATCH", "Receiving Store does not match the workflow binding")
+        if source_store is not None and (source_store.namespace_id != record["source_namespace_id"]
+                or source_store._identity.to_dict() != record["source_identity"]):
+            raise DepositError("IDENTITY_MISMATCH", "Source Store does not match the workflow binding")
+
+    def abandon_import(self, workflow, *, target_store=None, source_store=None):
+        """Release local ownership once existing actions and plan ownership resolve."""
+        from ._import_workflows import ImportWorkflow, ImportWorkflowStore
+        if not isinstance(workflow, ImportWorkflow):
+            raise TypeError("workflow must be an ImportWorkflow reference")
+        selected = target_store
+        if selected is None:
+            selected = next((store for store in tuple(self._stores)
+                             if store._namespace_id == workflow.target_namespace_id), None)
+        if selected is None or selected._client is not self:
+            raise ValueError("An authenticated receiving Store is required to abandon this workflow")
+        workflows = ImportWorkflowStore(selected._journal.storage)
+        with workflows.lock(workflow.id):
+            record = workflows.get(workflow.id)
+            self._check_import_bindings(record, selected, source_store)
+            if record["state"] in {"APPLIED", "ABANDONED", "FAILED", "EXPIRED", "CANCELLED"}:
+                selected._cleanup_import_workflow(workflows, workflow.id, source_store=source_store)
+                return workflows.status(workflow.id)
+            if record["state"] not in {"ABANDON_REQUESTED", "ABANDON_PENDING"}:
+                workflows.update(workflow.id, resume_state=(record["resume_state"] or record["state"]),
+                                 state="ABANDON_REQUESTED", phase="abandon_requested")
+            return self._abandon_import_locked(workflows, workflow.id, selected, source_store)
+
+    def _abandon_import_locked(self, workflows, workflow_id, target, source):
+        from ._recovery.identity import DeploymentIdentity
+        from ._recovery.transfers import ProtectedTransferSpool
+        record = workflows.get(workflow_id)
+        unresolved = False
+        actions = dict(record["action_keys"])
+        spool = ProtectedTransferSpool(target._journal, target._identity)
+        manifest = None
+        if record["upload_id"] and target._journal.storage.has_record(f"transfer-{record['upload_id']}-manifest"):
+            manifest = spool.load(record["upload_id"])
+            for name, field in (("upload_begin", "begin_action_key"), ("upload_chunk", "pending_action_key"),
+                                ("upload_finish", "finish_action_key")):
+                if manifest[field] is not None:
+                    actions[name] = manifest[field]
+        # Observe only known actions. Abandon does not prepare/execute original
+        # analysis or apply; a prepared unexecuted action uses existing release.
+        for name, key in actions.items():
+            if name == "upload_transfer":
+                continue
+            store = source if name == "export" else target
+            identity = (DeploymentIdentity.from_dict(record["source_identity"]) if name == "export" else target._identity)
+            journal = store._journal if store is not None else target._journal
+            action = journal.load_if_present(identity, key)
+            if action is None:
+                # Source journals can live in a different protected root.
+                unresolved |= store is None
+                continue
+            if action["state"] in {"failed", "conflicted"}:
+                continue
+            envelope = action.get("outcome") if action["state"] == "released" else None
+            if envelope is None:
+                if store is None:
+                    unresolved = True
+                    continue
+                with store._serialized():
+                    try:
+                        status = store._control("deposit.action.status", key)
+                    except DepositError as exc:
+                        if exc.code != "NOT_FOUND" or action["state"] not in {"intent", "prepare_sent"}:
+                            raise
+                        status = {"state": "absent"}
+                    if status.get("state") == "committed":
+                        envelope = store._save_and_release(action, status)
+                    elif status.get("state") in {"prepared", "absent"}:
+                        failure = {"code": "CANCELLED", "message": "Import action ownership was abandoned",
+                                   "details": {}, "request_id": None, "retryable": False}
+                        if status["state"] == "absent":
+                            store._journal.update(identity, key, state="failed", failure=failure)
+                        else:
+                            failed = store._journal.update(identity, key, state="failure_saved", failure=failure)
+                            try:
+                                envelope = store._finish_failed_action(failed, status=status)
+                            except DepositError as exc:
+                                if exc.code != "CANCELLED":
+                                    raise
+                    else:
+                        unresolved = True
+            if envelope is not None and name in {"analysis", "apply"}:
+                result = target._import_result(key, envelope)
+                try:
+                    if name == "analysis" and result["kind"] != "diagnostic":
+                        workflows.update(workflow_id, plan_id=result.plan_id, result_action_key=key,
+                                         plan_expires_at=(workflows.get(workflow_id)["plan_expires_at"]
+                                             if workflows.get(workflow_id)["plan_expires_at"] is not None else result["expiresAt"]))
+                    elif name == "apply":
+                        workflows.update(workflow_id, state="APPLIED", phase="applied", result_action_key=key)
+                finally:
+                    result.close()
+        record = workflows.get(workflow_id)
+        if record["state"] == "APPLIED":
+            target._cleanup_import_workflow(workflows, workflow_id, source_store=source)
+            return workflows.status(workflow_id)
+        if record["plan_id"]:
+            observation = target._observe_import_plan(workflows, workflow_id, abandoning=True)
+            if observation in {"ready", "unavailable"}:
+                unresolved = True
+            elif observation == "applied":
+                workflows.update(workflow_id, state="APPLIED", phase="applied")
+        if manifest is not None and manifest["begin_action_key"] is not None and not unresolved:
+            begin = target._journal.load_if_present(target._identity, manifest["begin_action_key"])
+            upload_id = manifest["upload_id"] or ((begin.get("outcome") or {}).get("uploadId") if begin else None)
+            finish = (target._journal.load_if_present(target._identity, manifest["finish_action_key"])
+                      if manifest["finish_action_key"] is not None else None)
+            finished = (manifest["state"] == "finished" or (finish is not None
+                        and finish["state"] == "released" and (finish.get("outcome") or {}).get("state") == "ready"))
+            if upload_id is not None and not finished:
+                abort_key = record["action_keys"].get("upload_abort") or str(uuid.uuid4())
+                workflows.update(workflow_id, action_keys=dict(workflows.get(workflow_id)["action_keys"], upload_abort=abort_key))
+                target._workflow_action(abort_key, "deposit.resource.abortUpload", [upload_id])
+                # This established action releases the upload lease. No new
+                # Server cancellation route or Namespace import effect occurs.
+        current = workflows.get(workflow_id)
+        if current["state"] != "APPLIED":
+            workflows.update(workflow_id, state="ABANDON_PENDING" if unresolved else "ABANDONED",
+                             phase="abandon_pending" if unresolved else "abandoned")
+        if not unresolved:
+            target._cleanup_import_workflow(workflows, workflow_id, source_store=source)
+        else:
+            workflows.update(workflow_id, cleanup_status="pending")
+        return workflows.status(workflow_id)
 
     def recover(self, operation: PendingOperation, *, username: str, password: str) -> RecoveredOperation:
         """Authenticate and resolve one operation reference without exposing its recovery key."""

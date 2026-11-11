@@ -11,6 +11,7 @@ import math
 import mimetypes
 from pathlib import Path
 import threading
+import time
 import weakref
 from typing import Any, Iterator
 import uuid
@@ -659,7 +660,7 @@ class Store:
     def delete_user_tool(self, user_tool_id: str):
         return self._run_action("deposit.delete.userTool", [{"id": _stable_id(user_tool_id)}])
 
-    def upload_resource(self, resource: DResource) -> DResource:
+    def upload_resource(self, resource: DResource, *, _workflow_store=None, _workflow_id=None) -> DResource:
         """Upload a frozen local resource source and return its ready reference."""
         self._assert_not_collecting_batch()
         if not isinstance(resource, DResource):
@@ -685,7 +686,18 @@ class Store:
         if manifest["begin_action_key"] is None:
             spool.ensure_action_capacity(manifest)
         with self._serialized():
-            result = self._resume_upload_locked(resource._transfer_id, spool=spool, already_serialized=True)
+            result = self._resume_upload_locked(
+                resource._transfer_id, spool=spool, already_serialized=True,
+                on_resolved=(lambda value, transfer: _workflow_store.update(
+                    _workflow_id, package_resource_id=value["resourceId"],
+                    upload_id=transfer["transfer_id"], state="TARGET_PACKAGE_READY",
+                    phase="target_package_ready", action_keys={
+                        **_workflow_store.get(_workflow_id)["action_keys"],
+                        "upload_begin": transfer["begin_action_key"],
+                        "upload_finish": transfer["finish_action_key"],
+                    }
+                )) if _workflow_store is not None else None,
+            )
         resource._value.update(result)
         resource._path = None
         resource._stream = None
@@ -792,7 +804,6 @@ class Store:
             raise TypeError("Pattern must be an {id: UUID} selector and form values must be a mapping")
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("Pattern rules must be a mapping")
-        self._client.require_paged_import_results()
         key = str(uuid.uuid4())
         envelope = self._run_action(
             "deposit.import.dataByPattern",
@@ -910,7 +921,6 @@ class Store:
             _portable_input(frozen_relationships),
             _portable_input(dict(rules or {})),
         ]
-        self._client.require_paged_import_results()
         key = str(uuid.uuid4())
         envelope = self._run_action("deposit.import.rows", request, _recovery_key=key,
                                     result_format=RESULT_FORMAT_IMPORT)
@@ -939,6 +949,415 @@ class Store:
             rules=rules, require_subgraph=False,
         )
 
+    def export_exchange(self, *, roots=None, max_hops=None, root_class_boundary=True):
+        """Prepare a checked Exchange export and return its owning bundle."""
+        from .exchange import ExchangeBundle
+        selection = {}
+        if roots is not None:
+            if not isinstance(roots, (list, tuple)):
+                raise TypeError("roots must be a list or tuple of Object selectors")
+            selection["rootIds"] = [_portable_input(root) for root in roots]
+        if type(root_class_boundary) is not bool:
+            raise TypeError("root_class_boundary must be a bool")
+        options = {"rootClassBoundary": bool(root_class_boundary)}
+        if max_hops is not None:
+            if type(max_hops) is not int or max_hops < 0:
+                raise ValueError("max_hops must be a nonnegative integer or None")
+            options["maxHops"] = max_hops
+        self._client.require_paged_import_results()
+        key = str(uuid.uuid4())
+        result = self._run_action("deposit.save.data", [selection, options], _recovery_key=key)
+        return ExchangeBundle(self, result)
+
+    def import_exchange(self, source, *, rules=None):
+        """Freeze an Exchange input, analyze it, and retain durable workflow ownership."""
+        from ._import_workflows import ImportWorkflowStore
+        if rules is not None and not isinstance(rules, Mapping):
+            raise TypeError("rules must be a mapping")
+        self._client.require_paged_import_results()
+        frozen_rules = _portable_input(dict(rules or {}))
+        workflows = ImportWorkflowStore(self._journal.storage)
+        workflow = workflows.create(source=getattr(source, "source_store", None), target=self)
+        with workflows.lock(workflow.id):
+            workflows.update(workflow.id, frozen_rules=frozen_rules,
+                             analysis_arguments={"rules": frozen_rules})
+            return self._import_exchange_workflow(source, frozen_rules, workflows, workflow)
+
+    def _import_exchange_workflow(self, source, rules, workflows, workflow):
+        from .exchange import ExchangeBundle, DurableExchangeFile, validate_exchange_archive
+        from ._imports import prepared_import_package
+        try:
+            if isinstance(source, ExchangeBundle):
+                source.pin(workflow.id)
+                record = workflows.get(workflow.id)
+                if source._stage is None:
+                    source._stage_id = record["source_stage_id"] or source._stage_id
+                workflows.update(workflow.id, state="SOURCE_STAGING", phase="source_staging",
+                                 source_stage_id=(source._stage_id if source._stage is not None else record["source_stage_id"]),
+                                 source_export_result=source._export_result)
+                result = self._analyze_import_bundle(source, rules, workflows, workflow)
+            elif isinstance(source, Mapping):
+                with prepared_import_package(_portable_input(dict(source)), storage=self._journal.storage) as package:
+                    self._freeze_workflow_package(package._source, workflows, workflow.id)
+                result = self._continue_import_workflow(workflows, workflow.id)
+            else:
+                # Paths are opened here; caller streams are consumed from their
+                # current position once and never closed or reopened by recovery.
+                is_path = isinstance(source, (str, Path))
+                if not is_path and not callable(getattr(source, "read", None)):
+                    # Borrow an already validated protected view without rebuilding it.
+                    from ._imports import _checked_package_view
+                    view = _checked_package_view(source)
+                    if view is None:
+                        raise TypeError("Exchange input must be a package, path, or binary stream")
+                    self._freeze_workflow_package(view._source, workflows, workflow.id)
+                else:
+                    with (Path(source).open("rb") if is_path else nullcontext(source)) as reader:
+                        self._freeze_workflow_package(reader, workflows, workflow.id)
+                record = workflows.get(workflow.id)
+                stage = DurableExchangeFile(self._journal.storage, record["package_stage_id"],
+                                            identity=self._identity.to_dict())
+                try:
+                    stage.seek(0)
+                    with validate_exchange_archive(stage, storage=self._journal.storage):
+                        pass
+                finally:
+                    stage.close()
+                result = self._continue_import_workflow(workflows, workflow.id)
+            return result
+        except Exception as exc:
+            self._import_workflow_failure(workflows, workflow.id, exc)
+            raise
+
+    def _freeze_workflow_package(self, reader, workflows, workflow_id):
+        from .exchange import DurableExchangeFile
+        record = workflows.get(workflow_id)
+        stage_id = record["package_stage_id"] or uuid.uuid4().hex
+        workflows.update(workflow_id, state="SOURCE_STAGING", phase="source_staging", package_stage_id=stage_id)
+        stage = DurableExchangeFile(self._journal.storage, stage_id, identity=self._identity.to_dict(), create=True)
+        try:
+            if not stage.manifest["complete"]:
+                offset = stage.manifest["bytes"]
+                if offset:
+                    reader.seek(offset)
+                while True:
+                    block = reader.read(1024 * 1024)
+                    if not isinstance(block, bytes) or len(block) > 1024 * 1024:
+                        raise TypeError("Exchange stream must return bounded binary bytes")
+                    if not block:
+                        break
+                    stage.write(block)
+                stage.complete()
+            workflows.update(workflow_id, state="SOURCE_STAGED", phase="source_staged")
+        finally:
+            stage.close()
+
+    def _workflow_action(self, key, procedure, arguments, *, import_result=False):
+        """Resolve the exact action, including durable intent before journal creation."""
+        loader = getattr(self._journal, "load_if_present", None)
+        action = loader(self._identity, key) if loader else None
+        if action is not None:
+            if action["procedure"] != procedure or action["arguments"] != arguments:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Frozen import action inputs changed")
+            with self._serialized():
+                return self._resolve_action_locked(action, allow_new_prepare=True)
+        return self._run_action(procedure, arguments, _recovery_key=key,
+                                **({"result_format": RESULT_FORMAT_IMPORT} if import_result else {}))
+
+    def _workflow_analysis(self, workflows, workflow_id):
+        record = workflows.get(workflow_id)
+        key = record["action_keys"].get("analysis") or str(uuid.uuid4())
+        request = record["analysis_arguments"] if isinstance(record["analysis_arguments"], list) else [
+            {"packageResourceId": record["package_resource_id"]}, record["frozen_rules"]]
+        actions = dict(record["action_keys"], analysis=key)
+        workflows.update(workflow_id, state="ANALYSIS_REQUESTED", phase="analysis",
+                         action_keys=actions, analysis_arguments=request)
+        envelope = self._workflow_action(key, "deposit.import.analyze", request, import_result=True)
+        result = self._import_result(key, envelope)
+        if result["kind"] == "diagnostic":
+            workflows.update(workflow_id, state="FAILED", phase="diagnostic", result_action_key=key,
+                             failure="IMPORT_CONFLICT")
+            self._cleanup_import_workflow(workflows, workflow_id)
+            self._raise_import_diagnostic(result)
+        workflows.update(workflow_id, state="PLAN_READY", phase="plan_ready",
+                         plan_id=result.plan_id, result_action_key=key, plan_expires_at=result["expiresAt"],
+                         failure=None, resume_state=None)
+        return result
+
+    def _continue_import_workflow(self, workflows, workflow_id):
+        """Continue only frozen local or remote package boundaries; never apply."""
+        from .exchange import DurableExchangeFile, validate_exchange_archive
+        self._client.require_paged_import_results()
+        record = workflows.get(workflow_id)
+        state = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
+        if state in {"TARGET_PACKAGE_READY", "ANALYSIS_REQUESTED"}:
+            return self._workflow_analysis(workflows, workflow_id)
+        if state not in {"SOURCE_STAGED", "ROUTING_DECIDED", "TARGET_UPLOAD", "SOURCE_STAGING"}:
+            return None
+        if record["routing_decision"] == "same_server_actor_grant" and record["package_resource_id"]:
+            return self._workflow_analysis(workflows, workflow_id)
+        stage_id = record["package_stage_id"]
+        if not stage_id:
+            return None
+        stage = DurableExchangeFile(self._journal.storage, stage_id, identity=self._identity.to_dict())
+        try:
+            if not stage.manifest["complete"]:
+                # No caller input may replace a partial freeze during recovery.
+                raise DepositError("IMPORT_FREEZE_INTERRUPTED", "Exchange input freeze was interrupted before completion")
+            with stage.reader() as reader:
+                with validate_exchange_archive(reader, storage=self._journal.storage):
+                    pass
+                reader.seek(0)
+                spool = ProtectedTransferSpool(self._journal, self._identity)
+                transfer_id = record["upload_id"]
+                if transfer_id:
+                    # The first spool checkpoint is persisted after workflow intent.
+                    # Absence proves no upload action was prepared; exact bytes remain.
+                    if not self._journal.storage.has_record(spool._manifest_name(transfer_id)):
+                        transfer_id = None
+                    else:
+                        manifest = spool.load(transfer_id)
+                        if manifest["state"] == "staging":
+                            if any(manifest.get(k) for k in ("begin_action_key", "finish_action_key", "pending_action_key")):
+                                raise DepositError("RECOVERY_DEFERRED", "Partial spool has unresolved action ownership")
+                            with self._journal.storage.lock(spool._lock_name(transfer_id)):
+                                for name in self._journal.storage.list_records():
+                                    if name.startswith(f"transfer-{transfer_id}-"):
+                                        self._journal.storage.delete(name)
+                                self._journal.storage.delete(f"admission-{manifest['admission_id']}")
+                            transfer_id = None
+                if transfer_id is None:
+                    original_save = spool._save
+                    def save(manifest, *, creating=False):
+                        if creating:
+                            workflows.update(workflow_id, state="TARGET_UPLOAD", phase="target_upload",
+                                             upload_id=manifest["transfer_id"])
+                        return original_save(manifest, creating=creating)
+                    spool._save = save
+                    transfer_id = spool.freeze(reader, filename="deposit-import.zip", media_type="application/zip")["transfer_id"]
+                workflows.update(workflow_id, state="TARGET_UPLOAD", phase="target_upload", upload_id=transfer_id)
+                def saved(value, transfer):
+                    current = workflows.get(workflow_id)
+                    actions = dict(current["action_keys"], upload_begin=transfer["begin_action_key"],
+                                   upload_finish=transfer["finish_action_key"])
+                    workflows.update(workflow_id, state="TARGET_PACKAGE_READY", phase="target_package_ready",
+                                     package_resource_id=value["resourceId"], action_keys=actions)
+                with self._serialized():
+                    uploaded = self._resume_upload_locked(transfer_id, spool=spool,
+                        already_serialized=True, on_resolved=saved)
+                # Reconcile an interrupted acknowledgement after the upload callback.
+                if workflows.get(workflow_id)["state"] != "TARGET_PACKAGE_READY":
+                    saved(uploaded, spool.load(transfer_id))
+            return self._workflow_analysis(workflows, workflow_id)
+        finally:
+            stage.close()
+
+    def _direct_import_eligible(self, bundle):
+        """Require live provenance, actor context and a currently accessible grant."""
+        from ._recovery.identity import read_deployment_identity, IdentityUnavailableError
+        source = bundle.source_store
+        if source._identity.to_dict() != bundle.source_binding:
+            return False
+        try:
+            identities = []
+            for store in (source, self):
+                client = store._client
+                current = read_deployment_identity(client._driver, database=client._database,
+                    actor_id=store._identity.actor_id, namespace_id=store.namespace_id)
+                profile = client.get_session(store._token)
+                if (current != store._identity or profile.get("user", {}).get("id") != current.actor_id
+                        or profile.get("namespaceId") != current.namespace_id):
+                    return False
+                identities.append(current)
+            left, right = identities
+            if (left.endpoint, left.database_name, left.database_id, left.dbms_id, left.actor_id) != (
+                right.endpoint, right.database_name, right.database_id, right.dbms_id, right.actor_id):
+                return False
+            if not isinstance(bundle.package_reference, str) or not bundle.package_reference:
+                return False
+            # Resource info enforces current source Namespace role/history grant.
+            # Same live actor/deployment then qualifies for Server analysis checks.
+            metadata = source._call_one("deposit.resource.info", bundle.package_reference)
+            return isinstance(metadata, dict) and metadata.get("resourceId") == bundle.package_reference
+        except (IdentityUnavailableError, AttributeError, DepositError):
+            return False
+
+    def _analyze_import_bundle(self, bundle, rules, workflows, workflow):
+        self._client.require_paged_import_results()
+        record = workflows.get(workflow.id)
+        direct = record["routing_decision"] == "same_server_actor_grant" or (
+            record["routing_decision"] is None and self._direct_import_eligible(bundle))
+        if direct:
+            workflows.update(workflow.id, state="ROUTING_DECIDED", phase="direct_handoff",
+                             routing_decision="same_server_actor_grant", package_resource_id=bundle.package_reference)
+            try:
+                return self._workflow_analysis(workflows, workflow.id)
+            except DepositError as exc:
+                # _workflow_action resolves the original journal before returning
+                # a definitive denial. Transport/result uncertainty never reroutes.
+                if not self._relay_after_direct_denial(workflows, workflow.id, exc):
+                    raise
+        workflows.update(workflow.id, state="ROUTING_DECIDED", phase="client_relay",
+                         routing_decision="authenticated_client_relay", source_stage_id=bundle._stage_id)
+        bundle.materialize()
+        with bundle.open_package_stream() as reader:
+            self._freeze_workflow_package(reader, workflows, workflow.id)
+        return self._continue_import_workflow(workflows, workflow.id)
+
+    def _relay_after_direct_denial(self, workflows, workflow_id, exc):
+        current = workflows.get(workflow_id)
+        original_key = current["action_keys"].get("analysis")
+        original = self._journal.load_if_present(self._identity, original_key) if original_key else None
+        if (exc.code not in {"NOT_FOUND", "FORBIDDEN"} or original is None
+                or original["state"] != "failed" or original["failure"]["code"] != exc.code):
+            return False
+        actions = dict(current["action_keys"])
+        actions["direct_analysis"] = actions.pop("analysis")
+        workflows.update(workflow_id, state="ROUTING_DECIDED", phase="relay_source_required",
+                         routing_decision="authenticated_client_relay", action_keys=actions,
+                         analysis_arguments={"rules": current["frozen_rules"]}, package_resource_id=None,
+                         resume_state=None, failure=None)
+        return True
+
+    def _import_workflow_failure(self, workflows, workflow_id, exc):
+        record = workflows.get(workflow_id)
+        if record["state"] in {"FAILED", "CANCELLED", "EXPIRED", "ABANDONED", "APPLIED"}:
+            return
+        code = getattr(exc, "code", None)
+        terminal = {"IMPORT_CONFLICT": "FAILED", "IMPORT_FREEZE_INTERRUPTED": "FAILED",
+                    "CANCELLED": "CANCELLED", "OPERATION_CANCELLED": "CANCELLED",
+                    "PLAN_EXPIRED": "EXPIRED", "EXPIRED": "EXPIRED",
+                    "FORBIDDEN": "FAILED", "UNAUTHENTICATED": "FAILED", "NOT_FOUND": "FAILED"}
+        state = terminal.get(code)
+        if (code == "NOT_FOUND" and record["apply_requested"] and record["plan_expires_at"] is not None
+                and record["plan_expires_at"] <= int(time.time() * 1000)):
+            state = "EXPIRED"
+        # A response code during receipt lookup is not evidence of rollback.
+        # Only finalized local action failures authorize terminal classification.
+        active_key = record["action_keys"].get("apply" if record["apply_requested"] else "analysis")
+        if active_key is not None and state is not None:
+            action = self._journal.load_if_present(self._identity, active_key)
+            if action is not None and action["state"] not in {"failed", "conflicted"}:
+                state = None
+        if state is None and not record["action_keys"] and not record["source_namespace_id"]:
+            state = "FAILED"
+        if state:
+            workflows.update(workflow_id, state=state, phase=state.lower(), failure=code or type(exc).__name__)
+            self._cleanup_import_workflow(workflows, workflow_id)
+        else:
+            previous = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
+            workflows.update(workflow_id, state="OUTCOME_UNCERTAIN", resume_state=previous,
+                             failure=code or type(exc).__name__)
+
+    def _observe_import_plan(self, workflows, workflow_id, *, abandoning=False):
+        record = workflows.get(workflow_id)
+        if not record["plan_id"]:
+            return None
+        try:
+            wrapper = self._call_one("deposit.get.importPlan", record["plan_id"])
+        except DepositError as exc:
+            if exc.code not in {"NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED"}:
+                raise
+            # NOT_FOUND intentionally hides authorization as well as expiry;
+            # retain that distinction rather than inventing an expiry reason.
+            expired = record["plan_expires_at"] is not None and record["plan_expires_at"] <= int(time.time() * 1000)
+            if not abandoning:
+                workflows.update(workflow_id, state="EXPIRED" if expired else "FAILED",
+                                 phase="expired" if expired else "plan_unavailable", failure=exc.code)
+                self._cleanup_import_workflow(workflows, workflow_id)
+            return "expired" if expired else "unavailable"
+        if not valid_import_plan_wrapper(wrapper, plan_id=record["plan_id"], namespace_id=self.namespace_id):
+            raise DepositError("INVALID_RESPONSE", "Import plan observation returned an invalid wrapper")
+        state = wrapper["plan"]["state"]
+        if state == "applied" and not record["apply_requested"]:
+            workflows.update(workflow_id, state="APPLIED", phase="applied")
+            self._cleanup_import_workflow(workflows, workflow_id)
+        return state
+
+    def _cleanup_import_workflow(self, workflows, workflow_id, *, source_store=None):
+        from .exchange import DurableExchangeFile
+        record = workflows.get(workflow_id)
+        pending = False
+        for stage_id, store in ((record["package_stage_id"], self), (record["source_stage_id"], source_store)):
+            if not stage_id:
+                continue
+            if store is None:
+                if self._journal.storage.has_record(f"import-stage-{stage_id}-manifest"):
+                    storage, identity = self._journal.storage, record["source_identity"]
+                else:
+                    pending = True
+                    continue
+            else:
+                storage, identity = store._journal.storage, store._identity.to_dict()
+            try:
+                pending |= not DurableExchangeFile.release_owned(storage, stage_id, workflow_id=workflow_id)
+            except Exception:
+                pending = True
+        transfer_id = record["upload_id"]
+        if transfer_id and self._journal.storage.has_record(f"transfer-{transfer_id}-manifest"):
+            spool = ProtectedTransferSpool(self._journal, self._identity)
+            try:
+                with self._journal.storage.lock(spool._lock_name(transfer_id)):
+                    manifest = spool.load(transfer_id)
+                    finish = (self._journal.load_if_present(self._identity, manifest["finish_action_key"])
+                              if manifest["finish_action_key"] is not None else None)
+                    abort_key = record["action_keys"].get("upload_abort")
+                    abort = self._journal.load_if_present(self._identity, abort_key) if abort_key else None
+                    aborted = (abort is not None and abort["state"] == "released"
+                               and (abort.get("outcome") or {}).get("aborted") is True)
+                    safe = (aborted or manifest["state"] in {"failed", "finished"}
+                            or (manifest["begin_action_key"] is None)
+                            or (finish is not None and finish["state"] == "released"))
+                    if safe:
+                        for name in self._journal.storage.list_records():
+                            if name.startswith(f"transfer-{transfer_id}-"):
+                                self._journal.storage.delete(name)
+                        self._journal.storage.delete(f"admission-{manifest['admission_id']}")
+                    else:
+                        pending = True
+            except Exception:
+                pending = True
+        workflows.update(workflow_id, cleanup_status="pending" if pending else "complete")
+
+    def import_from(self, source_store, *, roots=None, max_hops=None,
+                    root_class_boundary=True, rules=None):
+        """Import one immutable export using independently authenticated Stores."""
+        from ._import_workflows import ImportWorkflowStore
+        from .exchange import ExchangeBundle
+        if not isinstance(source_store, Store):
+            raise TypeError("source_store must be an authenticated Store")
+        if rules is not None and not isinstance(rules, Mapping):
+            raise TypeError("rules must be a mapping")
+        if roots is not None and not isinstance(roots, (list, tuple)):
+            raise TypeError("roots must be a list or tuple of Object selectors")
+        if type(root_class_boundary) is not bool:
+            raise TypeError("root_class_boundary must be a bool")
+        export_selection = {"rootIds": [_portable_input(root) for root in roots]} if roots is not None else {}
+        export_options = {"rootClassBoundary": root_class_boundary}
+        if max_hops is not None:
+            if type(max_hops) is not int or max_hops < 0:
+                raise ValueError("max_hops must be a nonnegative integer or None")
+            export_options["maxHops"] = max_hops
+        self._client.require_paged_import_results()
+        frozen_rules = _portable_input(dict(rules or {}))
+        export_args = [export_selection, export_options]
+        workflows = ImportWorkflowStore(self._journal.storage)
+        workflow = workflows.create(source=source_store, target=self)
+        with workflows.lock(workflow.id):
+            export_key = str(uuid.uuid4())
+            workflows.update(workflow.id, state="SOURCE_EXPORT_REQUESTED", phase="source_export",
+                action_keys={"export": export_key}, source_export_arguments=export_args,
+                frozen_rules=frozen_rules, analysis_arguments={"rules": frozen_rules})
+            try:
+                export_result = source_store._workflow_action(export_key, "deposit.save.data", export_args)
+                workflows.update(workflow.id, state="SOURCE_REFERENCE_READY", phase="source_reference_ready",
+                                 source_export_result=export_result)
+                with ExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
+                    return self._import_exchange_workflow(bundle, frozen_rules, workflows, workflow)
+            except Exception as exc:
+                self._import_workflow_failure(workflows, workflow.id, exc)
+                raise
+
     def _analyze_import_snapshot(
         self,
         source,
@@ -947,6 +1366,9 @@ class Store:
         resource_source=None,
         rules: Mapping[str, Any] | None,
         require_subgraph: bool,
+        _workflow_store=None,
+        _workflow_id=None,
+        _verified_package_stream=None,
     ) -> dict[str, Any]:
         from ._imports import _checked_package_view
         package_source = (_checked_package_view(source) is not None or
@@ -963,14 +1385,28 @@ class Store:
         frozen_source = source if package_source else _portable_input(dict(source))
         frozen_rules = _portable_input(dict(rules or {}))
         from ._imports import prepared_import_package
-        with prepared_import_package(
-            frozen_source, resources=resources, resource_source=resource_source,
-            storage=self._journal.storage, require_subgraph=require_subgraph,
-        ) as package:
-            package_source = package._source
+        if _workflow_store is not None:
+            if _verified_package_stream is not None:
+                self._freeze_workflow_package(_verified_package_stream, _workflow_store, _workflow_id)
+            else:
+                with prepared_import_package(frozen_source, resources=resources, resource_source=resource_source,
+                    storage=self._journal.storage, require_subgraph=require_subgraph) as package:
+                    self._freeze_workflow_package(package._source, _workflow_store, _workflow_id)
+            return self._continue_import_workflow(_workflow_store, _workflow_id)
+        def upload_package(package_source):
             package_source.seek(0)
             package_resource = DResource(stream=package_source, filename="deposit-import.zip")
             self.upload_resource(package_resource)
+            return package_resource
+
+        if _verified_package_stream is not None:
+            package_resource = upload_package(_verified_package_stream)
+        else:
+            with prepared_import_package(
+                frozen_source, resources=resources, resource_source=resource_source,
+                storage=self._journal.storage, require_subgraph=require_subgraph,
+            ) as package:
+                package_resource = upload_package(package._source)
         resource_id = package_resource.resource_id
         if not isinstance(resource_id, str) or not resource_id:
             raise DepositError("INVALID_RESPONSE", "Exchange package upload returned no resource ID")
@@ -999,15 +1435,56 @@ class Store:
         failure.import_result = result
         raise failure
 
-    def import_apply(self, plan_id: str) -> dict[str, Any]:
-        """Atomically apply the complete server plan through prepared recovery."""
+    def import_apply(self, plan_id: str):
+        """Persist explicit apply intent and retain ownership through its result."""
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("plan_id must be a nonempty string")
         self._client.require_paged_import_results()
-        key = str(uuid.uuid4())
-        envelope = self._run_action("deposit.import.apply", [plan_id], _recovery_key=key,
-                                    result_format=RESULT_FORMAT_IMPORT)
-        return self._import_result(key, envelope)
+        from ._import_workflows import ImportWorkflowStore
+        workflows = ImportWorkflowStore(self._journal.storage)
+        candidates = workflows.matching_plan(plan_id)
+        matches = [record for record in candidates if record["target_identity"] == self._identity.to_dict()
+                   and record["target_namespace_id"] == self.namespace_id]
+        if candidates and not matches:
+            raise DepositError("IDENTITY_MISMATCH", "Import plan workflow belongs to another authenticated Store")
+        if not matches:
+            key = str(uuid.uuid4())
+            return self._import_result(key, self._workflow_action(key, "deposit.import.apply", [plan_id], import_result=True))
+        workflow_id = matches[-1]["workflow_id"]
+        with workflows.lock(workflow_id):
+            record = workflows.get(workflow_id)
+            if record["target_identity"] != self._identity.to_dict() or record["target_namespace_id"] != self.namespace_id:
+                raise DepositError("IDENTITY_MISMATCH", "Import workflow target binding changed before apply")
+            if record["state"] not in {"PLAN_READY", "APPLY_REQUESTED", "APPLYING", "OUTCOME_UNCERTAIN", "APPLIED"}:
+                raise DepositError("IMPORT_WORKFLOW_BUSY", "Import workflow cannot accept apply intent")
+            if record["state"] == "PLAN_READY":
+                key = str(uuid.uuid4())
+                workflows.update(workflow_id, state="APPLY_REQUESTED", phase="apply_requested", apply_requested=True,
+                                 action_keys=dict(record["action_keys"], apply=key))
+            else:
+                key = record["action_keys"].get("apply")
+                if not record["apply_requested"] or not isinstance(key, str):
+                    raise DepositError("RECOVERY_DEFERRED", "Apply action has no durable explicit intent")
+            return self._apply_import_workflow(workflows, workflow_id)
+
+    def _apply_import_workflow(self, workflows, workflow_id):
+        record = workflows.get(workflow_id)
+        if record["target_identity"] != self._identity.to_dict() or record["target_namespace_id"] != self.namespace_id:
+            raise DepositError("IDENTITY_MISMATCH", "Import workflow target binding does not match apply Store")
+        key = record["action_keys"].get("apply")
+        if not record["apply_requested"] or not isinstance(key, str):
+            raise DepositError("RECOVERY_DEFERRED", "Apply action has no durable explicit intent")
+        try:
+            workflows.update(workflow_id, state="APPLYING", phase="applying")
+            envelope = self._workflow_action(key, "deposit.import.apply", [record["plan_id"]], import_result=True)
+            result = self._import_result(key, envelope)
+            workflows.update(workflow_id, state="APPLIED", phase="applied", result_action_key=key,
+                             failure=None, resume_state=None)
+            self._cleanup_import_workflow(workflows, workflow_id)
+            return result
+        except Exception as exc:
+            self._import_workflow_failure(workflows, workflow_id, exc)
+            raise
 
     def import_inspect(self, plan_id: str):
         """Read a plan's immutable analysis result without applying it."""
@@ -1870,7 +2347,8 @@ class Store:
             self._terminalize_upload_failure_locked(spool, manifest)
             raise
 
-    def _resume_upload_locked(self, transfer_id: str, *, spool=None, already_serialized: bool = False) -> dict[str, Any]:
+    def _resume_upload_locked(self, transfer_id: str, *, spool=None, already_serialized: bool = False,
+                              on_resolved=None) -> dict[str, Any]:
         spool = spool or ProtectedTransferSpool(self._journal, self._identity)
         lock = nullcontext() if already_serialized else self._serialized()
         with lock, self._journal.storage.lock(f"transfer-{transfer_id}", timeout=0.0):
@@ -1994,6 +2472,8 @@ class Store:
                 "bytes": manifest["bytes"],
                 "state": "ready",
             }
+            if on_resolved is not None:
+                on_resolved(result, manifest)
             spool.update(transfer_id, _locked=True, state="finished", offset=manifest["bytes"])
             spool.cleanup_resolved(transfer_id, _locked=True)
             return result
@@ -2105,7 +2585,9 @@ class Store:
                 if (status.get("state") == "prepared"
                         and getattr(exc, "_server_reported", False) is True
                         and exc.retryable is False
-                        and exc.code in _DEFINITIVE_DOMAIN_FAILURE_CODES):
+                        and (exc.code in _DEFINITIVE_DOMAIN_FAILURE_CODES
+                             or (record["procedure"] in {"deposit.import.analyze", "deposit.import.apply"}
+                                 and exc.code in {"CANCELLED", "FORBIDDEN", "UNAUTHENTICATED", "PLAN_EXPIRED"}))):
                     failed = self._journal.update(
                         self._identity, key, state="failure_saved",
                         failure={"code": exc.code, "message": exc.message, "details": exc.details,

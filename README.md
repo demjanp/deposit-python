@@ -100,6 +100,26 @@ passed directly as `data` without separate providers. Typed references and
 graph/domain semantics remain Server-validated. Full-Namespace clone recovery and Client-owned
 server-scope mutation recovery remain deferred.
 
+Portable Exchange workflows use `store.export_exchange(...)` to return a
+context-managed `ExchangeBundle`. The bundle can be inspected lazily or saved
+as a portable ZIP with `bundle.save(path)`. Import a checked bundle or portable
+ZIP path/stream with `store.import_exchange(source, rules=...)`; use
+`target_store.import_from(source_store, ...)` for a Store-to-Store transfer.
+Both methods return an `ImportResult` plan and never apply it automatically.
+Direct handoff is used only when the current Server bindings and package grant
+allow it; otherwise the client relays the same frozen package through the two
+authenticated Stores.
+
+Import workflows persist their frozen inputs and recovery state in protected
+storage. `client.pending_imports()` lists pending and retained terminal workflow
+references without credentials. Inspect locally with `client.inspect_import(workflow)`;
+resume with authenticated `target_store` and, only when source work remains,
+`source_store`. Resume stops at `PLAN_READY` unless explicit apply intent was
+already recorded durably; then it recovers that same apply. To start the apply,
+call `target_store.import_apply(plan_id)`. Call
+`client.abandon_import(workflow, target_store=target_store)` when you want to
+release a workflow; unresolved Server ownership remains pending.
+
 CSV/XLSX/GeoPackage load/save, table paging, history, undo/redo and confirmed
 restore use `store.call(...)` with the exact public Server arguments. Returned
 browser download URLs use independent browser authentication; never append a
@@ -160,8 +180,10 @@ Operations return explicit analysis or action results. Import methods return a
 plan that must be applied; callers should retain its `planId` and returned
 mapping when they need to associate source records with receiver-side IDs.
 Store-scoped pending operations can be recovered through the Store recovery
-methods, subject to the configured protected recovery directory. Recovery does
-not cover full-Namespace clone workflows or Client-owned Server-scope mutations.
+methods, subject to the configured protected recovery directory. Client-owned
+composed Exchange workflows use `pending_imports`, `inspect_import`,
+`resume_import`, and `abandon_import`. Recovery does not cover full-Namespace
+clone workflows or Client-owned Server-scope mutations.
 Close Stores, resources and download readers when finished; incomplete resource
 downloads are reported when a reader closes before all bytes are consumed.
 

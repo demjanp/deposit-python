@@ -282,6 +282,437 @@ class ProtectedChunkFile:
             raise
 
 
+class DurableExchangeFile:
+    """Reopenable immutable chunk checkpoints; short appends never replace a checkpoint."""
+
+    CHUNK_SIZE = _CHUNK_SIZE
+
+    def __init__(self, storage, owner_id, *, identity=None, create=False, verify=True):
+        if not isinstance(owner_id, str) or not re.fullmatch(r"[0-9a-f]{32}", owner_id):
+            raise ValueError("Durable Exchange owner reference is invalid")
+        self.storage, self.owner_id, self.identity = storage, owner_id, identity
+        self.prefix = f"import-stage-{owner_id}"
+        self.manifest_name = self.prefix + "-manifest"
+        self.position, self.closed = 0, False
+        if create and not storage.has_record(self.manifest_name):
+            self.manifest = {"owner_id": owner_id, "identity": identity, "bytes": 0,
+                             "chunk_count": 0, "complete": False}
+            self._save_manifest()
+        else:
+            self.manifest = self._load_manifest()
+        if identity is not None and self.manifest["identity"] != identity:
+            raise ValueError("Durable Exchange staging identity changed")
+        if verify:
+            self._verify_chunks()
+        self.position = self.manifest["bytes"]
+
+    def _write(self, name, data):
+        # Reuse the admitted protected-record writer and its restart reconciler.
+        from ._recovery.journal import ProtectedJournal
+        ProtectedJournal(store=self.storage)._write_protected(name, data)
+
+    def _load_manifest(self):
+        try:
+            value = json.loads(self.storage.read(self.manifest_name).decode("utf-8"))
+        except Exception as exc:
+            raise OSError("Durable Exchange checkpoint is unavailable") from exc
+        if (not isinstance(value, dict) or set(value) != {"owner_id", "identity", "bytes", "chunk_count", "complete"}
+                or value.get("owner_id") != self.owner_id or type(value.get("bytes")) is not int
+                or value["bytes"] < 0 or type(value.get("chunk_count")) is not int
+                or value["chunk_count"] != (value["bytes"] + self.CHUNK_SIZE - 1) // self.CHUNK_SIZE
+                or type(value.get("complete")) is not bool):
+            raise OSError("Durable Exchange checkpoint is corrupt")
+        return value
+
+    def _save_manifest(self):
+        self._write(self.manifest_name, json.dumps(self.manifest, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode())
+
+    def _chunk_name(self, index, *, length=None):
+        length = min(self.CHUNK_SIZE, self.manifest["bytes"] - index * self.CHUNK_SIZE) if length is None else length
+        # Partial chunks use immutable length-qualified generations. A crash
+        # before publishing a larger checkpoint leaves the old tail intact.
+        return f"{self.prefix}-chunk-{index:08x}-{length:08x}"
+
+    def _meta_name(self, index, *, length=None):
+        return self._chunk_name(index, length=length).replace("-chunk-", "-meta-")
+
+    def _verify_chunks(self):
+        for index in range(self.manifest["chunk_count"]):
+            expected = min(self.CHUNK_SIZE, self.manifest["bytes"] - index * self.CHUNK_SIZE)
+            try:
+                data = self.storage.read(self._chunk_name(index))
+                meta = json.loads(self.storage.read(self._meta_name(index)))
+            except Exception as exc:
+                raise OSError("A committed Exchange chunk is missing") from exc
+            if (meta != {"index": index, "bytes": expected, "sha256": hashlib.sha256(data).hexdigest()}
+                    or len(data) != expected):
+                raise OSError("A committed Exchange chunk failed checkpoint verification")
+
+    def write(self, data):
+        self._check()
+        if self.manifest["complete"]:
+            raise OSError("Completed Exchange bytes are immutable")
+        if self.position != self.manifest["bytes"]:
+            raise OSError("Durable Exchange writes must append at the verified checkpoint")
+        view = memoryview(data).cast("B")
+        consumed = 0
+        while consumed < len(view):
+            index, inner = divmod(self.position, self.CHUNK_SIZE)
+            previous = self._chunk_name(index) if inner else None
+            prior = self.storage.read(previous) if inner else b""
+            count = min(self.CHUNK_SIZE - inner, len(view) - consumed)
+            piece = prior + bytes(view[consumed:consumed + count])
+            name = self._chunk_name(index, length=len(piece))
+            meta = self._meta_name(index, length=len(piece))
+            self._write(name, piece)
+            self._write(meta, json.dumps({"index": index, "bytes": len(piece),
+                        "sha256": hashlib.sha256(piece).hexdigest()}, separators=(",", ":")).encode())
+            old_manifest = dict(self.manifest)
+            self.manifest["bytes"] += count
+            self.manifest["chunk_count"] = index + 1
+            try:
+                self._save_manifest()
+            except BaseException:
+                self.manifest = old_manifest
+                raise
+            self.position += count
+            consumed += count
+            if previous:
+                self.storage.delete(previous)
+                self.storage.delete(previous.replace("-chunk-", "-meta-"))
+        return consumed
+
+    def read(self, size=-1):
+        self._check()
+        remaining = max(0, self.manifest["bytes"] - self.position)
+        wanted = remaining if size is None or size < 0 else min(size, remaining)
+        result = bytearray()
+        while len(result) < wanted:
+            index, inner = divmod(self.position, self.CHUNK_SIZE)
+            data = self.storage.read(self._chunk_name(index))
+            count = min(wanted - len(result), len(data) - inner)
+            if count <= 0:
+                raise OSError("Durable Exchange chunk is truncated")
+            result.extend(data[inner:inner + count])
+            self.position += count
+        return bytes(result)
+
+    def seek(self, offset, whence=0):
+        self._check()
+        base = 0 if whence == 0 else self.position if whence == 1 else self.manifest["bytes"] if whence == 2 else None
+        if type(offset) is not int or base is None or base + offset < 0:
+            raise ValueError("Invalid durable Exchange seek")
+        self.position = base + offset
+        return self.position
+
+    def tell(self):
+        self._check()
+        return self.position
+
+    def flush(self):
+        self._check()
+
+    def complete(self):
+        self._check()
+        self._verify_chunks()
+        self.manifest["complete"] = True
+        self._save_manifest()
+
+    def close(self):
+        self.closed = True
+
+    @classmethod
+    def release_owned(cls, storage, owner_id, *, workflow_id=None):
+        if not isinstance(owner_id, str) or not re.fullmatch(r"[0-9a-f]{32}", owner_id):
+            raise ValueError("Durable Exchange owner reference is invalid")
+        # Cleanup authority comes from the authenticated workflow record, not
+        # successful reads of content that may have failed during disk pressure.
+        stage = object.__new__(cls)
+        stage.storage, stage.owner_id = storage, owner_id
+        stage.prefix = f"import-stage-{owner_id}"
+        return stage.cleanup(workflow_id=workflow_id)
+
+    def cleanup(self, *, workflow_id=None):
+        from ._recovery.storage import ProtectedStorageError, StorageAdmissionCoordinator
+        with self.storage.lock(self.prefix + "-ownership"):
+            if workflow_id is not None:
+                self.storage.delete(self.prefix + "-workflow-" + workflow_id)
+            if any(name.startswith(self.prefix + "-workflow-") for name in self.storage.list_records()):
+                return True
+            for name in self.storage.list_records():
+                if name.startswith(self.prefix + "-reader-"):
+                    try:
+                        with self.storage.lock("ix-reader-" + hashlib.sha256(name.encode()).hexdigest()[:40]):
+                            self.storage.delete(name)
+                    except ProtectedStorageError:
+                        self._write(self.prefix + "-cleanup", b"true")
+                        return False
+            # No write is needed to reclaim an unpinned stage under disk pressure.
+            for name in self.storage.list_records():
+                if name.startswith(self.prefix + "-"):
+                    self.storage.delete(name)
+            coordinator = StorageAdmissionCoordinator(self.storage)
+            complete = True
+            for name in self.storage.list_records():
+                if name.startswith("admission-"):
+                    reservation = json.loads(self.storage.read(name))
+                    if (reservation.get("purpose") == "journal-record"
+                            and str(reservation.get("owner_id", "")).startswith(self.prefix + "-")):
+                        try:
+                            with coordinator.writer(reservation):
+                                observation = coordinator._reconcile_owner(reservation)
+                                if observation.get("resolved"):
+                                    self.storage.delete(name)
+                                else:
+                                    complete = False
+                        except ProtectedStorageError:
+                            complete = False
+            return complete
+
+    def reader(self, *, borrower=None):
+        return _ExchangeReader(self, borrower=borrower)
+
+    def _check(self):
+        if self.closed:
+            raise ValueError("Durable Exchange staging file is closed")
+
+
+class _ExchangeReader:
+    """An independently positioned process-pinned immutable archive reader."""
+
+    def __init__(self, stage, *, borrower=None):
+        self._stage = stage
+        self.closed = False
+        self._name = stage.prefix + "-reader-" + uuid.uuid4().hex
+        with stage.storage.lock(stage.prefix + "-ownership"):
+            if stage.storage.has_record(stage.prefix + "-cleanup") and (borrower is None or borrower.closed):
+                raise ValueError("Exchange staging cleanup has been requested")
+            self._lock = stage.storage.lock("ix-reader-" + hashlib.sha256(self._name.encode()).hexdigest()[:40])
+            self._lock.acquire()
+            try:
+                stage._write(self._name, b"true")
+                self._file = DurableExchangeFile(stage.storage, stage.owner_id, identity=stage.identity, verify=False)
+                if not self._file.manifest["complete"]:
+                    raise ValueError("Exchange staging is incomplete")
+                self._file.seek(0)
+            except BaseException:
+                self._lock.release()
+                stage.storage.delete(self._name)
+                raise
+
+    def read(self, size=-1):
+        return self._file.read(size)
+
+    def seek(self, offset, whence=0):
+        return self._file.seek(offset, whence)
+
+    def tell(self):
+        return self._file.tell()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self._file.close()
+            self._lock.release()
+            self._stage.storage.delete(self._name)
+            if self._stage.storage.has_record(self._stage.prefix + "-cleanup"):
+                self._stage.cleanup()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class _ExchangeContentReader:
+    def __init__(self, reader, info):
+        self._reader = reader
+        # Reuse the already checked bounded ZIP entry metadata with an
+        # independent cursor. No JSON/index lifetime is borrowed from the bundle.
+        archive = object.__new__(_Archive)
+        archive.source, archive.check = reader, lambda: None
+        self._chunks = iter(archive.chunks(info))
+        self._buffer = b""
+        self.closed = False
+
+    def read(self, size=-1):
+        if self.closed:
+            raise ValueError("Exchange content reader is closed")
+        result = bytearray()
+        while size < 0 or len(result) < size:
+            if not self._buffer:
+                self._buffer = next(self._chunks, b"")
+                if not self._buffer:
+                    break
+            count = len(self._buffer) if size < 0 else min(len(self._buffer), size - len(result))
+            result.extend(self._buffer[:count])
+            self._buffer = self._buffer[count:]
+        return bytes(result)
+
+    def close(self):
+        if not self.closed:
+            self._reader.close()
+            self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class ExchangeBundle:
+    """Lazy validated frozen archive; Stores and caller input streams are borrowed."""
+
+    def __init__(self, source_store, export_result, *, workflow_id=None):
+        import copy
+        self.source_store = source_store
+        self._source_binding = copy.deepcopy(source_store._identity.to_dict())
+        self._export_result = copy.deepcopy(export_result)
+        self._closed = False
+        self._workflow_id = workflow_id
+        self._stage_id = uuid.uuid4().hex
+        self._stage = None
+        self._package_view = None
+        self._owner_reader = None
+
+    def pin(self, workflow_id):
+        if not isinstance(workflow_id, str) or not re.fullmatch(r"[0-9a-f]{32}", workflow_id):
+            raise ValueError("Import workflow reference is invalid")
+        self._workflow_id = workflow_id
+        if self._stage is not None:
+            self._stage._write(self._stage.prefix + "-workflow-" + workflow_id, b"true")
+        return self
+
+    @property
+    def source_binding(self):
+        import copy
+        return copy.deepcopy(self._source_binding)
+
+    @property
+    def package_reference(self):
+        result = self._export_result
+        return (result.get("packageResourceId") or result.get("resourceId")) if isinstance(result, Mapping) else None
+
+    def _assert_source(self):
+        if self.source_store._identity.to_dict() != self._source_binding or getattr(self.source_store, "closed", False):
+            raise ValueError("Authenticated source Store identity changed")
+
+    def materialize(self):
+        if self._closed:
+            raise ValueError("Exchange bundle is closed")
+        if self._package_view is None:
+            self._materialize_remote()
+        return self._package_view
+
+    def _materialize_remote(self):
+        from ._recovery.transfers import TRANSFER_CHUNK_BYTES
+        self._assert_source()
+        result = self._export_result
+        resource_id = self.package_reference
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("Export returned no package resource reference")
+        storage = self.source_store._journal.storage
+        self._stage = DurableExchangeFile(storage, self._stage_id, identity=self._source_binding, create=True)
+        if self._workflow_id is not None:
+            self._stage._write(self._stage.prefix + "-workflow-" + self._workflow_id, b"true")
+        if self._stage.manifest["complete"]:
+            self._attach_view()
+            return
+        metadata = self.source_store._call_one("deposit.resource.info", resource_id)
+        if (not isinstance(metadata, dict) or metadata.get("resourceId") != resource_id
+                or type(metadata.get("bytes")) is not int or metadata["bytes"] < 0
+                or not isinstance(metadata.get("checksum"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", metadata["checksum"])):
+            raise ValueError("Export package metadata is invalid")
+        expected_size, expected_digest = metadata["bytes"], metadata["checksum"]
+        while self._stage.manifest["bytes"] < expected_size:
+            self._assert_source()
+            offset = self._stage.manifest["bytes"]
+            requested = min(TRANSFER_CHUNK_BYTES, expected_size - offset)
+            chunk = self.source_store._call_one("deposit.resource.downloadChunk", resource_id, offset, requested)
+            try:
+                block = __import__("base64").b64decode(chunk["bytesBase64"], validate=True)
+            except Exception as exc:
+                raise ValueError("Export package download returned invalid Base64") from exc
+            next_offset = offset + len(block)
+            if (chunk.get("offset") != offset or chunk.get("nextOffset") != next_offset or not block
+                    or len(block) > requested or chunk.get("eof") is not (next_offset == expected_size)
+                    or hashlib.sha256(block).hexdigest() != chunk.get("chunkSha256")):
+                raise ValueError("Export package chunk failed offset or digest verification")
+            self._stage.write(block)
+        digest = hashlib.sha256()
+        self._stage.seek(0)
+        while block := self._stage.read(_CHUNK_SIZE):
+            digest.update(block)
+        if self._stage.manifest["bytes"] != expected_size or digest.hexdigest() != expected_digest:
+            raise ValueError("Export package failed its whole-file checksum")
+        for claim, actual in ((result.get("bytes"), expected_size),
+                              (result.get("checksum") or result.get("sha256"), expected_digest)):
+            if claim is not None and claim != actual:
+                raise ValueError("Export package receipt contradicts its resource metadata")
+        self._stage.complete()
+        self._attach_view()
+
+    def _attach_view(self):
+        self._owner_reader = self._stage.reader()
+        try:
+            self._package_view = validate_exchange_archive(self._owner_reader, storage=self._stage.storage)
+        except BaseException:
+            self._owner_reader.close()
+            self._owner_reader = None
+            raise
+
+    @property
+    def manifest(self):
+        return self.materialize().manifest
+
+    @property
+    def graph(self):
+        return self.materialize().graph
+
+    def open_resource(self, entry):
+        package = self.materialize()
+        if not isinstance(entry, str) or not _RESOURCE_PATH.fullmatch(entry):
+            raise ValueError("Exchange resource entry is unsafe")
+        info = package._table.get(("entry", entry))
+        if info is None:
+            raise KeyError(entry)
+        return _ExchangeContentReader(self._stage.reader(borrower=self._owner_reader), list(info))
+
+    def open_package_stream(self):
+        self.materialize()
+        return self._stage.reader(borrower=self._owner_reader)
+
+    def save(self, path):
+        from pathlib import Path
+        with self.open_package_stream() as source, Path(path).open("wb") as output:
+            while block := source.read(_CHUNK_SIZE):
+                output.write(block)
+
+    def close(self):
+        self._closed = True
+        if self._package_view is not None:
+            self._package_view.close()
+            self._package_view = None
+        if self._owner_reader is not None:
+            self._owner_reader.close()
+            self._owner_reader = None
+        if self._stage is not None:
+            self._stage.close()
+            self._stage.cleanup()
+
+    def __enter__(self):
+        if self._closed:
+            raise ValueError("Exchange bundle is closed")
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 class _ZipWriter:
     """ZIP64 writer with a protected spooled central directory."""
 

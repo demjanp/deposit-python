@@ -273,7 +273,7 @@ class ProtectedJournal:
                 if reference["identity"] != identity.to_dict() or reference["resultId"] != result_id:
                     raise JournalError("Local import result reference is bound to different data")
                 if self._local_import_result_expired(reference, datetime.now(timezone.utc)):
-                    if not self._cleanup_import_result_locked(reference["key"]):
+                    if not self._cleanup_import_result_locked(reference["key"], identity=DeploymentIdentity.from_dict(reference["identity"])):
                         return reference["key"]
                     self.storage.delete(reference_name)
                 else:
@@ -345,7 +345,7 @@ class ProtectedJournal:
             reference = self._read_local_import_result_ref(name)
             anchor = reference["completedAt"] if reference["completedAt"] is not None else reference["createdAt"]
             if _aware_datetime(anchor) <= cutoff:
-                if not self._cleanup_import_result_locked(reference["key"]):
+                if not self._cleanup_import_result_locked(reference["key"], identity=DeploymentIdentity.from_dict(reference["identity"])):
                     continue
                 self.storage.delete(name)
                 removed += 1
@@ -512,8 +512,10 @@ class ProtectedJournal:
         finally:
             owner_lock.release()
 
-    def _cleanup_import_result_locked(self, key: str) -> bool:
-        """Delete expired result segments only when no reader owns a pin."""
+    def _cleanup_import_result_locked(self, key: str, *, identity: DeploymentIdentity) -> bool:
+        """Delete expired result segments only when readers/workflows release them."""
+        if _record_name(identity, key) in self._workflow_dependencies_locked():
+            return False
         prefix = f"import-result-{key}-"
         for name in self.storage.list_records():
             if not name.startswith(prefix) or "-pin-" not in name:
@@ -685,7 +687,7 @@ class ProtectedJournal:
         cutoff = (now or datetime.now(timezone.utc)) - RESULT_RETENTION
         removed = 0
         with self.storage.lock("journal-index"):
-            dependencies = self._transfer_dependencies_locked()
+            dependencies = self._transfer_dependencies_locked() | self._workflow_dependencies_locked()
             for record in self._records_locked(identity):
                 if record["state"] not in {"released", "failed"}:
                     continue
@@ -697,11 +699,12 @@ class ProtectedJournal:
                     raise JournalError("Resolved journal record has invalid retention metadata")
                 if resolved <= cutoff and _record_name(identity, record["key"]) not in dependencies:
                     if record.get("result_format") == RESULT_FORMAT_IMPORT:
-                        if not self._cleanup_import_result_locked(record["key"]):
+                        if not self._cleanup_import_result_locked(record["key"], identity=DeploymentIdentity.from_dict(record["identity"])):
                             continue
                     self.storage.delete(_record_name(identity, record["key"]))
                     removed += 1
             self._cleanup_operation_payloads_locked()
+            self._cleanup_workflow_payloads_locked()
             removed += self._prune_local_import_results_locked(cutoff)
         return removed
 
@@ -724,21 +727,9 @@ class ProtectedJournal:
                     raise JournalError("Recovery key collision")
                 if creating and current_unresolved >= MAX_UNRESOLVED:
                     raise ProtectedStorageError("The 1,024 unresolved recovery operation limit is reached")
-                generation = uuid.uuid4().hex
-                prefix = _operation_payload_prefix(name, generation)
-                # Durable ownership precedes every content chunk, including a
-                # create whose operation root has not yet been published.
-                owner = {"operation": name, "generation": generation, "role": "operation"}
-                self._write_protected(f"{prefix}owner", _json_bytes(owner))
-                checksum = hashlib.sha256()
-                length = count = 0
-                for count, chunk in enumerate(_operation_json_chunks(record), 1):
-                    self._write_protected(f"{prefix}{count - 1}", chunk)
-                    checksum.update(chunk)
-                    length += len(chunk)
+                descriptor = self._write_segmented_payload(name, "operation", record)
                 root = {"key": record["key"], "identity": record["identity"], "state": record["state"],
-                        "payload": {"role": "operation", "generation": generation,
-                                    "chunkCount": count, "bytes": length, "sha256": checksum.hexdigest()}}
+                        "payload": descriptor}
                 payload = _json_bytes(root)
                 try:
                     self._write_protected(name, payload)
@@ -754,53 +745,82 @@ class ProtectedJournal:
                         raise
                 self._cleanup_operation_payloads_locked()
 
+    def _write_segmented_payload(self, owner: str, role: str, value: Any) -> dict[str, Any]:
+        """Persist owned immutable admitted segments before their root is published."""
+        generation = uuid.uuid4().hex
+        prefix = _segmented_payload_prefix(owner, role, generation)
+        self._write_protected(prefix + "owner", _json_bytes(_payload_owner(owner, role, generation)))
+        checksum = hashlib.sha256()
+        length = count = 0
+        for count, chunk in enumerate(_operation_json_chunks(value), 1):
+            self._write_protected(f"{prefix}{count - 1}", chunk)
+            checksum.update(chunk)
+            length += len(chunk)
+        return {"role": role, "generation": generation, "chunkCount": count,
+                "bytes": length, "sha256": checksum.hexdigest()}
+
+    def _read_segmented_payload(self, owner: str, descriptor: dict[str, Any]):
+        _validate_payload_descriptor(descriptor, descriptor.get("role"))
+        prefix = _segmented_payload_prefix(owner, descriptor["role"], descriptor["generation"])
+        if _strict_json_loads(self.storage.read(prefix + "owner")) != _payload_owner(
+                owner, descriptor["role"], descriptor["generation"]):
+            raise JournalError("Segmented payload ownership is invalid")
+        checksum = hashlib.sha256()
+        payload = bytearray()
+        for index in range(descriptor["chunkCount"]):
+            chunk = self.storage.read(f"{prefix}{index}")
+            if len(chunk) != min(OPERATION_CHUNK_BYTES, descriptor["bytes"] - index * OPERATION_CHUNK_BYTES):
+                raise JournalError("Segmented payload chunk length is invalid")
+            checksum.update(chunk)
+            payload.extend(chunk)
+        if checksum.hexdigest() != descriptor["sha256"]:
+            raise JournalError("Segmented payload checksum is invalid")
+        return _strict_json_loads(payload.decode("utf-8"))
+
     def _cleanup_operation_payloads_locked(self) -> None:
-        """Reclaim only authenticated, unreferenced generations under index lock."""
+        self._cleanup_segmented_payloads_locked("operation", self._decode_operation_root)
+
+    def _cleanup_workflow_payloads_locked(self) -> None:
+        from .._import_workflows import ImportWorkflowStore
+        self._cleanup_segmented_payloads_locked("workflow", ImportWorkflowStore.decode_root)
+
+    def _cleanup_segmented_payloads_locked(self, role, decode_root) -> None:
+        """Reclaim authenticated unpublished/replaced generations under journal-index."""
+        pattern = (r"action-payload-(op-[0-9a-f]{16}-[0-9a-f-]{36})-([0-9a-f]{32})-owner"
+                   if role == "operation" else r"workflow-payload-(import-workflow-[0-9a-f]{32})-([0-9a-f]{32})-owner")
         try:
             owners = self.storage.list_records()
         except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "Operation payload cleanup deferred because ownership cannot be enumerated: %s", exc
-            )
+            logging.getLogger(__name__).warning("Payload cleanup enumeration deferred: %s", exc)
             return
         for name in owners:
-            match = re.fullmatch(r"action-payload-(op-[0-9a-f]{16}-[0-9a-f-]{36})-([0-9a-f]{32})-owner", name)
+            match = re.fullmatch(pattern, name)
             if match is None:
                 continue
-            operation, generation = match.groups()
-            expected = {"operation": operation, "generation": generation, "role": "operation"}
+            owner, generation = match.groups()
             try:
-                if _strict_json_loads(self.storage.read(name)) != expected:
-                    raise ValueError("Invalid operation payload ownership")
+                if _strict_json_loads(self.storage.read(name)) != _payload_owner(owner, role, generation):
+                    raise ValueError("Invalid payload ownership")
                 names = self.storage.list_records()
-                if operation in names:
-                    root = self._decode_operation_root(self.storage.read(operation), operation)
+                if owner in names:
+                    root = decode_root(self.storage.read(owner), owner)
                     if root["payload"]["generation"] == generation:
                         continue
-                prefix = _operation_payload_prefix(operation, generation)
+                prefix = _segmented_payload_prefix(owner, role, generation)
                 owned = [candidate for candidate in names if candidate.startswith(prefix) and candidate != name]
                 if any(re.fullmatch(r"[0-9]+", candidate[len(prefix):]) is None for candidate in owned):
-                    raise ValueError("Invalid owned operation payload name")
+                    raise ValueError("Invalid owned payload name")
             except Exception as exc:
-                logging.getLogger(__name__).warning(
-                    "Operation payload cleanup deferred because ownership is uncertain (%s): %s",
-                    operation, exc,
-                )
+                logging.getLogger(__name__).warning("Payload cleanup ownership deferred (%s): %s", owner, exc)
                 continue
-            # Keep ownership until all its files have been removed, making an
-            # interrupted cleanup repeatable. Current readers own journal-index.
             try:
                 for candidate in owned:
                     self.storage.delete(candidate)
                 self.storage.delete(name)
             except Exception as exc:
-                # The authoritative operation root has already been published
-                # (or expired). Keep this owner for a later retry; cleanup
-                # failure must never turn a durable action update into a
-                # reported action failure.
-                logging.getLogger(__name__).warning(
-                    "Operation payload cleanup deferred for %s: %s", operation, exc
-                )
+                # The authoritative root remains published. Retain the owner
+                # until every obsolete segment is removed; cleanup is retryable.
+                logging.getLogger(__name__).warning("Payload cleanup deferred (%s): %s", owner, exc)
 
     def _unresolved_count_all_roots_locked(self) -> int:
         count = 0
@@ -838,6 +858,40 @@ class ProtectedJournal:
                     count += 1
         return count
 
+    def _workflow_dependencies_locked(self) -> set[str]:
+        """Read identity-bound workflow pins, including independently stored sources.
+
+        Only bounded authenticated roots are needed. Never acquire another
+        root's journal/workflow locks while holding this journal-index lock.
+        The shared quota lock serializes root publication and deletion.
+        """
+        from .._import_workflows import ImportWorkflowStore
+        dependencies = set()
+        quota = getattr(self.storage, "user_quota_lock", None)
+        with quota() if quota else nullcontext():
+            registered = getattr(self.storage, "registered_roots", None)
+            roots = registered() if registered else (self.storage.root,)
+            for root in roots:
+                if root == self.storage.root:
+                    storage = self.storage
+                else:
+                    storage = object.__new__(ProtectedStore)
+                    storage.root = root
+                try:
+                    for name in storage.list_records():
+                        if re.fullmatch(r"import-workflow-[0-9a-f]{32}", name) is None:
+                            continue
+                        header = ImportWorkflowStore.decode_root(storage.read(name), name)
+                        if header["state"] in {"APPLIED", "ABANDONED", "FAILED", "CANCELLED", "EXPIRED"} and header["cleanup_status"] == "complete":
+                            continue
+                        for side in ("source", "target"):
+                            if header["dependencies"][side]:
+                                identity = DeploymentIdentity.from_dict(header[side + "_identity"])
+                                dependencies.update(_record_name(identity, key) for key in header["dependencies"][side])
+                except Exception as exc:
+                    raise JournalError("Protected workflow dependencies cannot be assessed safely") from exc
+        return dependencies
+
     def _transfer_dependencies_locked(self) -> set[str]:
         """Snapshot validated transfer pins under journal-index, never transfer locks."""
         from .transfers import ProtectedTransferSpool
@@ -862,7 +916,7 @@ class ProtectedJournal:
         return dependencies
 
     def _prune_expired_locked(self, identity: DeploymentIdentity) -> None:
-        dependencies = self._transfer_dependencies_locked()
+        dependencies = self._transfer_dependencies_locked() | self._workflow_dependencies_locked()
         cutoff = datetime.now(timezone.utc) - RESULT_RETENTION
         for name in self.storage.list_records():
             if not name.startswith("op-"):
@@ -878,11 +932,12 @@ class ProtectedJournal:
                 raise JournalError("An existing recovery journal record cannot be pruned safely") from exc
             if resolved <= cutoff and name not in dependencies:
                 if record.get("result_format") == RESULT_FORMAT_IMPORT:
-                    if not self._cleanup_import_result_locked(record["key"]):
+                    if not self._cleanup_import_result_locked(record["key"], identity=DeploymentIdentity.from_dict(record["identity"])):
                         continue
                 self.storage.delete(name)
         self._prune_local_import_results_locked(cutoff)
         self._cleanup_operation_payloads_locked()
+        self._cleanup_workflow_payloads_locked()
 
     @staticmethod
     def _decode_operation_root(payload: bytes, name: str) -> dict[str, Any]:
@@ -892,20 +947,10 @@ class ProtectedJournal:
         try:
             identity = DeploymentIdentity.from_dict(root["identity"])
             expected = _record_name(identity, root["key"])
-            descriptor = root["payload"]
             if (not _is_uuid(root["key"]) or name not in {expected, f"{expected}.dpapi"}
-                    or not isinstance(root["state"], str) or root["state"] not in _TRANSITIONS
-                    or not isinstance(descriptor, dict)
-                    or set(descriptor) != {"role", "generation", "chunkCount", "bytes", "sha256"}
-                    or descriptor["role"] != "operation"
-                    or not isinstance(descriptor["generation"], str)
-                    or re.fullmatch(r"[0-9a-f]{32}", descriptor["generation"]) is None
-                    or type(descriptor["chunkCount"]) is not int or descriptor["chunkCount"] < 1
-                    or type(descriptor["bytes"]) is not int or descriptor["bytes"] < 1
-                    or descriptor["chunkCount"] != (descriptor["bytes"] + OPERATION_CHUNK_BYTES - 1) // OPERATION_CHUNK_BYTES
-                    or not isinstance(descriptor["sha256"], str)
-                    or re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is None):
-                raise ValueError("Invalid operation root binding or descriptor")
+                    or not isinstance(root["state"], str) or root["state"] not in _TRANSITIONS):
+                raise ValueError("Invalid operation root binding")
+            _validate_payload_descriptor(root["payload"], "operation")
         except (ValueError, TypeError, KeyError) as exc:
             raise JournalError("Recovery operation root is corrupt") from exc
         return root
@@ -919,25 +964,8 @@ class ProtectedJournal:
     ) -> dict[str, Any]:
         """Strictly decode, validate, and bind one record to its protected filename."""
         root = self._decode_operation_root(payload, name)
-        descriptor = root["payload"]
-        operation = _record_name(DeploymentIdentity.from_dict(root["identity"]), root["key"])
-        prefix = _operation_payload_prefix(operation, descriptor["generation"])
         try:
-            owner = _strict_json_loads(self.storage.read(f"{prefix}owner"))
-            if owner != {"operation": operation, "generation": descriptor["generation"], "role": "operation"}:
-                raise ValueError("Invalid operation payload owner")
-            checksum = hashlib.sha256()
-            payload_bytes = bytearray()
-            for index in range(descriptor["chunkCount"]):
-                chunk = self.storage.read(f"{prefix}{index}")
-                expected_length = min(OPERATION_CHUNK_BYTES, descriptor["bytes"] - index * OPERATION_CHUNK_BYTES)
-                if len(chunk) != expected_length:
-                    raise ValueError("Invalid operation chunk length")
-                checksum.update(chunk)
-                payload_bytes.extend(chunk)
-            if checksum.hexdigest() != descriptor["sha256"]:
-                raise ValueError("Invalid operation payload digest")
-            raw = _strict_json_loads(bytes(payload_bytes))
+            raw = self._read_segmented_payload(name.removesuffix(".dpapi"), root["payload"])
             if any(raw[field] != root[field] for field in ("identity", "key", "state")):
                 raise ValueError("Operation root and payload disagree")
         except Exception as exc:
@@ -1041,6 +1069,32 @@ class ProtectedJournal:
 
 def _operation_payload_prefix(operation: str, generation: str) -> str:
     return f"action-payload-{operation}-{generation}-"
+
+
+def _segmented_payload_prefix(owner: str, role: str, generation: str) -> str:
+    if role == "operation":
+        return _operation_payload_prefix(owner, generation)
+    if role == "workflow":
+        return f"workflow-payload-{owner}-{generation}-"
+    raise JournalError("Segmented payload role is unsupported")
+
+
+def _payload_owner(owner, role, generation):
+    return {"operation" if role == "operation" else "workflow": owner,
+            "generation": generation, "role": role}
+
+
+def _validate_payload_descriptor(descriptor, role):
+    if (role not in {"operation", "workflow"} or not isinstance(descriptor, dict)
+            or set(descriptor) != {"role", "generation", "chunkCount", "bytes", "sha256"}
+            or descriptor["role"] != role or not isinstance(descriptor["generation"], str)
+            or re.fullmatch(r"[0-9a-f]{32}", descriptor["generation"]) is None
+            or type(descriptor["chunkCount"]) is not int or descriptor["chunkCount"] < 1
+            or type(descriptor["bytes"]) is not int or descriptor["bytes"] < 1
+            or descriptor["chunkCount"] != (descriptor["bytes"] + OPERATION_CHUNK_BYTES - 1) // OPERATION_CHUNK_BYTES
+            or not isinstance(descriptor["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is None):
+        raise ValueError("Segmented payload descriptor is invalid")
 
 
 def _operation_json_chunks(record: dict[str, Any]):
