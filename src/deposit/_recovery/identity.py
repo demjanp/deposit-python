@@ -12,7 +12,6 @@ class IdentityUnavailableError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class DeploymentIdentity:
-    schema_version: int
     endpoint: str
     database_name: str
     database_id: str
@@ -25,10 +24,10 @@ class DeploymentIdentity:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DeploymentIdentity":
-        expected = {"schema_version", "endpoint", "database_name", "database_id", "dbms_id", "actor_id", "namespace_id"}
-        if not isinstance(value, dict) or set(value) != expected or value.get("schema_version") != 1:
-            raise IdentityUnavailableError("Stored deployment identity is invalid or unsupported")
-        if any(not isinstance(value[key], str) or not value[key] for key in expected - {"schema_version"}):
+        expected = {"endpoint", "database_name", "database_id", "dbms_id", "actor_id", "namespace_id"}
+        if not isinstance(value, dict) or set(value) != expected:
+            raise IdentityUnavailableError("Stored deployment identity is invalid")
+        if any(not isinstance(value[key], str) or not value[key] for key in expected):
             raise IdentityUnavailableError("Stored deployment identity is incomplete")
         return cls(**value)
 
@@ -91,4 +90,4 @@ def read_deployment_identity(
         raise IdentityUnavailableError("Neo4j returned incomplete store identity metadata")
     if database_name != summary_database or (database is not None and database_name != database):
         raise IdentityUnavailableError("Resolved Neo4j database differs from the requested database")
-    return DeploymentIdentity(1, endpoint, database_name, database_id, dbms_id, actor_id, namespace_id)
+    return DeploymentIdentity(endpoint, database_name, database_id, dbms_id, actor_id, namespace_id)

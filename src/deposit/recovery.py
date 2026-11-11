@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from ._recovery.journal import (
-    RESULT_FORMAT_IMPORT_V1, RESULT_FORMAT_NAMED_ROWS_V1,
+    RESULT_FORMAT_IMPORT, RESULT_FORMAT_NAMED_ROWS,
     valid_import_result_envelope, valid_named_rows_result,
 )
 
@@ -50,7 +50,7 @@ def recovered_operation(record: dict[str, Any], *, journal=None) -> RecoveredOpe
         raise ValueError("Only released operations have a recovered result")
     result = record["outcome"]
     result_format = record.get("result_format")
-    if result_format == RESULT_FORMAT_IMPORT_V1:
+    if result_format == RESULT_FORMAT_IMPORT:
         if not valid_import_result_envelope(result) or journal is None:
             raise ValueError("Recovered import result is invalid or its protected index is unavailable")
         index = journal.read_import_index(record["key"])
@@ -59,7 +59,7 @@ def recovered_operation(record: dict[str, Any], *, journal=None) -> RecoveredOpe
         from ._paging import ImportResult
         result = ImportResult(journal, record["key"], result)
     elif result_format is not None:
-        if result_format != RESULT_FORMAT_NAMED_ROWS_V1 or not valid_named_rows_result(result):
+        if result_format != RESULT_FORMAT_NAMED_ROWS or not valid_named_rows_result(result):
             raise ValueError("Advanced recovered operation has an invalid named result")
     return RecoveredOperation(
         id=record["public_id"],

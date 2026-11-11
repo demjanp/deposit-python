@@ -485,7 +485,7 @@ class FileLock:
 class ProtectedStore:
     """Atomic, DPAPI-protected named byte records in a current-user directory."""
 
-    _MAGIC = b"DEPOSIT-DPAPI-1\0"
+    _MAGIC = b"DEPOSIT-DPAPI\0"
     MAX_RECORD_BYTES = 16 * 1024 * 1024
     MAX_PROTECTED_BYTES = MAX_RECORD_BYTES + 64 * 1024
 
@@ -794,7 +794,7 @@ class StorageAdmissionCoordinator:
             raise ValueError("Admission owner and purpose are required")
         volumes, locations = self._normalize(commitments_by_volume)
         reservation_id = secrets.token_hex(16)
-        record = {"version": 1, "id": reservation_id, "owner_id": owner_id,
+        record = {"id": reservation_id, "owner_id": owner_id,
                   "purpose": purpose, "writer_pid": os.getpid(), "commitments": volumes,
                   "locations": locations, "materialized": {}, "ownership_resolved": False}
         with self.store.user_quota_lock():
@@ -945,9 +945,9 @@ class StorageAdmissionCoordinator:
 
     @staticmethod
     def _validate_reservation(record: dict) -> None:
-        required = {"version", "id", "owner_id", "purpose", "writer_pid", "commitments",
+        required = {"id", "owner_id", "purpose", "writer_pid", "commitments",
                     "locations", "materialized", "ownership_resolved"}
-        if (not isinstance(record, dict) or set(record) != required or record.get("version") != 1
+        if (not isinstance(record, dict) or set(record) != required
                 or not isinstance(record.get("id"), str) or not re.fullmatch(r"[0-9a-f]{32}", record["id"])
                 or not isinstance(record.get("owner_id"), str) or not record["owner_id"]
                 or not isinstance(record.get("purpose"), str) or not record["purpose"]
@@ -975,10 +975,10 @@ class StorageAdmissionCoordinator:
         return self.store.lock(f"admission-owner-{reservation['id']}", timeout=0.0)
 
     def _reconcile_owner(self, record: dict) -> dict:
-        if record.get("purpose") == "import-result-segment":
+        if record.get("purpose") == "journal-record":
             name = record.get("owner_id")
             if not isinstance(name, str) or Path(name).name != name or not name:
-                return {"state": "unknown", "reason": "invalid result segment owner"}
+                return {"state": "unknown", "reason": "invalid journal record owner"}
             try:
                 if self._has_temporary_files():
                     return {"state": "uncertain", "reason": "protected write temporary files remain"}
@@ -993,17 +993,14 @@ class StorageAdmissionCoordinator:
                 self._save(record)
                 return {"state": segment_state, "resolved": True}
             except Exception:
-                return {"state": "uncertain", "reason": "result segment artifacts are uncertain"}
+                return {"state": "uncertain", "reason": "journal record artifacts are uncertain"}
         owner = record.get("owner_id")
         if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
             return {"state": "unknown", "reason": "unrecognized owner"}
         try:
-            manifest = json.loads(self.store.read(f"transfer-{owner}-manifest"))
-        except Exception:
-            return {"state": "unknown", "reason": "owner manifest unavailable or corrupt"}
-        try:
-            if manifest.get("format_version") != 3 or manifest.get("transfer_id") != owner:
-                return {"state": "unknown", "reason": "unsupported owner manifest"}
+            from .transfers import decode_transfer_manifest
+
+            manifest = decode_transfer_manifest(self.store.read(f"transfer-{owner}-manifest"), owner)
             count, total = manifest["chunk_count"], manifest["bytes"]
             for index in range(count):
                 self._verify_chunk(owner, index, min(1024 * 1024, total - index * 1024 * 1024))

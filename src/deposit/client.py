@@ -68,7 +68,7 @@ class Client:
             raise TransportError("Neo4j request failed") from exc
 
     def discover(self) -> dict[str, Any]:
-        """Return server discovery and enforce the exact tested server build."""
+        """Return discovery after checking the installed Neo4j Python driver."""
         support = _manifest()["support"]
         driver_version = distribution_version("neo4j")
         try:
@@ -83,26 +83,16 @@ class Client:
         if not isinstance(data, dict) or not isinstance(data.get("version"), str):
             raise DepositError("INVALID_RESPONSE", "Server discovery returned no version")
         version = data["version"]
-        supported = support["target_server_version"]
-        if version != supported:
-            raise CompatibilityError(version, f"Deposit Server {supported}")
-        neo4j_record = self._single(
-            "CYPHER 25 CALL dbms.components() YIELD name, versions "
-            "WHERE name = 'Neo4j Kernel' RETURN versions[0] AS version"
-        )
-        neo4j_version = neo4j_record.get("version")
-        target_neo4j = support["target_neo4j_version"]
-        if neo4j_version != target_neo4j:
-            raise CompatibilityError(neo4j_version or "unknown", target_neo4j, "Neo4j Server")
         self._version = version
         return dict(data)
 
-    def require_import_result_v1(self) -> dict[str, Any]:
-        """Gate V1 import mutations on the exact advertised result capability."""
+    def require_paged_import_results(self) -> dict[str, Any]:
+        """Require the final paged-result contract before import operations."""
         data = self.discover()
-        if data.get("importResultFormats") != [1]:
-            raise CompatibilityError(str(data.get("importResultFormats", "missing")),
-                                     "importResultFormats [1]", "Deposit import result protocol")
+        capabilities = data.get("capabilities")
+        if not isinstance(capabilities, list) or "pagedImportResults" not in capabilities:
+            raise CompatibilityError(str(capabilities if capabilities is not None else "missing"),
+                                     "pagedImportResults", "Deposit import result capability")
         return data
 
     def login(self, username: str, password: str) -> str:

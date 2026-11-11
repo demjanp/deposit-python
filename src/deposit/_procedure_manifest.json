@@ -1,5 +1,4 @@
 {
-  "schema_version": 1,
   "source": {
     "repository": "deposit-server",
     "files_sha256": {
@@ -16,8 +15,8 @@
     "neo4j_version": "2026.05.0"
   },
   "support": {
-    "target_server_version": "2.0.0-dev.77-post.15.g7610e45-SNAPSHOT",
-    "target_neo4j_version": "2026.05.0",
+    "tested_server_build": "2.0.0-dev.77-post.15.g7610e45-SNAPSHOT",
+    "tested_neo4j_version": "2026.05.0",
     "target_python": "3.14.x (Windows x64)",
     "supported_python": ">=3.14,<3.15",
     "neo4j_driver": ">=6.1,<7"
@@ -2573,7 +2572,7 @@
       "invocation_owner": "Store"
     },
     {
-      "name": "deposit.get.importResultV1",
+      "name": "deposit.get.importResult",
       "args": [
         {
           "name": "resultId",
@@ -2588,11 +2587,11 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "versioned import result retrieval",
+      "batch_exclusion": "import result retrieval",
       "invocation_owner": "Store"
     },
     {
-      "name": "deposit.get.importResultPageV1",
+      "name": "deposit.get.importResultPage",
       "args": [
         {"name": "resultId", "type": "String", "binding": "resultId"},
         {"name": "collection", "type": "String", "binding": "collection"},
@@ -2606,11 +2605,11 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "versioned import result retrieval",
+      "batch_exclusion": "import result retrieval",
       "invocation_owner": "Store"
     },
     {
-      "name": "deposit.get.importResultEntryV1",
+      "name": "deposit.get.importResultEntry",
       "args": [
         {"name": "resultId", "type": "String", "binding": "resultId"},
         {"name": "collection", "type": "String", "binding": "collection"},
@@ -2623,7 +2622,7 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "versioned import result retrieval",
+      "batch_exclusion": "import result retrieval",
       "invocation_owner": "Store"
     },
     {

@@ -1,10 +1,11 @@
-"""Versioned, DPAPI-protected journal for prepared Deposit actions."""
+"""DPAPI-protected journal for prepared Deposit actions."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -19,11 +20,11 @@ from .identity import DeploymentIdentity
 from .storage import ProtectedStorageError, ProtectedStore, StorageAdmissionCoordinator
 
 
-FORMAT_VERSION = 1
-RESULT_FORMAT_NAMED_ROWS_V1 = "named_rows_v1"
-RESULT_FORMAT_IMPORT_V1 = "import_result_v1"
+RESULT_FORMAT_NAMED_ROWS = "named_rows"
+RESULT_FORMAT_IMPORT = "import_result"
 MAX_UNRESOLVED = 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
+OPERATION_CHUNK_BYTES = 1024 * 1024
 RESULT_RETENTION = timedelta(days=30)
 IMPORT_RESULT_PAGE_LIMIT = 128
 _MAX_SAFE_INTEGER = (1 << 53) - 1
@@ -124,7 +125,7 @@ class ProtectedJournal:
         key: str | None = None,
     ) -> dict[str, Any]:
         if result_format is not None and (
-            type(result_format) is not str or result_format not in {RESULT_FORMAT_NAMED_ROWS_V1, RESULT_FORMAT_IMPORT_V1}
+            type(result_format) is not str or result_format not in {RESULT_FORMAT_NAMED_ROWS, RESULT_FORMAT_IMPORT}
         ):
             raise JournalError("Recovery result format is unsupported")
         key = str(uuid.uuid4()) if key is None else key
@@ -132,7 +133,6 @@ class ProtectedJournal:
             raise JournalError("Recovery action key is invalid")
         now = _utc_now()
         record = {
-            "format_version": FORMAT_VERSION,
             "key": key,
             "public_id": str(uuid.uuid4()),
             "identity": identity.to_dict(),
@@ -152,6 +152,12 @@ class ProtectedJournal:
         return record
 
     def load(self, identity: DeploymentIdentity, key: str) -> dict[str, Any]:
+        # A root and its immutable payload remain one read snapshot while an
+        # update or retention cleanup replaces/deletes their generation.
+        with self.storage.lock("journal-index"):
+            return self._load_locked(identity, key)
+
+    def _load_locked(self, identity: DeploymentIdentity, key: str) -> dict[str, Any]:
         if not _is_uuid(key):
             raise JournalError("Recovery action key is invalid")
         name = _record_name(identity, key)
@@ -183,7 +189,7 @@ class ProtectedJournal:
                 if any(candidate.startswith("op-") and candidate.endswith(f"-{key}") for candidate in names):
                     raise JournalError("Recovery journal identity does not match this Store")
                 return None
-            return self.load(identity, key)
+            return self._load_locked(identity, key)
 
     def update(self, identity: DeploymentIdentity, key: str, **changes: Any) -> dict[str, Any]:
         record = self.load(identity, key)
@@ -250,7 +256,7 @@ class ProtectedJournal:
 
         self._validate_import_mapping_keys(key)
 
-        root_index = {"version": 1, "key": key, "resultId": envelope["resultId"],
+        root_index = {"key": key, "resultId": envelope["resultId"],
                       "envelope": envelope, "collections": envelope["collections"]}
         self._write_import_segments(key, {_import_result_index_name(key): _json_bytes(root_index)})
         return root_index
@@ -273,11 +279,11 @@ class ProtectedJournal:
                 else:
                     return reference["key"]
             key = str(uuid.uuid4())
-            reference = {"version": 1, "key": key, "resultId": result_id,
+            reference = {"key": key, "resultId": result_id,
                          "identity": identity.to_dict(), "state": "pending",
                          "createdAt": _utc_now(), "completedAt": None,
                          "planObservation": None}
-            self.storage.write(reference_name, _json_bytes(reference))
+            self._write_protected(reference_name, _json_bytes(reference))
             return key
 
     def complete_local_import_result(self, identity: DeploymentIdentity, key: str,
@@ -302,15 +308,15 @@ class ProtectedJournal:
             if reference["state"] != "complete":
                 reference["state"] = "complete"
                 reference["completedAt"] = _utc_now()
-            self.storage.write(reference_name, _json_bytes(reference))
+            self._write_protected(reference_name, _json_bytes(reference))
             return reference
 
     def _read_local_import_result_ref(self, name: str) -> dict[str, Any]:
         try:
             reference = _strict_json_loads(self.storage.read(name))
             if (not isinstance(reference, dict)
-                    or set(reference) != {"version", "key", "resultId", "identity", "state", "createdAt", "completedAt", "planObservation"}
-                    or reference.get("version") != 1 or not _is_uuid(reference.get("key"))
+                    or set(reference) != {"key", "resultId", "identity", "state", "createdAt", "completedAt", "planObservation"}
+                    or not _is_uuid(reference.get("key"))
                     or not isinstance(reference.get("resultId"), str)
                     or not isinstance(reference.get("identity"), dict)
                     or reference.get("state") not in {"pending", "complete"}
@@ -362,7 +368,7 @@ class ProtectedJournal:
             except Exception as exc:
                 raise JournalError("Protected import collection metadata is corrupt") from exc
         else:
-            meta = {"version": 1, "resultId": result_id, "collection": collection,
+            meta = {"resultId": result_id, "collection": collection,
                     "kind": kind, "count": count, "textBytes": text_bytes,
                     "pageCount": 0, "entryCount": 0, "nextCursor": None, "complete": False}
             self._write_import_segments(key, {meta_name: _json_bytes(meta)})
@@ -473,8 +479,8 @@ class ProtectedJournal:
             index = _strict_json_loads(self.storage.read(_import_result_index_name(key)))
         except Exception as exc:
             raise JournalError("Protected import result index is unavailable") from exc
-        if (not isinstance(index, dict) or set(index) != {"version", "key", "resultId", "envelope", "collections"}
-                or type(index["version"]) is not int or index["version"] != 1 or index["key"] != key
+        if (not isinstance(index, dict) or set(index) != {"key", "resultId", "envelope", "collections"}
+                or index["key"] != key
                 or not valid_import_result_envelope(index["envelope"])
                 or index["resultId"] != index["envelope"]["resultId"]
                 or index["collections"] != index["envelope"]["collections"]):
@@ -493,7 +499,7 @@ class ProtectedJournal:
             self.read_import_index(key)
             owner_lock.acquire()
             try:
-                self.storage.write(pin_name, _json_bytes({"version": 1, "key": key, "pinId": pin_id}))
+                self._write_protected(pin_name, _json_bytes({"key": key, "pinId": pin_id}))
             except BaseException:
                 owner_lock.release()
                 raise
@@ -514,8 +520,8 @@ class ProtectedJournal:
                 continue
             try:
                 pin = _strict_json_loads(self.storage.read(name))
-                if (not isinstance(pin, dict) or set(pin) != {"version", "key", "pinId"}
-                        or pin["version"] != 1 or pin["key"] != key
+                if (not isinstance(pin, dict) or set(pin) != {"key", "pinId"}
+                        or pin["key"] != key
                         or not isinstance(pin["pinId"], str) or not re.fullmatch(r"[0-9a-f]{32}", pin["pinId"])):
                     raise ValueError("invalid result pin")
                 lock = self.storage.lock(f"import-result-pin-{pin['pinId']}")
@@ -547,9 +553,9 @@ class ProtectedJournal:
         except Exception as exc:
             raise JournalError("Protected import collection index is unavailable") from exc
         if (not isinstance(meta, dict)
-                or set(meta) != {"version", "resultId", "collection", "kind", "count", "textBytes",
+                or set(meta) != {"resultId", "collection", "kind", "count", "textBytes",
                                  "pageCount", "entryCount", "nextCursor", "complete"}
-                or meta.get("version") != 1 or not isinstance(meta.get("resultId"), str)
+                or not isinstance(meta.get("resultId"), str)
                 or meta.get("collection") != collection or not isinstance(meta.get("kind"), str)
                 or meta.get("kind") not in {"sequence", "mapping", "text"}
                 or meta.get("complete") is not True
@@ -599,35 +605,50 @@ class ProtectedJournal:
         return payload
 
     def _write_import_segments(self, action_key: str, segments: dict[str, bytes]) -> None:
-        coordinator = StorageAdmissionCoordinator(self.storage)
         for name, payload in segments.items():
-            if len(payload) > MAX_RECORD_BYTES:
-                raise ProtectedStorageError("Import result segment exceeds the 16 MiB protected-record limit")
-            reservation = coordinator.acquire(name, "import-result-segment", {str(self.storage.root): 0})
-            try:
-                with coordinator.writer(reservation):
-                    estimate = len(payload) + 65536
-                    coordinator.grow(reservation, {str(self.storage.root): estimate})
-                    self.storage.write(name, payload)
-                    actual = self.storage.record_size(name)
-                    coordinator.materialized(reservation, self.storage.root, actual)
-                    coordinator.release(reservation, {str(self.storage.root): estimate - actual})
-                    coordinator.close(reservation)
-                self.storage.delete(f"admission-{reservation['id']}")
-            except Exception:
-                # Keep the durable reservation and any pages already written;
-                # exact retrieval resumes from their saved cursor positions.
-                raise
+            self._write_protected(name, payload)
+
+    def _write_protected(self, name: str, payload: bytes) -> None:
+        """Admit the additional protected temporary copy before each write.
+
+        Existing files already reduce measured free space, including the old
+        copy during replacement. Failed writes retain their reservation until
+        its writer/artifacts can be reconciled without guessing.
+        """
+        if len(payload) > MAX_RECORD_BYTES:
+            raise ProtectedStorageError("Journal segment exceeds the 16 MiB protected-record limit")
+        coordinator = StorageAdmissionCoordinator(self.storage)
+        estimate = len(payload) + 65536
+        # No reconciler can observe a new reservation before its writer owns
+        # the lifetime lock. Quota locks are reentrant; journal-index is always
+        # acquired before the quota lock, never from inside admission code.
+        with self.storage.user_quota_lock():
+            reservation = coordinator.acquire(name, "journal-record", {str(self.storage.root): estimate})
+            writer = coordinator.writer(reservation)
+            writer.acquire()
+        try:
+            self.storage.write(name, payload)
+            actual = self.storage.record_size(name)
+            coordinator.materialized(reservation, self.storage.root, actual)
+            coordinator.release(reservation, {str(self.storage.root): estimate - actual})
+            coordinator.close(reservation)
+        finally:
+            writer.release()
+        self.storage.delete(f"admission-{reservation['id']}")
 
 
     def records(self, identity: DeploymentIdentity) -> list[dict[str, Any]]:
+        with self.storage.lock("journal-index"):
+            return self._records_locked(identity)
+
+    def _records_locked(self, identity: DeploymentIdentity) -> list[dict[str, Any]]:
         prefix = f"op-{_endpoint_scope(identity)}-"
         result: list[dict[str, Any]] = []
         for name in self.storage.list_records():
             if not name.startswith(prefix):
                 continue
             key = name[len(prefix):]
-            result.append(self.load(identity, key))
+            result.append(self._load_locked(identity, key))
         return sorted(result, key=lambda item: item["created_at"])
 
     def records_all(self) -> list[dict[str, Any]]:
@@ -665,7 +686,7 @@ class ProtectedJournal:
         removed = 0
         with self.storage.lock("journal-index"):
             dependencies = self._transfer_dependencies_locked()
-            for record in self.records(identity):
+            for record in self._records_locked(identity):
                 if record["state"] not in {"released", "failed"}:
                     continue
                 try:
@@ -675,22 +696,18 @@ class ProtectedJournal:
                 if resolved.tzinfo is None:
                     raise JournalError("Resolved journal record has invalid retention metadata")
                 if resolved <= cutoff and _record_name(identity, record["key"]) not in dependencies:
-                    if record.get("result_format") == RESULT_FORMAT_IMPORT_V1:
+                    if record.get("result_format") == RESULT_FORMAT_IMPORT:
                         if not self._cleanup_import_result_locked(record["key"]):
                             continue
                     self.storage.delete(_record_name(identity, record["key"]))
                     removed += 1
+            self._cleanup_operation_payloads_locked()
             removed += self._prune_local_import_results_locked(cutoff)
         return removed
 
     def _write(self, record: dict[str, Any], *, creating: bool = False) -> None:
-        try:
-            payload = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise JournalError("Recovery arguments or result are not losslessly journalable") from exc
-        if len(payload) > MAX_RECORD_BYTES:
-            raise ProtectedStorageError("Recovery operation exceeds the 16 MiB record limit")
         identity = DeploymentIdentity.from_dict(record["identity"])
+        self._validate(record, identity, record["key"])
         name = _record_name(identity, record["key"])
         # The user quota coordinator makes the unresolved-count check global to
         # all registered recovery roots. The per-root index lock still serializes
@@ -707,7 +724,83 @@ class ProtectedJournal:
                     raise JournalError("Recovery key collision")
                 if creating and current_unresolved >= MAX_UNRESOLVED:
                     raise ProtectedStorageError("The 1,024 unresolved recovery operation limit is reached")
-                self.storage.write(name, payload)
+                generation = uuid.uuid4().hex
+                prefix = _operation_payload_prefix(name, generation)
+                # Durable ownership precedes every content chunk, including a
+                # create whose operation root has not yet been published.
+                owner = {"operation": name, "generation": generation, "role": "operation"}
+                self._write_protected(f"{prefix}owner", _json_bytes(owner))
+                checksum = hashlib.sha256()
+                length = count = 0
+                for count, chunk in enumerate(_operation_json_chunks(record), 1):
+                    self._write_protected(f"{prefix}{count - 1}", chunk)
+                    checksum.update(chunk)
+                    length += len(chunk)
+                root = {"key": record["key"], "identity": record["identity"], "state": record["state"],
+                        "payload": {"role": "operation", "generation": generation,
+                                    "chunkCount": count, "bytes": length, "sha256": checksum.hexdigest()}}
+                payload = _json_bytes(root)
+                try:
+                    self._write_protected(name, payload)
+                except Exception:
+                    # Replacement may have completed before an interrupted
+                    # acknowledgement/bookkeeping step. Authenticate and compare
+                    # the exact intended root before treating it as published.
+                    try:
+                        published = self.storage.read(name) == payload
+                    except Exception:
+                        published = False
+                    if not published:
+                        raise
+                self._cleanup_operation_payloads_locked()
+
+    def _cleanup_operation_payloads_locked(self) -> None:
+        """Reclaim only authenticated, unreferenced generations under index lock."""
+        try:
+            owners = self.storage.list_records()
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Operation payload cleanup deferred because ownership cannot be enumerated: %s", exc
+            )
+            return
+        for name in owners:
+            match = re.fullmatch(r"action-payload-(op-[0-9a-f]{16}-[0-9a-f-]{36})-([0-9a-f]{32})-owner", name)
+            if match is None:
+                continue
+            operation, generation = match.groups()
+            expected = {"operation": operation, "generation": generation, "role": "operation"}
+            try:
+                if _strict_json_loads(self.storage.read(name)) != expected:
+                    raise ValueError("Invalid operation payload ownership")
+                names = self.storage.list_records()
+                if operation in names:
+                    root = self._decode_operation_root(self.storage.read(operation), operation)
+                    if root["payload"]["generation"] == generation:
+                        continue
+                prefix = _operation_payload_prefix(operation, generation)
+                owned = [candidate for candidate in names if candidate.startswith(prefix) and candidate != name]
+                if any(re.fullmatch(r"[0-9]+", candidate[len(prefix):]) is None for candidate in owned):
+                    raise ValueError("Invalid owned operation payload name")
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Operation payload cleanup deferred because ownership is uncertain (%s): %s",
+                    operation, exc,
+                )
+                continue
+            # Keep ownership until all its files have been removed, making an
+            # interrupted cleanup repeatable. Current readers own journal-index.
+            try:
+                for candidate in owned:
+                    self.storage.delete(candidate)
+                self.storage.delete(name)
+            except Exception as exc:
+                # The authoritative operation root has already been published
+                # (or expired). Keep this owner for a later retry; cleanup
+                # failure must never turn a durable action update into a
+                # reported action failure.
+                logging.getLogger(__name__).warning(
+                    "Operation payload cleanup deferred for %s: %s", operation, exc
+                )
 
     def _unresolved_count_all_roots_locked(self) -> int:
         count = 0
@@ -717,7 +810,7 @@ class ProtectedJournal:
         else:
             roots = registered_roots()
         for root in roots:
-            if root is None:
+            if root is None or root == self.storage.root:
                 records = ((name, self.storage.read(name)) for name in self.storage.list_records() if name.startswith("op-"))
             else:
                 other = object.__new__(ProtectedStore)
@@ -738,7 +831,7 @@ class ProtectedJournal:
                     raise JournalError("An existing recovery journal record cannot be counted safely") from exc
             for name, contents in records:
                 try:
-                    validated = self._decode_record(contents, f"{name}.dpapi")
+                    validated = self._decode_operation_root(contents, f"{name}.dpapi")
                 except Exception as exc:
                     raise JournalError("An existing recovery journal record cannot be counted safely") from exc
                 if validated["state"] in UNRESOLVED_STATES:
@@ -775,18 +868,47 @@ class ProtectedJournal:
             if not name.startswith("op-"):
                 continue
             try:
-                record = self._decode_record(self.storage.read(name), name)
-                if record["state"] not in {"released", "failed"}:
+                payload = self.storage.read(name)
+                root = self._decode_operation_root(payload, name)
+                if root["state"] not in {"released", "failed"}:
                     continue
+                record = self._decode_record(payload, name)
                 resolved = _aware_datetime(record["resolved_at"])
             except Exception as exc:
                 raise JournalError("An existing recovery journal record cannot be pruned safely") from exc
             if resolved <= cutoff and name not in dependencies:
-                if record.get("result_format") == RESULT_FORMAT_IMPORT_V1:
+                if record.get("result_format") == RESULT_FORMAT_IMPORT:
                     if not self._cleanup_import_result_locked(record["key"]):
                         continue
                 self.storage.delete(name)
         self._prune_local_import_results_locked(cutoff)
+        self._cleanup_operation_payloads_locked()
+
+    @staticmethod
+    def _decode_operation_root(payload: bytes, name: str) -> dict[str, Any]:
+        root = _strict_json_loads(payload)
+        if not isinstance(root, dict) or set(root) != {"key", "identity", "state", "payload"}:
+            raise JournalError("Recovery operation root has an unsupported format")
+        try:
+            identity = DeploymentIdentity.from_dict(root["identity"])
+            expected = _record_name(identity, root["key"])
+            descriptor = root["payload"]
+            if (not _is_uuid(root["key"]) or name not in {expected, f"{expected}.dpapi"}
+                    or not isinstance(root["state"], str) or root["state"] not in _TRANSITIONS
+                    or not isinstance(descriptor, dict)
+                    or set(descriptor) != {"role", "generation", "chunkCount", "bytes", "sha256"}
+                    or descriptor["role"] != "operation"
+                    or not isinstance(descriptor["generation"], str)
+                    or re.fullmatch(r"[0-9a-f]{32}", descriptor["generation"]) is None
+                    or type(descriptor["chunkCount"]) is not int or descriptor["chunkCount"] < 1
+                    or type(descriptor["bytes"]) is not int or descriptor["bytes"] < 1
+                    or descriptor["chunkCount"] != (descriptor["bytes"] + OPERATION_CHUNK_BYTES - 1) // OPERATION_CHUNK_BYTES
+                    or not isinstance(descriptor["sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is None):
+                raise ValueError("Invalid operation root binding or descriptor")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise JournalError("Recovery operation root is corrupt") from exc
+        return root
 
     def _decode_record(
         self,
@@ -796,13 +918,36 @@ class ProtectedJournal:
         identity: DeploymentIdentity | None = None,
     ) -> dict[str, Any]:
         """Strictly decode, validate, and bind one record to its protected filename."""
-        raw = _strict_json_loads(payload)
+        root = self._decode_operation_root(payload, name)
+        descriptor = root["payload"]
+        operation = _record_name(DeploymentIdentity.from_dict(root["identity"]), root["key"])
+        prefix = _operation_payload_prefix(operation, descriptor["generation"])
+        try:
+            owner = _strict_json_loads(self.storage.read(f"{prefix}owner"))
+            if owner != {"operation": operation, "generation": descriptor["generation"], "role": "operation"}:
+                raise ValueError("Invalid operation payload owner")
+            checksum = hashlib.sha256()
+            payload_bytes = bytearray()
+            for index in range(descriptor["chunkCount"]):
+                chunk = self.storage.read(f"{prefix}{index}")
+                expected_length = min(OPERATION_CHUNK_BYTES, descriptor["bytes"] - index * OPERATION_CHUNK_BYTES)
+                if len(chunk) != expected_length:
+                    raise ValueError("Invalid operation chunk length")
+                checksum.update(chunk)
+                payload_bytes.extend(chunk)
+            if checksum.hexdigest() != descriptor["sha256"]:
+                raise ValueError("Invalid operation payload digest")
+            raw = _strict_json_loads(bytes(payload_bytes))
+            if any(raw[field] != root[field] for field in ("identity", "key", "state")):
+                raise ValueError("Operation root and payload disagree")
+        except Exception as exc:
+            raise JournalError("Recovery operation payload is corrupt or unavailable") from exc
         if not isinstance(raw, dict):
             raise JournalError("Recovery journal record is corrupt")
         try:
             identity_data = raw.get("identity")
-            if not isinstance(identity_data, dict) or type(identity_data.get("schema_version")) is not int:
-                raise ValueError("Invalid stored identity version")
+            if not isinstance(identity_data, dict):
+                raise ValueError("Invalid stored identity")
             stored_identity = DeploymentIdentity.from_dict(identity_data)
             key = raw.get("key")
             if not isinstance(key, str):
@@ -822,7 +967,7 @@ class ProtectedJournal:
     @staticmethod
     def _validate(record: Any, identity: DeploymentIdentity, key: str) -> dict[str, Any]:
         required = {
-            "format_version", "key", "public_id", "identity", "procedure", "arguments", "snapshot_revision",
+            "key", "public_id", "identity", "procedure", "arguments", "snapshot_revision",
             "state", "created_at", "updated_at", "outcome", "operation_id", "resolved_at",
         }
         allowed = required | {"result_format", "failure"}
@@ -830,13 +975,11 @@ class ProtectedJournal:
             raise JournalError("Recovery journal record has an unsupported format")
         if "result_format" in record and (
             type(record["result_format"]) is not str
-            or record["result_format"] not in {RESULT_FORMAT_NAMED_ROWS_V1, RESULT_FORMAT_IMPORT_V1}
+            or record["result_format"] not in {RESULT_FORMAT_NAMED_ROWS, RESULT_FORMAT_IMPORT}
         ):
             raise JournalError("Recovery journal record has an unsupported format")
         if (
-            type(record["format_version"]) is not int
-            or record["format_version"] != FORMAT_VERSION
-            or not isinstance(record["key"], str)
+            not isinstance(record["key"], str)
             or not _is_uuid(record["key"])
             or record["key"] != key
             or not _is_uuid(record["public_id"])
@@ -881,19 +1024,47 @@ class ProtectedJournal:
                 raise JournalError("Released recovery outcome is invalid")
         elif record["resolved_at"] is not None:
             raise JournalError("Unreleased recovery record has retention metadata")
-        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS_V1 and record["outcome"] is not None:
+        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS and record["outcome"] is not None:
             if not valid_named_rows_result(record["outcome"]):
                 raise JournalError("Advanced recovery result is invalid")
-        if record.get("result_format") == RESULT_FORMAT_IMPORT_V1 and record["outcome"] is not None:
+        if record.get("result_format") == RESULT_FORMAT_IMPORT and record["outcome"] is not None:
             if not valid_import_result_envelope(record["outcome"]):
                 raise JournalError("Import recovery result envelope is invalid")
         if record["state"] == "COMMITTED_RESULT_PENDING" and (
-                record.get("result_format") != RESULT_FORMAT_IMPORT_V1
+                record.get("result_format") != RESULT_FORMAT_IMPORT
                 or not valid_import_result_envelope(record.get("outcome"))
                 or not isinstance(record.get("operation_id"), str)):
             raise JournalError("Committed import result recovery state is invalid")
         return record
 
+
+
+def _operation_payload_prefix(operation: str, generation: str) -> str:
+    return f"action-payload-{operation}-{generation}-"
+
+
+def _operation_json_chunks(record: dict[str, Any]):
+    """Encode exact JSON in bounded byte chunks, without an aggregate byte cap."""
+    pending = bytearray()
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    try:
+        for token in encoder.iterencode(record):
+            # iterencode can yield one large string token; do not duplicate its
+            # entire UTF-8 representation while assembling protected chunks.
+            for offset in range(0, len(token), 65536):
+                encoded = token[offset:offset + 65536].encode("utf-8")
+                position = 0
+                while position < len(encoded):
+                    count = min(OPERATION_CHUNK_BYTES - len(pending), len(encoded) - position)
+                    pending.extend(encoded[position:position + count])
+                    position += count
+                    if len(pending) == OPERATION_CHUNK_BYTES:
+                        yield bytes(pending)
+                        pending.clear()
+        if pending:
+            yield bytes(pending)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise JournalError("Recovery arguments or result are not losslessly journalable") from exc
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -925,9 +1096,8 @@ def _import_result_page_name(key: str, collection: str, page_index: int) -> str:
 def _validate_import_page(response: Any, result_id: str, collection: str, kind: str,
                           request_cursor: Any, entry_count: int, expected_count: int | None,
                           expected_text_bytes: int | None) -> None:
-    required = {"format", "resultId", "collection", "entries", "nextCursor"}
+    required = {"resultId", "collection", "entries", "nextCursor"}
     if (not isinstance(response, dict) or set(response) != required
-            or response.get("format") != "deposit.import-result-page/1"
             or response.get("resultId") != result_id or response.get("collection") != collection
             or not isinstance(response.get("entries"), list)
             or len(response["entries"]) > IMPORT_RESULT_PAGE_LIMIT):
@@ -1074,11 +1244,11 @@ def valid_import_result_envelope(value: Any) -> bool:
         "planId", "revision", "expiresAt", "collections",
     }:
         return False
-    if (value["format"] != "deposit.import-result/1"
+    if (value["format"] != "deposit.import-result"
             or not isinstance(value["resultId"], str) or not value["resultId"]
             or (value["operationId"] is not None
                 and (not isinstance(value["operationId"], str) or not value["operationId"]))
-            or not isinstance(value["kind"], str) or value["kind"] not in {"analysis", "apply", "plan_inspection"}
+            or not isinstance(value["kind"], str) or value["kind"] not in {"analysis", "apply", "diagnostic", "plan_inspection"}
             or not isinstance(value["state"], str) or not value["state"]
             or not isinstance(value["namespaceId"], str) or not value["namespaceId"]
             or (value["planId"] is not None and not isinstance(value["planId"], str))
@@ -1115,8 +1285,7 @@ def _valid_plan_observation(value: Any, envelope: dict[str, Any] | None = None) 
 
 def valid_import_plan_wrapper(value: Any, *, plan_id: str | None = None,
                               namespace_id: str | None = None) -> bool:
-    if (not isinstance(value, dict) or set(value) != {"format", "plan", "analysisResult"}
-            or value.get("format") != "deposit.import-plan/1"
+    if (not isinstance(value, dict) or set(value) != {"plan", "analysisResult"}
             or not valid_import_result_envelope(value.get("analysisResult"))
             or not _valid_plan_observation(value.get("plan"), value["analysisResult"])):
         return False

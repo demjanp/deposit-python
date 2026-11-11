@@ -17,15 +17,10 @@ from .storage import ProtectedStorageError, StorageAdmissionCoordinator
 TRANSFER_CHUNK_BYTES = 1024 * 1024
 _TRANSFER_ID = re.compile(r"^[0-9a-f]{32}$")
 _MANIFEST_FIELDS = {
-    "format_version", "transfer_id", "identity", "filename", "media_type", "bytes",
-    "sha256", "chunks", "state", "offset", "upload_id", "begin_action_key",
-    "pending_action_key", "pending_offset", "pending_length", "finish_action_key",
-}
-
-_MANIFEST_V2_FIELDS = _MANIFEST_FIELDS | {"failed_action_key", "failure"}
-_MANIFEST_V3_FIELDS = (_MANIFEST_FIELDS - {"chunks"}) | {
+    "transfer_id", "identity", "filename", "media_type", "bytes", "sha256",
     "chunk_count", "admission_id", "staging_pending_length", "staging_pending_sha256",
-    "failed_action_key", "failure"
+    "state", "offset", "upload_id", "begin_action_key", "pending_action_key",
+    "pending_offset", "pending_length", "finish_action_key", "failed_action_key", "failure",
 }
 
 
@@ -65,7 +60,7 @@ class ProtectedTransferSpool:
         reservation = admission.acquire(transfer_id, "protected-upload-spool", {str(self._storage.root): 0})
         digest = hashlib.sha256()
         manifest = {
-            "format_version": 3, "transfer_id": transfer_id,
+            "transfer_id": transfer_id,
             "identity": self._identity.to_dict(), "filename": filename, "media_type": media_type,
             "bytes": 0, "sha256": digest.hexdigest(), "chunk_count": 0,
             "admission_id": reservation["id"], "staging_pending_length": 0,
@@ -150,15 +145,13 @@ class ProtectedTransferSpool:
             raise TransferError("Protected transfer manifest is unavailable or corrupt") from exc
 
     def update(self, transfer_id: str, *, _locked: bool = False, **changes: Any) -> dict[str, Any]:
-        if set(changes) - _MANIFEST_V2_FIELDS:
+        if set(changes) - _MANIFEST_FIELDS:
             raise TransferError("Transfer manifest update contains unsupported fields")
         lock = self._storage.lock(self._lock_name(transfer_id), timeout=0.0)
         with (nullcontext() if _locked else lock):
             manifest = self.load(transfer_id)
             if manifest["state"] == "failed":
                 raise TransferError("Failed transfer manifest is immutable")
-            if manifest["format_version"] == 1:
-                manifest = {**manifest, "format_version": 2, "failed_action_key": None, "failure": None}
             manifest.update(changes)
             self._save(manifest)
             return manifest
@@ -179,20 +172,14 @@ class ProtectedTransferSpool:
 
     @staticmethod
     def chunk_count(manifest: dict[str, Any]) -> int:
-        if manifest.get("format_version") == 3:
-            return manifest["chunk_count"]
-        return len(manifest["chunks"])
+        return manifest["chunk_count"]
 
     @staticmethod
     def chunk_length(manifest: dict[str, Any], index: int) -> int:
-        if manifest.get("format_version") == 3:
-            remaining = manifest["bytes"] - index * TRANSFER_CHUNK_BYTES
-            return min(TRANSFER_CHUNK_BYTES, remaining)
-        return manifest["chunks"][index]["bytes"]
+        remaining = manifest["bytes"] - index * TRANSFER_CHUNK_BYTES
+        return min(TRANSFER_CHUNK_BYTES, remaining)
 
     def chunk_metadata(self, manifest: dict[str, Any], index: int) -> dict[str, Any]:
-        if manifest.get("format_version") != 3:
-            return manifest["chunks"][index]
         if type(index) is not int or not 0 <= index < manifest["chunk_count"]:
             raise TransferError("Protected transfer chunk index is invalid")
         try:
@@ -300,93 +287,11 @@ class ProtectedTransferSpool:
             self._storage.write(name, payload)
 
     def _validate(self, manifest: Any, transfer_id: Any) -> None:
-        if (
-            not isinstance(manifest, dict)
-            or set(manifest) != (_MANIFEST_FIELDS if manifest.get("format_version") == 1 else
-                                 _MANIFEST_V2_FIELDS if manifest.get("format_version") == 2 else _MANIFEST_V3_FIELDS)
-            or manifest.get("format_version") not in {1, 2, 3}
-            or type(manifest.get("format_version")) is not int
-            or manifest.get("transfer_id") != transfer_id
-            or not isinstance(transfer_id, str)
-            or not _TRANSFER_ID.fullmatch(transfer_id)
-            or not DeploymentIdentity.from_dict(manifest.get("identity", {})).matches(self._identity)
-            or not isinstance(manifest.get("filename"), str)
-            or not manifest["filename"]
-            or not isinstance(manifest.get("media_type"), str)
-            or not manifest["media_type"]
-            or type(manifest.get("bytes")) is not int
-            or manifest["bytes"] < 0
-            or not isinstance(manifest.get("sha256"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])
-            or manifest.get("state") not in ({"staged", "uploading", "finished"} if manifest.get("format_version") == 1
-                                             else {"staged", "uploading", "finished", "failed"} if manifest.get("format_version") == 2
-                                             else {"staging", "staged", "uploading", "finished", "failed"})
-            or type(manifest.get("offset")) is not int
-            or not 0 <= manifest["offset"] <= manifest["bytes"]
-            or (manifest.get("format_version") != 3 and not isinstance(manifest.get("chunks"), list))
-        ):
-            raise TransferError("Protected transfer manifest has an unsupported format")
-        if manifest["format_version"] in {2, 3}:
-            failed_key, failure = manifest["failed_action_key"], manifest["failure"]
-            if manifest["state"] == "failed":
-                references = {manifest["begin_action_key"], manifest["pending_action_key"], manifest["finish_action_key"]}
-                if not _is_uuid(failed_key) or failed_key not in references or not _valid_failure(failure):
-                    raise TransferError("Failed transfer manifest has invalid failure metadata")
-            elif failed_key is not None or failure is not None:
-                raise TransferError("Active transfer manifest has terminal failure metadata")
-        total = 0
-        for index, entry in enumerate(manifest.get("chunks", [])):
-            if (
-                not isinstance(entry, dict)
-                or set(entry) != {"name", "bytes", "sha256"}
-                or entry.get("name") != self._chunk_name(transfer_id, index)
-                or type(entry.get("bytes")) is not int
-                or not 0 <= entry["bytes"] <= TRANSFER_CHUNK_BYTES
-                or not isinstance(entry.get("sha256"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
-            ):
-                raise TransferError("Protected transfer manifest has invalid chunk metadata")
-            total += entry["bytes"]
-        if manifest["format_version"] == 3:
-            count = manifest["chunk_count"]
-            pending_length = manifest["staging_pending_length"]
-            pending_digest = manifest["staging_pending_sha256"]
-            if (type(count) is not int or count < 0 or count != (manifest["bytes"] + TRANSFER_CHUNK_BYTES - 1) // TRANSFER_CHUNK_BYTES
-                    or not isinstance(manifest["admission_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", manifest["admission_id"])
-                    or type(pending_length) is not int
-                    or not 0 <= pending_length <= TRANSFER_CHUNK_BYTES
-                    or ((pending_length == 0) != (pending_digest is None))
-                    or (pending_digest is not None and (not isinstance(pending_digest, str)
-                        or not re.fullmatch(r"[0-9a-f]{64}", pending_digest)))
-                    or (manifest["state"] in {"staged", "uploading", "finished"} and pending_length != 0)
-                    or (manifest["state"] == "staging" and any(manifest[field] is not None for field in
-                        ("upload_id", "begin_action_key", "pending_action_key", "pending_offset",
-                         "finish_action_key")))):
-                raise TransferError("Protected transfer manifest has invalid segmented chunk metadata")
-        elif total != manifest["bytes"] or (manifest["bytes"] and not manifest["chunks"]):
-            raise TransferError("Protected transfer manifest length does not match its chunks")
-        for field in ("upload_id", "begin_action_key", "pending_action_key"):
-            value = manifest.get(field)
-            if value is not None and (not isinstance(value, str) or not value):
-                raise TransferError("Protected transfer manifest has an invalid action reference")
-        finish_key = manifest.get("finish_action_key")
-        if finish_key is not None and (not isinstance(finish_key, str) or not finish_key):
-            raise TransferError("Protected transfer manifest has an invalid finish action reference")
-        if manifest["state"] == "finished" and finish_key is None:
-            raise TransferError("Finished transfer manifest has no finish action reference")
-        for field in ("pending_offset", "pending_length"):
-            value = manifest.get(field)
-            if value is not None and (type(value) is not int or value < 0):
-                raise TransferError("Protected transfer manifest has invalid pending chunk metadata")
-        pending = (manifest.get("pending_action_key"), manifest.get("pending_offset"), manifest.get("pending_length"))
-        if any(value is not None for value in pending) and not all(value is not None for value in pending):
-            raise TransferError("Protected transfer manifest has incomplete pending chunk metadata")
-        if pending[1] is not None and (pending[2] == 0 or pending[1] + pending[2] > manifest["bytes"]):
-            raise TransferError("Protected transfer manifest pending chunk is outside the frozen content")
-        if manifest["state"] == "uploading" and (manifest["upload_id"] is None or manifest["begin_action_key"] is None):
-            raise TransferError("Uploading transfer manifest has no server identity or begin action")
-        if manifest["state"] == "finished" and manifest["offset"] != manifest["bytes"]:
-            raise TransferError("Finished transfer manifest has an incomplete offset")
+        validate_transfer_manifest(manifest, transfer_id, expected_identity=self._identity)
+
+    @staticmethod
+    def validate_manifest(manifest: Any, transfer_id: Any) -> dict[str, Any]:
+        return validate_transfer_manifest(manifest, transfer_id)
 
     @staticmethod
     def _unique_pairs(pairs):
@@ -414,6 +319,76 @@ class ProtectedTransferSpool:
         if not isinstance(transfer_id, str) or not _TRANSFER_ID.fullmatch(transfer_id):
             raise TransferError("Transfer reference is invalid")
         return f"transfer-{transfer_id}"
+
+
+def validate_transfer_manifest(manifest: Any, transfer_id: Any,
+                               *, expected_identity: DeploymentIdentity | None = None) -> dict[str, Any]:
+    if (not isinstance(manifest, dict) or set(manifest) != _MANIFEST_FIELDS
+            or manifest.get("transfer_id") != transfer_id
+            or not isinstance(transfer_id, str) or not _TRANSFER_ID.fullmatch(transfer_id)
+            or not isinstance(manifest.get("identity"), dict)
+            or not isinstance(manifest.get("filename"), str) or not manifest["filename"]
+            or not isinstance(manifest.get("media_type"), str) or not manifest["media_type"]
+            or type(manifest.get("bytes")) is not int or manifest["bytes"] < 0
+            or not isinstance(manifest.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])
+            or manifest.get("state") not in {"staging", "staged", "uploading", "finished", "failed"}
+            or type(manifest.get("offset")) is not int
+            or not 0 <= manifest["offset"] <= manifest["bytes"]):
+        raise TransferError("Protected transfer manifest has an unsupported structure")
+    identity = DeploymentIdentity.from_dict(manifest["identity"])
+    if expected_identity is not None and not identity.matches(expected_identity):
+        raise TransferError("Protected transfer manifest identity does not match this Store")
+    failed_key, failure = manifest["failed_action_key"], manifest["failure"]
+    if manifest["state"] == "failed":
+        references = {manifest["begin_action_key"], manifest["pending_action_key"], manifest["finish_action_key"]}
+        if not _is_uuid(failed_key) or failed_key not in references or not _valid_failure(failure):
+            raise TransferError("Failed transfer manifest has invalid failure metadata")
+    elif failed_key is not None or failure is not None:
+        raise TransferError("Active transfer manifest has terminal failure metadata")
+    count = manifest["chunk_count"]
+    pending_length = manifest["staging_pending_length"]
+    pending_digest = manifest["staging_pending_sha256"]
+    if (type(count) is not int or count < 0
+            or count != (manifest["bytes"] + TRANSFER_CHUNK_BYTES - 1) // TRANSFER_CHUNK_BYTES
+            or not isinstance(manifest["admission_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", manifest["admission_id"])
+            or type(pending_length) is not int or not 0 <= pending_length <= TRANSFER_CHUNK_BYTES
+            or ((pending_length == 0) != (pending_digest is None))
+            or (pending_digest is not None and (not isinstance(pending_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", pending_digest)))
+            or (manifest["state"] in {"staged", "uploading", "finished"} and pending_length != 0)
+            or (manifest["state"] == "staging" and any(manifest[field] is not None for field in
+                ("upload_id", "begin_action_key", "pending_action_key", "pending_offset", "finish_action_key")))):
+        raise TransferError("Protected transfer manifest has invalid segmented chunk metadata")
+    for field in ("upload_id", "begin_action_key", "pending_action_key"):
+        value = manifest.get(field)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise TransferError("Protected transfer manifest has an invalid action reference")
+    finish_key = manifest.get("finish_action_key")
+    if finish_key is not None and (not isinstance(finish_key, str) or not finish_key):
+        raise TransferError("Protected transfer manifest has an invalid finish action reference")
+    if manifest["state"] == "finished" and finish_key is None:
+        raise TransferError("Finished transfer manifest has no finish action reference")
+    for field in ("pending_offset", "pending_length"):
+        value = manifest.get(field)
+        if value is not None and (type(value) is not int or value < 0):
+            raise TransferError("Protected transfer manifest has invalid pending chunk metadata")
+    pending = (manifest.get("pending_action_key"), manifest.get("pending_offset"), manifest.get("pending_length"))
+    if any(value is not None for value in pending) and not all(value is not None for value in pending):
+        raise TransferError("Protected transfer manifest has incomplete pending chunk metadata")
+    if pending[1] is not None and (pending[2] == 0 or pending[1] + pending[2] > manifest["bytes"]):
+        raise TransferError("Protected transfer manifest pending chunk is outside the frozen content")
+    if manifest["state"] == "uploading" and (manifest["upload_id"] is None or manifest["begin_action_key"] is None):
+        raise TransferError("Uploading transfer manifest has no server identity or begin action")
+    if manifest["state"] == "finished" and manifest["offset"] != manifest["bytes"]:
+        raise TransferError("Finished transfer manifest has an incomplete offset")
+    return manifest
+
+
+def decode_transfer_manifest(payload: bytes | str, transfer_id: Any) -> dict[str, Any]:
+    manifest = _strict_json_loads(payload)
+    return validate_transfer_manifest(manifest, transfer_id)
 
 
 class ResourceReader:

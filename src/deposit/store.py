@@ -17,8 +17,8 @@ import uuid
 
 from ._recovery.identity import DeploymentIdentity
 from ._recovery.journal import (
-    RESULT_FORMAT_IMPORT_V1,
-    RESULT_FORMAT_NAMED_ROWS_V1,
+    RESULT_FORMAT_IMPORT,
+    RESULT_FORMAT_NAMED_ROWS,
     JournalError,
     ProtectedJournal,
     UNRESOLVED_STATES,
@@ -786,22 +786,27 @@ class Store:
         pattern: Mapping[str, Any],
         values: Mapping[str, Any],
         rules: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ):
         """Submit form data for an ID-selected Pattern through the server workflow."""
         if not isinstance(pattern, Mapping) or not isinstance(values, Mapping):
             raise TypeError("Pattern must be an {id: UUID} selector and form values must be a mapping")
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("Pattern rules must be a mapping")
-        result = self._run_action(
+        self._client.require_paged_import_results()
+        key = str(uuid.uuid4())
+        envelope = self._run_action(
             "deposit.import.dataByPattern",
             [
                 _pattern_id_selector(pattern),
                 _portable_input(dict(values)),
                 _portable_input(dict(rules or {})),
             ],
+            _recovery_key=key,
+            result_format=RESULT_FORMAT_IMPORT,
         )
-        if not isinstance(result, dict):
-            raise DepositError("INVALID_RESPONSE", "Pattern form import returned no diagnostics")
+        result = self._import_result(key, envelope)
+        if result["kind"] == "diagnostic":
+            self._raise_import_diagnostic(result)
         return result
 
     def get_layout(
@@ -878,7 +883,7 @@ class Store:
             raise TypeError("rules must be a mapping")
         snapshot = from_networkx(graph)
         return self._analyze_import_snapshot(snapshot, rules=rules, require_subgraph=False)
-    def import_rows(self, rows, relationships=None, *, targets=None, rules=None) -> dict[str, Any]:
+    def import_rows(self, rows, relationships=None, *, targets=None, rules=None):
         """Analyze a frozen tabular submission; matching remains server-owned."""
         frozen_rows = _freeze_import_rows(rows)
         if relationships is None:
@@ -901,7 +906,14 @@ class Store:
             _portable_input(frozen_relationships),
             _portable_input(dict(rules or {})),
         ]
-        return _validated_import_plan(self._run_action("deposit.import.rows", request))
+        self._client.require_paged_import_results()
+        key = str(uuid.uuid4())
+        envelope = self._run_action("deposit.import.rows", request, _recovery_key=key,
+                                    result_format=RESULT_FORMAT_IMPORT)
+        result = self._import_result(key, envelope)
+        if result["kind"] == "diagnostic":
+            self._raise_import_diagnostic(result)
+        return result
 
     def import_subtree(
         self, subtree: Mapping[str, Any], *, rules: Mapping[str, Any] | None = None
@@ -926,7 +938,7 @@ class Store:
             raise TypeError("Import snapshot must be a manifest/graph mapping")
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("rules must be a mapping")
-        self._client.require_import_result_v1()
+        self._client.require_paged_import_results()
         frozen_source = _portable_input(dict(source))
         frozen_rules = _portable_input(dict(rules or {}))
         from ._imports import resource_free_exchange_package
@@ -946,27 +958,46 @@ class Store:
         request = [{"packageResourceId": resource_id}, frozen_rules]
         key = str(uuid.uuid4())
         envelope = self._run_action("deposit.import.analyze", request, _recovery_key=key,
-                                    result_format=RESULT_FORMAT_IMPORT_V1)
-        return self._import_result(key, envelope)
+                                    result_format=RESULT_FORMAT_IMPORT)
+        result = self._import_result(key, envelope)
+        if result["kind"] == "diagnostic":
+            self._raise_import_diagnostic(result)
+        return result
+
+    @staticmethod
+    def _raise_import_diagnostic(result):
+        try:
+            conflicts = result["conflicts"]
+        except KeyError as exc:
+            result.close()
+            raise DepositError("INVALID_RESPONSE", "Import diagnostic result has no conflicts") from exc
+        failure = DepositError(
+            "IMPORT_CONFLICT", "Import analysis found conflicts",
+            {"conflicts": conflicts}, result.operation_id,
+        )
+        # Keep the lazy detail reader alive for as long as the exception is
+        # retained; callers can close it explicitly after inspecting details.
+        failure.import_result = result
+        raise failure
 
     def import_apply(self, plan_id: str) -> dict[str, Any]:
         """Atomically apply the complete server plan through prepared recovery."""
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("plan_id must be a nonempty string")
-        self._client.require_import_result_v1()
+        self._client.require_paged_import_results()
         key = str(uuid.uuid4())
         envelope = self._run_action("deposit.import.apply", [plan_id], _recovery_key=key,
-                                    result_format=RESULT_FORMAT_IMPORT_V1)
+                                    result_format=RESULT_FORMAT_IMPORT)
         return self._import_result(key, envelope)
 
     def import_inspect(self, plan_id: str):
-        """Read a plan's immutable V1 analysis result without applying it."""
+        """Read a plan's immutable analysis result without applying it."""
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("plan_id must be a nonempty string")
-        self._client.require_import_result_v1()
+        self._client.require_paged_import_results()
         wrapper = self._call_one("deposit.get.importPlan", plan_id)
         if not valid_import_plan_wrapper(wrapper, plan_id=plan_id, namespace_id=self._namespace_id):
-            raise DepositError("INVALID_RESPONSE", "Import plan inspection returned an invalid V1 wrapper")
+            raise DepositError("INVALID_RESPONSE", "Import plan inspection returned an invalid wrapper")
         plan_observation = wrapper["plan"]
         envelope = wrapper["analysisResult"]
         try:
@@ -1002,7 +1033,7 @@ class Store:
                     or self._actor_id != selected_actor or self._namespace_id != selected_namespace
                     or self._client is not selected_client or self._closed or self._closing):
                 raise DepositError("STORE_SELECTION_CHANGED", "Import result reader is bound to its original Store selection")
-            return self._call_one("deposit.get.importResultPageV1", selected_result_id,
+            return self._call_one("deposit.get.importResultPage", selected_result_id,
                                   collection, cursor, limit)
 
         def attach_result():
@@ -1052,11 +1083,12 @@ class Store:
         bound = bind_arguments(entry, arguments, namespace_id=self._namespace_id)
         if entry["action"]:
             portable = _portable_input(list(bound))
-            result_format = RESULT_FORMAT_IMPORT_V1 if procedure in {
-                "deposit.import.analyze", "deposit.import.apply"
-            } else RESULT_FORMAT_NAMED_ROWS_V1
-            if result_format == RESULT_FORMAT_IMPORT_V1:
-                self._client.require_import_result_v1()
+            result_format = RESULT_FORMAT_IMPORT if procedure in {
+                "deposit.import.analyze", "deposit.import.rows", "deposit.import.dataByPattern",
+                "deposit.import.apply"
+            } else RESULT_FORMAT_NAMED_ROWS
+            if result_format == RESULT_FORMAT_IMPORT:
+                self._client.require_paged_import_results()
             with self._serialized():
                 self._update_observed_revision()
                 revision = self._observed_revision
@@ -1070,8 +1102,11 @@ class Store:
                     result_format=result_format,
                 )
                 outcome = self._resolve_action_locked(record, allow_new_prepare=True)
-                if result_format == RESULT_FORMAT_IMPORT_V1:
-                    return self._import_result(record["key"], outcome)
+                if result_format == RESULT_FORMAT_IMPORT:
+                    result = self._import_result(record["key"], outcome)
+                    if result["kind"] == "diagnostic":
+                        self._raise_import_diagnostic(result)
+                    return result
                 return detached_result(entry, outcome, self._token)
         return self._open_result(entry, bound)
 
@@ -1729,8 +1764,8 @@ class Store:
                 if stale_handle is not None:
                     stale_handle._mark_stale()
                 raise DepositError("REVISION_CONFLICT", "Entity handle baseline is stale; refresh and reapply explicitly")
-            if result_format == RESULT_FORMAT_IMPORT_V1:
-                self._client.require_import_result_v1()
+            if result_format == RESULT_FORMAT_IMPORT:
+                self._client.require_paged_import_results()
             record = self._journal.create(self._identity, procedure, arguments, revision,
                                           result_format=result_format, key=_recovery_key)
             try:
@@ -2062,7 +2097,7 @@ class Store:
             return self._save_and_release(
                 record,
                 {"state": "committed", "operationId": resumed.get("operationId"), "outcome": result},
-                outcome_is_named_rows=record.get("result_format") == RESULT_FORMAT_NAMED_ROWS_V1,
+                outcome_is_named_rows=record.get("result_format") == RESULT_FORMAT_NAMED_ROWS,
             )
 
         if state in {"outcome_saved", "release_sent"}:
@@ -2129,7 +2164,7 @@ class Store:
             if column not in row and column in {"node", "rel"}:
                 value = row.get("data")
             values[column] = value
-        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS_V1:
+        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS:
             return self._normalize_named_rows_result(
                 entry,
                 named_rows_result(tuple(entry["columns"]), [_portable_input(values)]),
@@ -2191,25 +2226,29 @@ class Store:
         if not isinstance(outcome, dict):
             raise DepositError("INVALID_RESPONSE", "Prepared action has no saved portable outcome")
         entry = store_procedure(record["procedure"])
-        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS_V1:
+        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS:
             outcome = self._normalize_named_rows_result(
                 entry,
                 outcome,
                 outcome_is_named_rows=outcome_is_named_rows,
             )
-        elif record.get("result_format") == RESULT_FORMAT_IMPORT_V1:
+        elif record.get("result_format") == RESULT_FORMAT_IMPORT:
             named = self._normalize_named_rows_result(
                 entry, outcome, outcome_is_named_rows=outcome_is_named_rows,
             )
             if (named["columns"] != ["data"] or len(named["rows"]) != 1
                     or not valid_import_result_envelope(named["rows"][0].get("data"))):
-                raise DepositError("INVALID_RESPONSE", "Prepared import action returned an invalid V1 result")
+                raise DepositError("INVALID_RESPONSE", "Prepared import action returned an invalid result")
             outcome = named["rows"][0]["data"]
             if (outcome["namespaceId"] != self._namespace_id
                     or outcome["operationId"] != status.get("operationId")):
                 raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Import result does not match its committed action")
-            expected_kind = "analysis" if record["procedure"] == "deposit.import.analyze" else "apply"
-            if outcome["kind"] != expected_kind:
+            expected_kind = "analysis" if record["procedure"] in {
+                "deposit.import.analyze", "deposit.import.rows", "deposit.import.dataByPattern"
+            } else "apply"
+            valid_kind = (outcome["kind"] in {"analysis", "diagnostic"}
+                          if expected_kind == "analysis" else outcome["kind"] == expected_kind)
+            if not valid_kind:
                 raise DepositError("INVALID_RESPONSE", "Import result kind does not match its action")
         elif (
             entry["scope"] == "namespace"
@@ -2222,7 +2261,7 @@ class Store:
             outcome = _portable_input(outcome)
         key = record["key"]
         current = self._journal.load(self._identity, key)
-        if record.get("result_format") == RESULT_FORMAT_IMPORT_V1:
+        if record.get("result_format") == RESULT_FORMAT_IMPORT:
             if current["state"] in {"outcome_saved", "release_sent", "released"}:
                 if current["outcome"] != outcome:
                     raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved import result changed during recovery")
@@ -2240,7 +2279,7 @@ class Store:
                     raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Committed import result changed during recovery")
 
                 def fetch_page(collection, cursor, limit):
-                    return self._call_one("deposit.get.importResultPageV1",
+                    return self._call_one("deposit.get.importResultPage",
                                           outcome["resultId"], collection, cursor, limit)
 
                 try:
@@ -2379,20 +2418,6 @@ def _freeze_import_rows(rows: Any) -> list[dict[str, Any]]:
         seen.add(row_id)
         frozen.append({"id": row_id, "values": dict(values)})
     return frozen
-
-
-def _validated_import_plan(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise DepositError("INVALID_RESPONSE", "Import analysis returned no portable plan")
-    plan_id = value.get("planId")
-    target_revision = value.get("targetRevision")
-    if not isinstance(plan_id, str) or not plan_id:
-        raise DepositError("INVALID_RESPONSE", "Import analysis returned no executable plan ID")
-    if type(target_revision) is not int or target_revision < 0:
-        raise DepositError("INVALID_RESPONSE", "Import analysis returned no target revision")
-    if not isinstance(value.get("groups"), list) or not isinstance(value.get("summary"), dict):
-        raise DepositError("INVALID_RESPONSE", "Import analysis returned invalid plan diagnostics")
-    return value
 
 
 def _schema_from_class_data(data: Any) -> dict[str, str]:
