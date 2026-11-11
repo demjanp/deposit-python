@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hashlib
+from contextlib import contextmanager
 import io
-import json
 from typing import Any
-import zipfile
 
 
 GRAPH_CATEGORIES = (
@@ -21,20 +19,10 @@ MANIFEST_FIELDS = (
 )
 
 
-def resource_free_exchange_package(
-    snapshot: Mapping[str, Any], *, require_subgraph: bool = False
-) -> bytes:
-    """Serialize a detached manifest/graph snapshot as the server's Exchange ZIP.
-
-    Resource payloads require a separate public shape decision. This path only
-    packages snapshots whose graph and archive file list contain no resources.
-    """
+def _validate_snapshot_shape(snapshot, require_subgraph, allow_resources):
     if not isinstance(snapshot, Mapping) or set(snapshot) - {"manifest", "graph", "history"}:
         raise TypeError("Import snapshot must contain only manifest, graph, and optional history")
-    if "manifest" not in snapshot or "graph" not in snapshot:
-        raise TypeError("Import snapshot requires manifest and graph mappings")
-    manifest = snapshot["manifest"]
-    graph = snapshot["graph"]
+    manifest, graph = snapshot.get("manifest"), snapshot.get("graph")
     if not isinstance(manifest, dict) or not isinstance(graph, dict):
         raise TypeError("Import snapshot manifest and graph must be portable mappings")
     if any(name not in manifest for name in MANIFEST_FIELDS):
@@ -43,9 +31,7 @@ def resource_free_exchange_package(
         raise ValueError("Import snapshot graph categories are incomplete")
     if any(not isinstance(graph[name], list) for name in GRAPH_CATEGORIES):
         raise TypeError("Import snapshot graph categories must be lists")
-    if graph["resources"]:
-        raise ValueError("Resource-bearing import snapshots require the approved content mapping")
-    if _contains_resource_reference(snapshot):
+    if not allow_resources and graph["resources"]:
         raise ValueError("Resource-bearing import snapshots require the approved content mapping")
     scope = manifest.get("scope")
     if scope not in {"subgraph", "namespace"}:
@@ -58,55 +44,79 @@ def resource_free_exchange_package(
         raise ValueError("Import snapshot history member does not match its manifest")
     if history is not None and not isinstance(history, dict):
         raise TypeError("Import snapshot history must be a portable mapping")
-    if scope == "subgraph" and history is not None:
-        raise ValueError("Subgraph import snapshots cannot include Namespace history")
-
+    mode = manifest.get("historyMode")
+    if mode not in {"disabled", "transient", "persistent"}:
+        raise ValueError("Import snapshot Namespace history mode is invalid")
+    if include_history != (scope == "namespace" and mode == "persistent"):
+        raise ValueError("Import snapshot history does not match its scope/history mode")
     supplied_files = manifest.get("files", {})
     if not isinstance(supplied_files, dict):
         raise TypeError("Import snapshot files must be a mapping")
-    allowed_supplied = {"graph.json"} | ({"history.json"} if history is not None else set())
-    if set(supplied_files) - allowed_supplied:
-        raise ValueError("Resource-bearing import snapshots require the approved content mapping")
+    if not allow_resources:
+        allowed = {"graph.json"} | ({"history.json"} if history is not None else set())
+        if set(supplied_files) - allowed:
+            raise ValueError("Resource-bearing import snapshots require the approved content mapping")
 
-    graph_bytes = _json_bytes(graph)
-    members = {"graph.json": graph_bytes}
-    if history is not None:
-        members["history.json"] = _json_bytes(history)
-    package_manifest = dict(manifest)
-    package_manifest["files"] = {
-        name: {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
-        for name, content in members.items()
-    }
-    members["manifest.json"] = _json_bytes(package_manifest)
 
+@contextmanager
+def prepared_exchange_package(snapshot, resources, *, storage, require_subgraph=False, checkpoint=None):
+    """Prepare a transport/integrity-checked package in supplied storage.
+
+    The yielded lazy package and its immutable source ZIP belong to this context.
+    Graph/history domain semantics remain the Deposit Server's responsibility.
+    This is the bounded provider path; Stage 5 decides when workflows adopt it.
+    """
+    from .exchange import ProtectedChunkFile, validate_exchange_archive, write_exchange_package
+    _validate_snapshot_shape(snapshot, require_subgraph, True)
+    with ProtectedChunkFile(storage) as staged:
+        write_exchange_package(staged, snapshot, resources, checkpoint=checkpoint)
+        staged.seek(0)
+        with validate_exchange_archive(staged, checkpoint=checkpoint) as package:
+            yield package
+
+
+class _MaterializationStore:
+    """Process-memory spools for the explicitly materializing bytes adapter.
+
+    Nothing is written to disk. This compatibility boundary intentionally keeps
+    its output and validation storage in memory; scalable callers use the
+    context-managed provider path with ProtectedStore instead.
+    """
+    MAX_RECORD_BYTES = 16 * 1024 * 1024
+
+    def __init__(self):
+        self.records = {}
+
+    def write(self, name, value):
+        self.records[name] = bytes(value)
+
+    def read(self, name):
+        return self.records[name]
+
+    def has_record(self, name):
+        return name in self.records
+
+    def delete(self, name):
+        self.records.pop(name, None)
+
+    def usage_bytes(self):
+        return 0  # This adapter has no filesystem storage.
+
+
+def resource_free_exchange_package(snapshot: Mapping[str, Any], *, require_subgraph: bool = False) -> bytes:
+    """Explicitly materialize resource-free Exchange bytes for existing callers.
+
+    ZIP generation and transport/integrity validation share the bounded Exchange
+    implementation. Domain semantics remain the Server's responsibility. The
+    bytes result and in-memory validation are intentional
+    materialization; this helper must not be used for scalable resource relays.
+    """
+    from .exchange import validate_exchange_archive, write_exchange_package
+    _validate_snapshot_shape(snapshot, require_subgraph, False)
+    storage = _MaterializationStore()
     output = io.BytesIO()
-    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name in ("manifest.json", "graph.json", "history.json"):
-            content = members.get(name)
-            if content is None:
-                continue
-            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o600 << 16
-            archive.writestr(info, content)
+    write_exchange_package(output, snapshot, {}, storage=storage)
+    output.seek(0)
+    with validate_exchange_archive(output, storage=storage):
+        pass
     return output.getvalue()
-
-
-def _json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-    ).encode("utf-8")
-
-
-def _contains_resource_reference(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        if (
-            "resourceId" in value
-            or value.get("kind") in ("Resource", "DResource")
-            or value.get("entityKind") in ("Resource", "DResource")
-        ):
-            return True
-        return any(_contains_resource_reference(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_resource_reference(item) for item in value)
-    return False

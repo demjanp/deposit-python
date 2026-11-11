@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import ExitStack, contextmanager
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -32,11 +33,16 @@ class _DataBlob(ctypes.Structure):
 
 def _blob(data: bytes) -> tuple[_DataBlob, ctypes.Array]:
     backing = ctypes.create_string_buffer(data, max(1, len(data)))
-    return _DataBlob(len(data), ctypes.cast(backing, ctypes.POINTER(ctypes.c_byte))), backing
+    # Casting the array itself installs a ctypes ownership cycle in _objects.
+    # The caller explicitly retains backing for the synchronous native call.
+    return _DataBlob(len(data), ctypes.cast(ctypes.addressof(backing), ctypes.POINTER(ctypes.c_byte))), backing
 
 
+@lru_cache(maxsize=1)
 def _dpapi_apis():
     """Load DPAPI functions with pointer-sized signatures and thread-local last error."""
+    if os.name != "nt":
+        raise ProtectedStorageError("Windows DPAPI is required for recovery storage")
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -84,15 +90,19 @@ def _crypt(data: bytes, *, protect: bool) -> bytes:
         failure = exc
     finally:
         free_failure: Exception | None = None
-        if target.pbData:
+        output_pointer = ctypes.c_void_p.from_address(
+            ctypes.addressof(target) + _DataBlob.pbData.offset).value
+        if output_pointer:
             try:
-                remaining = kernel32.LocalFree(ctypes.cast(target.pbData, ctypes.c_void_p))
+                remaining = kernel32.LocalFree(output_pointer)
                 if remaining:
                     free_failure = OSError("Windows LocalFree failed")
             except Exception as exc:
                 free_failure = exc
         if free_failure is not None and failure is None:
             failure = free_failure
+        # Keep the source owner alive until all synchronous native work ends.
+        del source_memory
     if failure is not None:
         raise ProtectedStorageError("Windows DPAPI operation failed") from failure
     if result is None:
@@ -125,49 +135,59 @@ class _AllowedAce(ctypes.Structure):
                 ("sid", wintypes.DWORD)]
 
 
+@lru_cache(maxsize=1)
+def _acl_native_apis():
+    """Load immutable typed Windows API bindings, but never cache a user SID."""
+    if os.name != "nt":
+        raise ProtectedStorageError("Windows ACLs are required for recovery storage")
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    out_pointer = ctypes.POINTER(pointer)
+    signatures = {
+        "OpenProcessToken": ([wintypes.HANDLE, wintypes.DWORD, out_pointer], wintypes.BOOL),
+        "OpenThreadToken": ([wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, out_pointer], wintypes.BOOL),
+        "GetTokenInformation": ([wintypes.HANDLE, ctypes.c_int, pointer, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "ConvertSidToStringSidW": ([pointer, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW":
+            ([wintypes.LPCWSTR, wintypes.DWORD, out_pointer, pointer], wintypes.BOOL),
+        "GetSecurityDescriptorDacl": ([pointer, ctypes.POINTER(wintypes.BOOL), out_pointer,
+                                        ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+        "GetSecurityDescriptorControl": ([pointer, ctypes.POINTER(wintypes.WORD),
+                                          ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "GetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, out_pointer,
+                             pointer, out_pointer, pointer, out_pointer], wintypes.DWORD),
+        "SetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, pointer,
+                             pointer, pointer, pointer], wintypes.DWORD),
+        "EqualSid": ([pointer, pointer], wintypes.BOOL),
+        "GetAce": ([pointer, wintypes.DWORD, out_pointer], wintypes.BOOL),
+    }
+    for name, (arguments, result) in signatures.items():
+        function = getattr(advapi, name)
+        function.argtypes, function.restype = arguments, result
+    signatures = {
+        "CreateFileW": ([wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, pointer,
+                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
+        "CreateDirectoryW": ([wintypes.LPCWSTR, pointer], wintypes.BOOL),
+        "GetFileInformationByHandle": ([wintypes.HANDLE, ctypes.POINTER(_FileInformation)], wintypes.BOOL),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "LocalFree": ([pointer], pointer),
+        "GetCurrentProcess": ([], wintypes.HANDLE),
+        "GetCurrentThread": ([], wintypes.HANDLE),
+    }
+    for name, (arguments, result) in signatures.items():
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = arguments, result
+    return advapi, kernel
+
+
 class _WindowsAcl:
     """Native SID and handle based protection; never modify owner or SACL."""
 
     def __init__(self):
-        self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
-        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.advapi, self.kernel = _acl_native_apis()
         pointer = ctypes.c_void_p
-        out_pointer = ctypes.POINTER(pointer)
-        signatures = {
-            "OpenProcessToken": ([wintypes.HANDLE, wintypes.DWORD, out_pointer], wintypes.BOOL),
-            "OpenThreadToken": ([wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, out_pointer], wintypes.BOOL),
-            "GetTokenInformation": ([wintypes.HANDLE, ctypes.c_int, pointer, wintypes.DWORD,
-                                     ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
-            "ConvertSidToStringSidW": ([pointer, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW":
-                ([wintypes.LPCWSTR, wintypes.DWORD, out_pointer, pointer], wintypes.BOOL),
-            "GetSecurityDescriptorDacl": ([pointer, ctypes.POINTER(wintypes.BOOL), out_pointer,
-                                            ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
-            "GetSecurityDescriptorControl": ([pointer, ctypes.POINTER(wintypes.WORD),
-                                               ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
-            "GetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, out_pointer,
-                                 pointer, out_pointer, pointer, out_pointer], wintypes.DWORD),
-            "SetSecurityInfo": ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, pointer,
-                                 pointer, pointer, pointer], wintypes.DWORD),
-            "EqualSid": ([pointer, pointer], wintypes.BOOL),
-            "GetAce": ([pointer, wintypes.DWORD, out_pointer], wintypes.BOOL),
-        }
-        for name, (arguments, result) in signatures.items():
-            function = getattr(self.advapi, name)
-            function.argtypes, function.restype = arguments, result
-        signatures = {
-            "CreateFileW": ([wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, pointer,
-                             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
-            "CreateDirectoryW": ([wintypes.LPCWSTR, pointer], wintypes.BOOL),
-            "GetFileInformationByHandle": ([wintypes.HANDLE, ctypes.POINTER(_FileInformation)], wintypes.BOOL),
-            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
-            "LocalFree": ([pointer], pointer),
-            "GetCurrentProcess": ([], wintypes.HANDLE),
-            "GetCurrentThread": ([], wintypes.HANDLE),
-        }
-        for name, (arguments, result) in signatures.items():
-            function = getattr(self.kernel, name)
-            function.argtypes, function.restype = arguments, result
         token = pointer()
         if not self.advapi.OpenThreadToken(self.kernel.GetCurrentThread(), 8, True, ctypes.byref(token)):
             if ctypes.get_last_error() != 1008:  # ERROR_NO_TOKEN
@@ -178,7 +198,7 @@ class _WindowsAcl:
             self.advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
             self.token_user = ctypes.create_string_buffer(size.value)
             self.check(self.advapi.GetTokenInformation(token, 1, self.token_user, size, ctypes.byref(size)))
-            self.sid = ctypes.cast(self.token_user, ctypes.POINTER(pointer))[0]
+            self.sid = ctypes.cast(ctypes.addressof(self.token_user), ctypes.POINTER(pointer))[0]
         finally:
             self.kernel.CloseHandle(token)
         sid_text = wintypes.LPWSTR()
@@ -186,7 +206,8 @@ class _WindowsAcl:
         try:
             self.sid_text = sid_text.value
         finally:
-            self.kernel.LocalFree(ctypes.cast(sid_text, pointer))
+            sid_pointer = ctypes.c_void_p.from_address(ctypes.addressof(sid_text)).value
+            self.kernel.LocalFree(sid_pointer)
 
     @staticmethod
     def check(result):
@@ -205,7 +226,7 @@ class _WindowsAcl:
         try:
             yield descriptor
         finally:
-            self.kernel.LocalFree(descriptor)
+            self.kernel.LocalFree(descriptor.value)
 
     def dacl(self, descriptor):
         present, defaulted = wintypes.BOOL(), wintypes.BOOL()
@@ -226,7 +247,7 @@ class _WindowsAcl:
         try:
             yield owner, acl, descriptor
         finally:
-            self.kernel.LocalFree(descriptor)
+            self.kernel.LocalFree(descriptor.value)
 
     def validate_target(self, handle, directory):
         info = _FileInformation()
@@ -248,11 +269,11 @@ class _WindowsAcl:
             if not control.value & 0x1000 or not acl.value:
                 raise PermissionError("Recovery DACL is not protected and non-null")
             self.dacl(descriptor)
-            if ctypes.cast(acl, ctypes.POINTER(_AclHeader)).contents.count != 1:
+            if _AclHeader.from_address(acl.value).count != 1:
                 raise PermissionError("Recovery DACL contains unexpected grants")
             ace = ctypes.c_void_p()
             self.check(self.advapi.GetAce(acl, 0, ctypes.byref(ace)))
-            allowed = ctypes.cast(ace, ctypes.POINTER(_AllowedAce)).contents
+            allowed = _AllowedAce.from_address(ace.value)
             sid = ace.value + _AllowedAce.sid.offset
             if (allowed.kind != 0 or allowed.flags != (3 if directory else 0)
                     or allowed.mask != 0x1F01FF or not self.advapi.EqualSid(sid, self.sid)):
@@ -617,13 +638,22 @@ class ProtectedStore:
         # Serialize writes across registered roots while replacing the root
         # registry. Capacity is determined by the filesystem, not a byte quota.
         with self.user_quota_lock():
-            with _private_file(temporary, create=True) as output:
-                _secure_acl(temporary, directory=False)
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
-                output.close()
-                os.replace(temporary, path)
+            try:
+                with _private_file(temporary, create=True) as output:
+                    _secure_acl(temporary, directory=False)
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    output.close()
+                    os.replace(temporary, path)
+            except BaseException:
+                # This invocation alone created this exact temporary path.
+                # Failed cleanup remains visible to ownership reconciliation.
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as cleanup:
+                    raise ProtectedStorageError("Protected write temporary cleanup failed") from cleanup
+                raise
         return path
 
     def read(self, name: str) -> bytes:
@@ -648,9 +678,8 @@ class ProtectedStore:
         except OSError as exc:
             raise ProtectedStorageError("Protected record size is unavailable") from exc
 
-    def list_records(self) -> tuple[str, ...]:
-        """List protected record names without decrypting their contents."""
-        names = []
+    def iter_records(self):
+        """Stream validated protected record names without decrypting contents."""
         try:
             with os.scandir(self.root) as entries:
                 for entry in entries:
@@ -659,12 +688,15 @@ class ProtectedStore:
                     details = entry.stat(follow_symlinks=False)
                     if not stat.S_ISREG(details.st_mode):
                         raise ProtectedStorageError("Unexpected link in recovery storage")
-                    names.append(entry.name[:-len(".dpapi")])
+                    yield entry.name[:-len(".dpapi")]
         except ProtectedStorageError:
             raise
         except OSError as exc:
             raise ProtectedStorageError("Recovery journal records cannot be listed safely") from exc
-        return tuple(sorted(names))
+
+    def list_records(self) -> tuple[str, ...]:
+        """Return an ordered collection when a caller explicitly needs one."""
+        return tuple(sorted(self.iter_records()))
 
     def has_record(self, name: str) -> bool:
         """Check one protected record name without enumerating the root."""
@@ -724,6 +756,23 @@ class ProtectedStore:
         return FileLock(self.root / f"{name}.lock", timeout)
 
 
+@lru_cache(maxsize=1)
+def _volume_apis():
+    if os.name != "nt":
+        raise ProtectedStorageError("Windows volume APIs are unavailable")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateFileW": ([wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE], wintypes.HANDLE),
+        "GetFinalPathNameByHandleW": ([wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD], wintypes.DWORD),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+    }
+    for name, (arguments, result) in signatures.items():
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = arguments, result
+    return kernel
+
+
 class StorageAdmissionCoordinator:
     """Durable disk-space commitments shared by protected recovery roots.
 
@@ -745,18 +794,13 @@ class StorageAdmissionCoordinator:
             raise ProtectedStorageError("Storage volume cannot be identified")
         try:
             if os.name == "nt":
-                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel = _volume_apis()
                 create_file = kernel.CreateFileW
-                create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-                create_file.restype = wintypes.HANDLE
                 handle = create_file(str(probe), 0x80, 0x7, None, 3, 0x02000000, None)
                 if handle == ctypes.c_void_p(-1).value:
                     raise ctypes.WinError(ctypes.get_last_error())
                 try:
                     resolve = kernel.GetFinalPathNameByHandleW
-                    resolve.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
-                    resolve.restype = wintypes.DWORD
 
                     def final_name(kind):
                         needed = resolve(handle, None, 0, kind)
@@ -778,8 +822,6 @@ class StorageAdmissionCoordinator:
                     nt_root = nt_match.group(1).casefold()
                     return f"nt:{nt_root}", probe, guid_root, nt_root
                 finally:
-                    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-                    kernel.CloseHandle.restype = wintypes.BOOL
                     kernel.CloseHandle(handle)
             # This branch supports isolated filesystem tests. Production
             # ProtectedStore refuses non-Windows hosts.
@@ -859,7 +901,7 @@ class StorageAdmissionCoordinator:
                 owner_store = self.store if root == self.store.root else object.__new__(ProtectedStore)
                 owner_store.root = root
                 coordinator = self if owner_store is self.store else StorageAdmissionCoordinator(owner_store)
-                for name in owner_store.list_records():
+                for name in owner_store.iter_records():
                     if not name.startswith("admission-"):
                         continue
                     try:
@@ -867,7 +909,7 @@ class StorageAdmissionCoordinator:
                         self._validate_reservation(record)
                     except Exception as exc:
                         raise ProtectedStorageError("Admission ownership cannot be reconciled safely") from exc
-                    if record.get("ownership_resolved"):
+                    if record.get("ownership_resolved") and record.get("purpose") != "exchange-staging":
                         continue
                     lock = coordinator.writer(record)
                     try:
@@ -876,14 +918,25 @@ class StorageAdmissionCoordinator:
                         observed.append({"id": record["id"], "writer_alive": True,
                                          "ownership_resolved": False, "commitments_retained": True})
                         continue
+                    artifacts = None
+                    observation = None
                     try:
                         artifacts = coordinator._reconcile_owner(record)
-                        observed.append({"id": record["id"], "writer_alive": False,
-                                         "ownership_resolved": artifacts.get("resolved", False),
-                                         "artifacts": artifacts,
-                                         "commitments_retained": not artifacts.get("resolved", False)})
+                        observation = {"id": record["id"], "writer_alive": False,
+                                       "ownership_resolved": artifacts.get("resolved", False),
+                                       "artifacts": artifacts,
+                                       "commitments_retained": not artifacts.get("resolved", False)}
+                        observed.append(observation)
                     finally:
                         lock.release()
+                        if (record.get("purpose") == "exchange-staging" and artifacts is not None
+                                and artifacts.get("resolved")):
+                            try:
+                                lock.path.unlink(missing_ok=True)
+                                owner_store.delete(f"admission-{record['id']}")
+                            except Exception:
+                                observation.update(ownership_resolved=False, commitments_retained=True,
+                                                   artifacts={"state": "cleanup_pending", "resolved": False})
         return tuple(observed)
 
     def _normalize(self, values: dict[str, int]) -> tuple[dict[str, int], dict[str, dict[str, str | None]]]:
@@ -906,7 +959,7 @@ class StorageAdmissionCoordinator:
         for root in roots:
             probe_store = self.store if root == self.store.root else object.__new__(ProtectedStore)
             probe_store.root = root
-            for name in probe_store.list_records():
+            for name in probe_store.iter_records():
                 if not name.startswith("admission-") or name == f"admission-{excluding}":
                     continue
                 try:
@@ -975,6 +1028,8 @@ class StorageAdmissionCoordinator:
         return self.store.lock(f"admission-owner-{reservation['id']}", timeout=0.0)
 
     def _reconcile_owner(self, record: dict) -> dict:
+        if record.get("purpose") == "exchange-staging":
+            return ExchangeStagingOwner.reconcile(self, record)
         if record.get("purpose") == "journal-record":
             name = record.get("owner_id")
             if not isinstance(name, str) or Path(name).name != name or not name:
@@ -982,7 +1037,7 @@ class StorageAdmissionCoordinator:
             try:
                 if self._has_temporary_files():
                     return {"state": "uncertain", "reason": "protected write temporary files remain"}
-                if name in self.store.list_records():
+                if self.store.has_record(name):
                     self.store.read(name)  # authenticate and validate the completed segment
                     segment_state = "materialized"
                 else:
@@ -1008,7 +1063,7 @@ class StorageAdmissionCoordinator:
             if pending_length:
                 index = count
                 names = (f"transfer-{owner}-chunk-{index:08d}", f"transfer-{owner}-meta-{index:08d}")
-                present = [name in self.store.list_records() for name in names]
+                present = [self.store.has_record(name) for name in names]
                 if present[0] != present[1]:
                     return {"state": "uncertain", "reason": "partial pending chunk artifacts"}
                 if present[0]:
@@ -1055,3 +1110,195 @@ class StorageAdmissionCoordinator:
             raise
         except OSError as exc:
             raise ProtectedStorageError("Protected temporary files cannot be reconciled") from exc
+
+
+class ExchangeStagingOwner:
+    """Durable admission and exact cleanup ownership for one temporary stream."""
+
+    def __init__(self, store: ProtectedStore, owner_id: str, chunk_size: int):
+        self.store = store
+        self.coordinator = StorageAdmissionCoordinator(store)
+        self.owner_id, self.chunk_size = owner_id, chunk_size
+        self.prefix = f"exchange-{owner_id}"
+        self.name = f"{self.prefix}-owner"
+        self.reservation = None
+        self.writer_lock = None
+        self.extent = 0
+        self.pending = None
+        self.cleanup = False
+        self.complete = False
+
+    def _ensure(self):
+        if self.reservation is None:
+            with self.store.user_quota_lock():
+                self.reservation = self.coordinator.acquire(
+                    self.owner_id, "exchange-staging", {str(self.store.root): 0})
+                lock = self.coordinator.writer(self.reservation)
+                lock.acquire()
+                self.writer_lock = lock
+            self._save()
+
+    def _metadata(self):
+        return {"owner_id": self.owner_id, "admission_id": self.reservation["id"],
+                "prefix": self.prefix, "chunk_size": self.chunk_size,
+                "extent": self.extent, "pending_write": self.pending, "cleanup": self.cleanup}
+
+    def _admitted_write(self, name, payload):
+        # The old destination already reduces measured free space. Admit the
+        # complete new encrypted temporary copy before replacing it.
+        estimate = len(payload) + 65536
+        root = str(self.store.root)
+        self.coordinator.grow(self.reservation, {root: estimate})
+        self.store.write(name, payload)
+        actual = self.store.record_size(name)
+        self.coordinator.materialized(self.reservation, self.store.root, actual)
+        self.coordinator.release(self.reservation, {root: estimate - actual})
+
+    def _save(self):
+        self._admitted_write(self.name, json.dumps(
+            self._metadata(), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
+    def write(self, index: int, payload: bytes):
+        if self.cleanup or self.complete:
+            raise ProtectedStorageError("Exchange staging owner is closed for writes")
+        self._ensure()
+        self.pending = {"index": index, "bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest()}
+        self._save()
+        self._admitted_write(f"{self.prefix}-{index:016x}", payload)
+        self.extent = max(self.extent, index + 1)
+        self.pending = None
+        self._save()
+
+    def close(self):
+        if self.complete:
+            return
+        if self.reservation is None:
+            self.complete = True
+            return
+        with self.store.user_quota_lock():
+            self._close_locked()
+
+    def _close_locked(self):
+        extent = max(self.extent, 0 if self.pending is None else self.pending["index"] + 1)
+        if not self.store.has_record(f"admission-{self.reservation['id']}"):
+            if self.store.has_record(self.name) or any(
+                    self.store.has_record(f"{self.prefix}-{index:016x}") for index in range(extent)):
+                if self.writer_lock is not None:
+                    self.writer_lock.release()
+                    self.writer_lock = None
+                raise ProtectedStorageError("Exchange admission ownership is missing")
+            lock = self.writer_lock or self.coordinator.writer(self.reservation)
+            lock.release()
+            lock.path.unlink(missing_ok=True)
+            self.writer_lock = None
+            self.complete = True
+            return
+        if self.writer_lock is None:
+            lock = self.coordinator.writer(self.reservation)
+            lock.acquire()
+            self.writer_lock = lock
+        ready = False
+        try:
+            self.cleanup = True
+            durable = self.coordinator._load(self.reservation)
+            # Existing metadata still proves exact ownership if a disk-full
+            # condition prevents recording the cleanup transition.
+            if not durable["ownership_resolved"]:
+                try:
+                    self._save()
+                except Exception:
+                    pass
+            failure = None
+            for index in range(extent):
+                try:
+                    self.store.delete(f"{self.prefix}-{index:016x}")
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+            if failure is not None:
+                raise ProtectedStorageError("Exchange staging cleanup is incomplete") from failure
+            if self.coordinator._has_temporary_files():
+                raise ProtectedStorageError("Exchange staging write ownership remains uncertain")
+            record = self.coordinator._load(self.reservation)
+            outstanding = sum(record["commitments"].values())
+            if outstanding:
+                self.coordinator.release(self.reservation, {str(self.store.root): outstanding})
+            if not record["ownership_resolved"]:
+                self.coordinator.close(self.reservation)
+            self.store.delete(self.name)
+            ready = True
+        finally:
+            lock = self.writer_lock
+            lock.release()
+            self.writer_lock = None
+            if ready:
+                # The quota lock excludes a reconciler between retiring this
+                # unique writer lock and removing its final durable marker.
+                lock.path.unlink(missing_ok=True)
+                self.store.delete(f"admission-{self.reservation['id']}")
+                self.complete = True
+
+    @staticmethod
+    def _validate(metadata, record):
+        owner = record["owner_id"]
+        required = {"owner_id", "admission_id", "prefix", "chunk_size", "extent", "pending_write", "cleanup"}
+        if (not isinstance(metadata, dict) or set(metadata) != required
+                or not re.fullmatch(r"[0-9a-f]{32}", owner)
+                or metadata["owner_id"] != owner or metadata["admission_id"] != record["id"]
+                or metadata["prefix"] != f"exchange-{owner}"
+                or type(metadata["chunk_size"]) is not int
+                or not 1 <= metadata["chunk_size"] <= ProtectedStore.MAX_RECORD_BYTES
+                or type(metadata["extent"]) is not int or metadata["extent"] < 0
+                or type(metadata["cleanup"]) is not bool):
+            raise ProtectedStorageError("Exchange staging owner is corrupt")
+        pending = metadata["pending_write"]
+        if pending is not None and (not isinstance(pending, dict)
+                or set(pending) != {"index", "bytes", "sha256"}
+                or type(pending["index"]) is not int or not 0 <= pending["index"] <= metadata["extent"]
+                or type(pending["bytes"]) is not int or not 0 <= pending["bytes"] <= metadata["chunk_size"]
+                or not isinstance(pending["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", pending["sha256"])):
+            raise ProtectedStorageError("Exchange pending write is corrupt")
+        return metadata
+
+    @staticmethod
+    def reconcile(coordinator, record):
+        owner = record.get("owner_id")
+        if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+            return {"state": "uncertain", "reason": "invalid Exchange owner"}
+        store = coordinator.store
+        name = f"exchange-{owner}-owner"
+        try:
+            if coordinator._has_temporary_files():
+                return {"state": "uncertain", "reason": "protected write temporary files remain"}
+            if not store.has_record(name):
+                if record["ownership_resolved"]:
+                    return {"state": "reclaimed", "resolved": True}
+                # A writer can exit between reserving metadata and creating
+                # the owner record. Resolve only proven absence of its exact
+                # prefix; unexpected artifacts remain attributable evidence.
+                if any(name.startswith(f"exchange-{owner}-") for name in store.iter_records()):
+                    return {"state": "uncertain", "reason": "Exchange owner metadata is missing"}
+                for volume in record["commitments"]:
+                    record["commitments"][volume] = 0
+                record["ownership_resolved"] = True
+                coordinator._save(record)
+                return {"state": "not_created", "resolved": True}
+            metadata = ExchangeStagingOwner._validate(json.loads(store.read(name)), record)
+            pending = metadata["pending_write"]
+            extent = max(metadata["extent"], 0 if pending is None else pending["index"] + 1)
+            for index in range(extent):
+                child = f"exchange-{owner}-{index:016x}"
+                if store.has_record(child):
+                    if len(store.read(child)) > metadata["chunk_size"]:
+                        raise ProtectedStorageError("Exchange staging block is corrupt")
+                    store.delete(child)
+            for volume in record["commitments"]:
+                record["commitments"][volume] = 0
+            record["ownership_resolved"] = True
+            coordinator._save(record)
+            store.delete(name)
+            return {"state": "reclaimed", "resolved": True}
+        except Exception:
+            return {"state": "uncertain", "reason": "Exchange staging artifacts could not be reclaimed"}

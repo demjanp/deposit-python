@@ -4,17 +4,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
-import hashlib
-import io
 import json
-import re
 import uuid
-import zipfile
+import math
 from typing import Any
 
 from ._imports import GRAPH_CATEGORIES, MANIFEST_FIELDS
+from .exchange import ProtectedChunkFile, validate_exchange_archive, _MANIFEST_ALLOWED
 
-_METADATA_KEY = "snapshot"
 _NODE_KINDS = {"Class", "Object"}
 _EDGE_KINDS = {"Membership", "Relationship", "ClassRelationship"}
 
@@ -40,8 +37,15 @@ def to_networkx(snapshot: Mapping[str, Any]):
     graph.graph.update(
         namespaceId=namespace_id,
         revision=revision,
+        depositVersion=manifest.get("depositVersion"),
         patterns=deepcopy(records["patterns"]),
-        **{_METADATA_KEY: value},
+        descriptorMetadata=[
+            {name: deepcopy(value) for name, value in descriptor.items() if name != "value"}
+            for descriptor in records["descriptors"]
+        ],
+        resources=deepcopy(records["resources"]),
+        geometries=deepcopy(records["geometries"]),
+        userTools=deepcopy(records["userTools"]),
     )
 
     classes = {record["id"]: record for record in records["classes"]}
@@ -93,11 +97,6 @@ def from_networkx(graph) -> dict[str, Any]:
         raise ValueError("Graph metadata requires a source namespaceId")
     if type(revision) is not int or revision < 0:
         raise ValueError("Graph metadata requires a nonnegative source revision")
-    snapshot = metadata.get(_METADATA_KEY)
-    if snapshot is not None:
-        value = _portable_snapshot(snapshot)
-        _check_graph_matches_snapshot(frozen_nodes, frozen_edges, metadata, value)
-        return value
     return _snapshot_from_graph(frozen_nodes, frozen_edges, metadata, namespace_id, revision)
 
 
@@ -107,10 +106,18 @@ def _portable_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(snapshot.get("manifest"), Mapping) or not isinstance(snapshot.get("graph"), Mapping):
         raise TypeError("Deposit graph snapshot requires manifest and graph mappings")
     try:
-        value = json.loads(json.dumps(snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+        _ensure_json_portable(snapshot)
     except (TypeError, ValueError, OverflowError) as exc:
         raise TypeError("Deposit graph snapshot must contain only finite JSON-portable values") from exc
+    value = {"manifest": snapshot["manifest"], "graph": snapshot["graph"]}
+    if "history" in snapshot:
+        value["history"] = snapshot["history"]
     manifest, records = value["manifest"], value["graph"]
+    version = manifest.get("depositVersion")
+    if version is not None and (not isinstance(version, str) or not version):
+        raise ValueError("Deposit graph manifest depositVersion must be a Server version String or null")
+    if set(manifest) - _MANIFEST_ALLOWED:
+        raise ValueError("Deposit graph manifest contains an unknown field")
     if any(name not in manifest for name in MANIFEST_FIELDS):
         raise ValueError("Deposit graph snapshot manifest is incomplete")
     if set(records) != set(GRAPH_CATEGORIES) or any(not isinstance(records[name], list) for name in GRAPH_CATEGORIES):
@@ -119,10 +126,49 @@ def _portable_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     revision = manifest.get("exportedRevision")
     if not isinstance(source_ns, str) or not source_ns or type(revision) is not int or revision < 0:
         raise ValueError("Deposit graph snapshot has invalid source identity or revision")
-    if records["resources"] or _contains_resource_reference(value):
-        # Export may retain references, but imports cannot fabricate resource content.
-        return value
     return value
+
+
+def _ensure_json_portable(root: Any) -> None:
+    """Validate finite JSON data iteratively without cloning the full snapshot."""
+    active: set[int] = set()
+    pending = [iter((root,))]
+    owners = []
+    while pending:
+        try:
+            value = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            if owners:
+                active.remove(owners.pop())
+            continue
+        if value is None or type(value) in (str, bool, int):
+            if isinstance(value, str):
+                for start in range(0, len(value), 64 * 1024):
+                    value[start:start + 64 * 1024].encode("utf-8")
+            continue
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError("non-finite number")
+            continue
+        if type(value) not in (dict, list):
+            raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+        identity = id(value)
+        if identity in active:
+            raise ValueError("cyclic JSON value")
+        active.add(identity)
+        owners.append(identity)
+        if type(value) is dict:
+            def items(mapping):
+                for key, item in mapping.items():
+                    if not isinstance(key, str):
+                        raise TypeError("JSON object keys must be strings")
+                    for start in range(0, len(key), 64 * 1024):
+                        key[start:start + 64 * 1024].encode("utf-8")
+                    yield item
+            pending.append(iter(items(value)))
+        else:
+            pending.append(iter(value))
 
 
 def _node_record(record: dict[str, Any], namespace_id: str, kind: str) -> dict[str, Any]:
@@ -174,25 +220,6 @@ def _freeze_graph(graph):
 
 def _json_freeze(value):
     return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
-
-
-def _check_graph_matches_snapshot(nodes, edges, metadata, snapshot):
-    manifest, records = snapshot["manifest"], snapshot["graph"]
-    namespace_id = manifest["sourceNamespaceId"]
-    if metadata.get("namespaceId") != namespace_id or metadata.get("revision") != manifest["exportedRevision"]:
-        raise ValueError("Graph identity/revision metadata contradicts its detached snapshot")
-    if metadata.get("patterns") != records["patterns"]:
-        raise ValueError("Graph patterns metadata contradicts its detached snapshot")
-    expected = to_networkx(snapshot)
-    exp_nodes = {key: dict(attrs) for key, attrs in expected.nodes(data=True)}
-    actual_nodes = dict(nodes)
-    if actual_nodes != exp_nodes:
-        raise ValueError("Graph node keys or attributes contradict the detached snapshot")
-    exp_edges = {(source, target, key): dict(attrs) for source, target, key, attrs in
-                 ((u, v, k, attrs) for u, v, k, attrs in expected.edges(keys=True, data=True))}
-    actual_edges = {(u, v, key): attrs for u, v, key, attrs in edges}
-    if actual_edges != exp_edges:
-        raise ValueError("Graph edges or attributes contradict the detached snapshot")
 
 
 def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
@@ -256,14 +283,35 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
     if not isinstance(patterns, list):
         raise TypeError("Graph patterns metadata must be a list")
     record_lists["patterns"] = deepcopy(patterns)
+    descriptor_metadata = metadata.get("descriptorMetadata", [])
+    if not isinstance(descriptor_metadata, list):
+        raise TypeError("Graph Descriptor metadata must be a list")
+    descriptor_metadata_by_owner_name = {}
+    for descriptor in descriptor_metadata:
+        if not isinstance(descriptor, Mapping):
+            raise TypeError("Graph Descriptor metadata rows must be mappings")
+        identity, owner, name = descriptor.get("id"), descriptor.get("objectId"), descriptor.get("name")
+        if (not isinstance(identity, str) or not identity or not isinstance(owner, str) or not owner
+                or not isinstance(name, str) or not name):
+            raise ValueError("Graph Descriptor metadata requires identity, owner and name")
+        key = (owner, name)
+        if key in descriptor_metadata_by_owner_name:
+            raise ValueError("Graph Descriptor metadata contains duplicate owners and names")
+        descriptor_metadata_by_owner_name[key] = descriptor
+    for category in ("resources", "geometries", "userTools"):
+        values = metadata.get(category, [])
+        if not isinstance(values, list):
+            raise TypeError(f"Graph {category} metadata must be a list")
+        record_lists[category] = deepcopy(values)
     declarations = {}
     for record in record_lists["classes"]:
         declarations[record["id"]] = {item.get("name"): item for item in record.get("descriptors", []) if isinstance(item, dict)}
     for record in record_lists["objects"]:
+        object_id = record["id"]
         class_id = record.get("classId")
         if class_id not in declarations:
             raise ValueError("Object references a missing Class declaration set")
-        values = object_descriptor_values.get(record["id"], {})
+        values = object_descriptor_values.get(object_id, {})
         if not isinstance(values, dict):
             raise TypeError("Object descriptors must be a mapping")
         for name, value in values.items():
@@ -275,26 +323,26 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
                 decode_value(declaration.get("type"), value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Object Descriptor {name!r} does not match its declaration") from exc
-            record_lists["descriptors"].append({
-                "id": str(uuid.uuid4()), "namespaceId": namespace_id,
-                "objectId": record["id"], "name": name, "value": deepcopy(value),
-            })
+            prior_metadata = descriptor_metadata_by_owner_name.pop((object_id, name), None)
+            if prior_metadata is not None and prior_metadata.get("namespaceId", namespace_id) != namespace_id:
+                raise ValueError("Descriptor metadata Namespace contradicts graph metadata")
+            descriptor = deepcopy(dict(prior_metadata)) if prior_metadata is not None else {"id": str(uuid.uuid4())}
+            descriptor.update(namespaceId=namespace_id, objectId=object_id, name=name,
+                              value=deepcopy(value))
+            record_lists["descriptors"].append(descriptor)
     if record_lists["resources"] or _contains_resource_reference(record_lists):
         raise ValueError("Resource-bearing NetworkX imports require the approved content mapping")
-    manifest = metadata.get("manifest")
-    if manifest is None:
-        manifest = {
-            "packageId": str(uuid.uuid4()), "sourceNamespaceId": namespace_id,
-            "name": "NetworkX graph", "description": "", "depositVersion": "2",
-            "historyMode": "none", "exportedRevision": revision,
-            "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "rootIds": sorted(object_by_id), "scope": "namespace", "includeHistory": False,
-            "files": {},
-        }
-    else:
-        manifest = deepcopy(manifest)
-        if manifest.get("sourceNamespaceId") != namespace_id or manifest.get("exportedRevision") != revision:
-            raise ValueError("Graph manifest contradicts source namespace/revision metadata")
+    version = metadata.get("depositVersion")
+    if version is not None and (not isinstance(version, str) or not version):
+        raise ValueError("Graph depositVersion must be a Server version String or null")
+    manifest = {
+        "packageId": str(uuid.uuid4()), "sourceNamespaceId": namespace_id,
+        "name": "NetworkX graph", "description": "", "depositVersion": version,
+        "historyMode": "disabled", "exportedRevision": revision,
+        "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "rootIds": sorted(object_by_id), "scope": "namespace", "includeHistory": False,
+        "files": {},
+    }
     _validate_structural_completeness(record_lists, namespace_id)
     return {"manifest": manifest, "graph": record_lists}
 
@@ -417,7 +465,7 @@ def _contains_resource_reference(value):
 
 
 def read_export_result(store, result):
-    """Return a complete inline export or validate a staged Exchange ZIP in memory."""
+    """Return an inline export or validate a staged ZIP in protected storage."""
     if isinstance(result, Mapping) and "manifest" in result and "graph" in result:
         return _portable_snapshot(result)
     resource_id = None
@@ -432,82 +480,32 @@ def read_export_result(store, result):
         "type": "DResource",
         "value": {"resourceId": resource_id, "namespaceId": store.namespace_id},
     })
-    with resource.open(store) as reader:
-        raw = reader.read()
-        metadata = resource._value
-    expected_bytes = result.get("bytes") if isinstance(result, Mapping) else None
-    expected_checksum = (result.get("checksum") or result.get("sha256")) if isinstance(result, Mapping) else None
-    if expected_bytes is not None and expected_bytes != len(raw):
-        raise ValueError("Staged Exchange export byte length contradicts its resource metadata")
-    if expected_checksum is not None and expected_checksum != hashlib.sha256(raw).hexdigest():
-        raise ValueError("Staged Exchange export checksum contradicts its resource metadata")
-    if metadata.get("bytes") is not None and metadata["bytes"] != len(raw):
-        raise ValueError("Staged Exchange resource length verification failed")
-    if metadata.get("checksum") is not None and metadata["checksum"] != hashlib.sha256(raw).hexdigest():
-        raise ValueError("Staged Exchange resource checksum verification failed")
-    return _read_exchange_zip(raw)
-
-
-def _read_exchange_zip(raw):
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            infos = archive.infolist()
-            names = [info.filename for info in infos]
-            if len(names) != len(set(names)) or any(info.is_dir() for info in infos):
-                raise ValueError("Staged Exchange ZIP contains duplicate or directory entries")
-            if not {"manifest.json", "graph.json"}.issubset(names):
-                raise ValueError("Staged Exchange ZIP requires manifest.json and graph.json")
-            if set(names) - {"manifest.json", "graph.json", "history.json"} and any(
-                not re.fullmatch(r"resources/[0-9a-f]{64}", name)
-                for name in names if name not in {"manifest.json", "graph.json", "history.json"}
-            ):
-                raise ValueError("Staged Exchange ZIP contains an unsupported member")
-            raw_manifest = archive.read("manifest.json")
-            manifest = json.loads(raw_manifest)
-            file_index = manifest.get("files")
-            if not isinstance(file_index, dict) or set(file_index) != set(names) - {"manifest.json"}:
-                raise ValueError("Staged Exchange ZIP manifest file index is incomplete")
-            members = {}
-            for name, entry in file_index.items():
-                data = archive.read(name)
-                if not isinstance(entry, Mapping) or entry.get("bytes") != len(data) or entry.get("sha256") != hashlib.sha256(data).hexdigest():
-                    raise ValueError(f"Staged Exchange ZIP checksum mismatch for {name}")
-                members[name] = data
-            result = {"manifest": manifest, "graph": json.loads(members["graph.json"])}
-            if "history.json" in members:
-                result["history"] = json.loads(members["history.json"])
-            _validate_staged_resources(result, members)
-            return _portable_snapshot(result)
-    except (zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
-        raise ValueError("Staged Exchange export is not a valid checked ZIP package") from exc
-
-
-def _validate_staged_resources(snapshot, members):
-    records = snapshot.get("graph", {}).get("resources")
-    if not isinstance(records, list):
-        raise ValueError("Staged Exchange graph resource index is invalid")
-    expected_entries = set()
-    for resource in records:
-        if not isinstance(resource, Mapping):
-            raise ValueError("Staged Exchange resource record is invalid")
-        entry = resource.get("entry")
-        checksum = resource.get("sha256")
-        byte_count = resource.get("bytes")
-        if (
-            not isinstance(entry, str)
-            or not re.fullmatch(r"resources/[0-9a-f]{64}", entry)
-            or entry in expected_entries
-            or entry not in members
-            or not isinstance(checksum, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", checksum)
-            or type(byte_count) is not int
-            or byte_count < 0
-        ):
-            raise ValueError("Staged Exchange resource entry is incomplete or unsafe")
-        content = members[entry]
-        if len(content) != byte_count or hashlib.sha256(content).hexdigest() != checksum:
-            raise ValueError("Staged Exchange resource content checksum mismatch")
-        expected_entries.add(entry)
-    actual_entries = {name for name in members if name.startswith("resources/")}
-    if expected_entries != actual_entries:
-        raise ValueError("Staged Exchange ZIP has unlisted or missing resource content")
+    storage = getattr(getattr(store, "_journal", None), "storage", None)
+    if storage is None:
+        raise ValueError("Staged Exchange validation requires protected recovery storage")
+    import hashlib
+    digest = hashlib.sha256()
+    length = 0
+    with ProtectedChunkFile(storage) as staged:
+        with resource.open(store) as reader:
+            metadata = resource._value
+            while True:
+                block = reader.read(1024 * 1024)
+                if not block:
+                    break
+                staged.write(block)
+                digest.update(block)
+                length += len(block)
+        expected_bytes = result.get("bytes") if isinstance(result, Mapping) else None
+        expected_checksum = (result.get("checksum") or result.get("sha256")) if isinstance(result, Mapping) else None
+        if expected_bytes is not None and expected_bytes != length:
+            raise ValueError("Staged Exchange export byte length contradicts its resource metadata")
+        if expected_checksum is not None and expected_checksum != digest.hexdigest():
+            raise ValueError("Staged Exchange export checksum contradicts its resource metadata")
+        if metadata.get("bytes") is not None and metadata["bytes"] != length:
+            raise ValueError("Staged Exchange resource length verification failed")
+        if metadata.get("checksum") is not None and metadata["checksum"] != digest.hexdigest():
+            raise ValueError("Staged Exchange resource checksum verification failed")
+        staged.seek(0)
+        with validate_exchange_archive(staged) as package:
+            return _portable_snapshot(package.materialize())
