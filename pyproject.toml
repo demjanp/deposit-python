@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75.0", "wheel"]
+requires = ["setuptools>=80", "setuptools-scm>=9.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Operating System :: Microsoft :: Windows :: Windows 10"
 ]
-version = "2.0.0.dev0"
+dynamic = ["version"]
 dependencies = ["neo4j>=6.1,<7"]
 
 [project.optional-dependencies]
@@ -40,3 +40,7 @@ include = ["deposit*"]
 [tool.setuptools.package-data]
 deposit = ["_procedure_manifest.json"]
 
+[tool.setuptools_scm]
+version_file = "src/deposit/_version.py"
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"

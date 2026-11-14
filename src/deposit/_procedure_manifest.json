@@ -2574,11 +2574,7 @@
     {
       "name": "deposit.get.importResult",
       "args": [
-        {
-          "name": "resultId",
-          "type": "String",
-          "binding": "resultId"
-        }
+        {"name": "resultId", "type": "String", "binding": "resultId"}
       ],
       "columns": ["data"],
       "mode": "READ",
@@ -2596,7 +2592,7 @@
         {"name": "resultId", "type": "String", "binding": "resultId"},
         {"name": "collection", "type": "String", "binding": "collection"},
         {"name": "cursor", "type": "Map<String,Object>", "binding": "cursor"},
-        {"name": "limit", "type": "Integer", "binding": "limit"}
+        {"name": "limit", "type": "Long", "binding": "limit"}
       ],
       "columns": ["data"],
       "mode": "READ",
@@ -2611,9 +2607,7 @@
     {
       "name": "deposit.get.importResultEntry",
       "args": [
-        {"name": "resultId", "type": "String", "binding": "resultId"},
-        {"name": "collection", "type": "String", "binding": "collection"},
-        {"name": "key", "type": "String", "binding": "key"}
+        {"name": "resultId", "type": "String", "binding": "resultId"},        {"name": "collection", "type": "String", "binding": "collection"},        {"name": "key", "type": "String", "binding": "key"}
       ],
       "columns": ["data"],
       "mode": "READ",
@@ -2676,27 +2670,6 @@
       "batch_eligible": false,
       "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
-    },
-    {
-      "name": "deposit.import.namespaceData",
-      "args": [
-        {
-          "name": "packageResourceId",
-          "type": "String",
-          "binding": "packageResourceId"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "WRITE",
-      "scope": "server",
-      "requires_token": true,
-      "action": true,
-      "admin": false,
-      "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
-      "invocation_owner": "Client"
     },
     {
       "name": "deposit.import.rows",
@@ -3044,6 +3017,224 @@
       "action": false,
       "batch_eligible": false,
       "batch_exclusion": "discovery lifecycle route",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.import.abortCloneUpload",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.import.beginCloneUpload",
+      "args": [
+        {
+          "name": "filename",
+          "type": "String",
+          "binding": "filename"
+        },
+        {
+          "name": "bytes",
+          "type": "Long",
+          "binding": "bytes"
+        },
+        {
+          "name": "sha256",
+          "type": "String",
+          "binding": "sha256"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.import.cloneNamespace",
+      "args": [
+        {
+          "name": "source",
+          "type": "Map<String,Object>",
+          "binding": "source"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.import.cloneUploadChunk",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        },
+        {
+          "name": "offset",
+          "type": "Long",
+          "binding": "offset"
+        },
+        {
+          "name": "bytesBase64",
+          "type": "String",
+          "binding": "bytesBase64"
+        },
+        {
+          "name": "chunkSha256",
+          "type": "String",
+          "binding": "chunkSha256"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.import.finishCloneUpload",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "action": true,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": "not registered in DomainService.COMMANDS",
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.cloneResult",
+      "args": [
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": null,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.cloneResultEntry",
+      "args": [
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        },
+        {
+          "name": "collection",
+          "type": "String",
+          "binding": "collection"
+        },
+        {
+          "name": "key",
+          "type": "String",
+          "binding": "key"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": null,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.cloneResultPage",
+      "args": [
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        },
+        {
+          "name": "collection",
+          "type": "String",
+          "binding": "collection"
+        },
+        {
+          "name": "cursor",
+          "type": "Map<String,Object>",
+          "binding": "cursor"
+        },
+        {
+          "name": "limit",
+          "type": "Long",
+          "binding": "limit"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "batch_exclusion": null,
       "invocation_owner": "Client"
     }
   ]

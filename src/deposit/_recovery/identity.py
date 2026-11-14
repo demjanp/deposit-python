@@ -17,7 +17,7 @@ class DeploymentIdentity:
     database_id: str
     dbms_id: str
     actor_id: str
-    namespace_id: str
+    namespace_id: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -27,8 +27,10 @@ class DeploymentIdentity:
         expected = {"endpoint", "database_name", "database_id", "dbms_id", "actor_id", "namespace_id"}
         if not isinstance(value, dict) or set(value) != expected:
             raise IdentityUnavailableError("Stored deployment identity is invalid")
-        if any(not isinstance(value[key], str) or not value[key] for key in expected):
+        if any(not isinstance(value[key], str) or not value[key] for key in expected - {"namespace_id"}):
             raise IdentityUnavailableError("Stored deployment identity is incomplete")
+        if value["namespace_id"] is not None and (not isinstance(value["namespace_id"], str) or not value["namespace_id"]):
+            raise IdentityUnavailableError("Stored deployment identity has an invalid Namespace scope")
         return cls(**value)
 
     def matches(self, current: "DeploymentIdentity") -> bool:
@@ -68,15 +70,18 @@ def _single(driver: Driver, database: str, query: str) -> tuple[dict[str, Any], 
 
 
 def read_deployment_identity(
-    driver: Driver, *, database: str | None, actor_id: str, namespace_id: str
+    driver: Driver, *, database: str | None, actor_id: str, namespace_id: str | None,
+    server_scope: bool = False,
 ) -> DeploymentIdentity:
     """Read target database and system-store DBMS IDs; fail closed on omissions.
 
     A cloned/restored Neo4j store may retain these IDs. The values detect fresh
     replacement and accidental retargeting; they do not attest unique history.
     """
-    if not all(isinstance(value, str) and value for value in (actor_id, namespace_id)):
-        raise IdentityUnavailableError("Actor and Namespace identities are required")
+    if (not isinstance(actor_id, str) or not actor_id or type(server_scope) is not bool
+            or (namespace_id is None) != server_scope
+            or namespace_id is not None and (not isinstance(namespace_id, str) or not namespace_id)):
+        raise IdentityUnavailableError("Actor and a valid deployment scope are required")
     target, summary = _single(driver, database, "CALL db.info() YIELD id, name RETURN id, name")
     system, _ = _single(driver, "system", "CALL dbms.info() YIELD id RETURN id")
     database_id = target.get("id")

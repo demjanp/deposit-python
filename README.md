@@ -48,15 +48,29 @@ NetworkX is optional. Install the graph extra only when using graph conversion:
 pip install "deposit[networkx]>=2,<3"
 ```
 
+The package version is derived at build time from `deposit-python` Git tags by
+`setuptools-scm`. The project release-tag convention is `vX.Y.Z`, optionally
+with a PEP 440 prerelease suffix such as `v2.4.0rc1`. Tag a release commit
+with that version and run `python -m build` to build its wheel and source
+distribution. Post-tag and dirty builds follow `setuptools-scm` standard
+development-version schemes; tagless and shallow
+checkouts follow its built-in behavior. For reliable release provenance, build
+releases from complete history with the release tag available. Source
+distributions retain the resolved version so their extracted contents can
+rebuild a wheel without Git metadata. Installed packages read
+their version from distribution metadata and do not invoke Git.
+`src/deposit/_version.py` is generated during builds, ignored by Git and not
+hand-maintained; runtime version reporting uses installed distribution
+metadata. The Python package version is independent of the Deposit Server version recorded in the
+procedure manifest; it is not Exchange `depositVersion` provenance.
+
 Package metadata requires Python 3.14.x and Neo4j Python driver >=6.1,<7. The
-`networkx` extra supports NetworkX 3.x, starting at 3.4. This client also checks
-the Deposit Server version against the exact build recorded in its installed
-procedure manifest; unsupported Server builds fail before Deposit API calls.
-The current manifest target is
-`2.0.0-dev.77-post.15.g7610e45-SNAPSHOT`.
+`networkx` extra supports NetworkX 3.x, starting at 3.4. Import operations
+require the final procedures and semantic capabilities; tested Server builds
+are recorded as verification evidence.
 The declared release acceptance matrix targets Windows x64, Python 3.14.0 and
 3.14.10, Neo4j driver 6.1.0 and 6.4.1, NetworkX absent and versions 3.4 and
-3.7, with the manifest's exact Server build. Release acceptance is separate
+3.7. Release acceptance is separate
 from PyPI publication.
 
 For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/deposit_gui/releases/latest)
@@ -96,9 +110,20 @@ remain open. Explicit content takes precedence over `resource_source`, and bad
 content fails without fallback. A `resource_source` can be an authenticated
 source Store or checked Exchange bundle. Package bytes are staged and integrity-checked in protected
 storage before upload or analysis. A complete checked Exchange bundle can be
-passed directly as `data` without separate providers. Typed references and
-graph/domain semantics remain Server-validated. Full-Namespace clone recovery and Client-owned
-server-scope mutation recovery remain deferred.
+passed directly as `data` without separate providers. To create a new
+Namespace from a complete Exchange package, call
+`client.clone_namespace(token, package)`; the resulting `CloneResult` exposes
+the created Namespace identity and lazy identity/resource mappings. The package
+Namespace name is preserved, and a name collision fails with `DUPLICATE`.
+Typed references and graph/domain semantics remain Server-validated.
+Clone transfers persist protected recovery workflows. Discover them with
+`client.pending_clones()`, inspect local phase and verified offset with
+`client.inspect_clone(workflow)`, and continue with
+`client.resume_clone(workflow, username=..., password=...)`. Resume verifies the
+original server, database and actor before using protected staging. If a process
+stops before the package is frozen, inspection reports `SOURCE_REQUIRED`; pass
+the replacement source to `resume_clone(..., source=...)`. After freezing,
+resume uses the immutable staged package and cannot replace its source.
 
 Portable Exchange workflows use `store.export_exchange(...)` to return a
 context-managed `ExchangeBundle`. The bundle can be inspected lazily or saved
@@ -165,9 +190,9 @@ Graph conversion represents current data, not history or a complete backup.
 Resource bytes never appear in graph attributes; provide them with
 `store.from_networkx(graph, resources=...)` or `resource_source=...`. Python
 checks package shape, ZIP safety, lengths and checksums, while the Server checks
-resource references and graph semantics before creating an analysis plan. The
-API does not provide full-Namespace clone recovery or recover Client-owned
-Server-scope mutations; those workflows remain deferred.
+resource references and graph semantics before creating an analysis plan.
+`Client.recover` returns a clone result as `RecoveredOperation.result` without
+selecting the newly created Namespace.
 
 ## Compatibility and migration <a name="compatibility-and-migration"></a>
 
@@ -182,8 +207,8 @@ mapping when they need to associate source records with receiver-side IDs.
 Store-scoped pending operations can be recovered through the Store recovery
 methods, subject to the configured protected recovery directory. Client-owned
 composed Exchange workflows use `pending_imports`, `inspect_import`,
-`resume_import`, and `abandon_import`. Recovery does not cover full-Namespace
-clone workflows or Client-owned Server-scope mutations.
+`resume_import`, and `abandon_import`. Full-Namespace clones use the separate
+`pending_clones`, `inspect_clone`, and `resume_clone` Client workflow methods.
 Close Stores, resources and download readers when finished; incomplete resource
 downloads are reported when a reader closes before all bytes are consumed.
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import uuid
+import base64
+import hashlib
 from importlib.metadata import version as distribution_version
 from importlib.resources import files
 from pathlib import Path
@@ -44,6 +46,7 @@ class Client:
         self._stores = set()
         self._recovery_journals = {}
         self._import_workflow_stores = {}
+        self._clone_workflow_stores = {}
 
     def _session(self):
         if self._closed:
@@ -92,9 +95,23 @@ class Client:
         """Require the final paged-result contract before import operations."""
         data = self.discover()
         capabilities = data.get("capabilities")
-        if not isinstance(capabilities, list) or "pagedImportResults" not in capabilities:
+        if (not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities)
+                or "pagedImportResults" not in capabilities):
             raise CompatibilityError(str(capabilities if capabilities is not None else "missing"),
                                      "pagedImportResults", "Deposit import result capability")
+        return data
+
+    def require_clone_capabilities(self) -> dict[str, Any]:
+        """Require full Namespace clone and paged result support from the Server."""
+        data = self.discover()
+        capabilities = data.get("capabilities")
+        required = {"fullNamespaceClone", "pagedImportResults"}
+        malformed = not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities)
+        normalized = [item for item in capabilities if isinstance(item, str)] if isinstance(capabilities, list) else []
+        if malformed or not required.issubset(normalized):
+            missing = sorted(required.difference(normalized))
+            detail = "malformed" if malformed else ", ".join(missing)
+            raise CompatibilityError(detail, ", ".join(sorted(required)), "Deposit Namespace clone capability")
         return data
 
     def login(self, username: str, password: str) -> str:
@@ -385,6 +402,424 @@ class Client:
         self._recovery_journals.update({record["public_id"]: journal for record in records})
         return tuple(pending_operation(record) for record in records if record["state"] in PENDING_STATES)
 
+    def clone_namespace(self, token: str, source, *, recovery_directory: str | Path | None = None):
+        """Create a Namespace atomically from a complete, checked Exchange package."""
+        from ._recovery.identity import read_deployment_identity
+        from ._recovery.journal import ProtectedJournal, RESULT_FORMAT_CLONE
+        from ._clone_workflows import CloneWorkflowStore
+
+        if not isinstance(token, str) or not token:
+            raise ValueError("token must be a nonempty authenticated session token")
+        self.require_clone_capabilities()
+        if isinstance(source, dict) and set(source) == {"resourceId"}:
+            from ._recovery.journal import _is_uuid
+            if not _is_uuid(source["resourceId"]):
+                raise ValueError("source resourceId must be a UUID")
+        profile = self.get_session(token)
+        user = profile.get("user")
+        actor_id = user.get("id") if isinstance(user, dict) else None
+        if not isinstance(actor_id, str) or not actor_id:
+            raise DepositError("INVALID_RESPONSE", "Session inspection returned no actor identity")
+        identity = read_deployment_identity(
+            self._driver, database=self._database, actor_id=actor_id,
+            namespace_id=None, server_scope=True,
+        )
+        journal = ProtectedJournal(recovery_directory)
+        workflows = CloneWorkflowStore(journal.storage)
+        workflow = workflows.create(identity)
+        self._clone_workflow_stores[workflow.id] = workflows
+        self._recovery_journals = getattr(self, "_recovery_journals", {})
+        self._invoke_client_procedure("deposit.utils.refresh", token, "server")
+        with workflows.lock(workflow.id):
+            self._freeze_clone_source(workflows, workflow.id, journal, identity, source)
+            return self._continue_clone_workflow(workflows, workflow.id, journal, identity, token)
+
+    def _freeze_clone_source(self, workflows, workflow_id, journal, identity, source):
+        from ._recovery.transfers import ProtectedTransferSpool
+        record = workflows.get(workflow_id)
+        if record["state"] != "SOURCE_REQUIRED" or record["transfer_id"] is not None:
+            raise DepositError("CLONE_SOURCE_ALREADY_FROZEN", "Clone workflow no longer accepts replacement package input")
+        from ._recovery.identity import DeploymentIdentity
+        direct_resource_id = None
+        if isinstance(source, dict) and set(source) == {"resourceId"}:
+            direct_resource_id = source["resourceId"]
+        elif getattr(source, "package_reference", None) is not None:
+            binding = getattr(source, "source_binding", None)
+            if (isinstance(binding, dict) and "namespace_id" in binding
+                    and DeploymentIdentity.from_dict(binding) == identity):
+                direct_resource_id = source.package_reference
+        if direct_resource_id is not None:
+            if not isinstance(direct_resource_id, str) or not direct_resource_id:
+                raise ValueError("source resourceId must be a nonempty string")
+            from ._recovery.journal import _is_uuid
+            if not _is_uuid(direct_resource_id):
+                raise ValueError("source resourceId must be a UUID")
+            workflows.update(workflow_id, state="READY", phase="ready", source_resource_id=direct_resource_id)
+            return
+        spool = ProtectedTransferSpool(journal, identity)
+        intent = spool.reserve_clone_source(workflow_id)
+        workflows.update(workflow_id, transfer_id=intent["transfer_id"], phase="source_freezing")
+        try:
+            transfer = Client._clone_source_manifest(spool, intent)
+        except DepositError as exc:
+            if exc.code != "CLONE_SOURCE_INCOMPLETE":
+                raise
+            # New reservation: the first durable source checkpoint is absent.
+            transfer = {"state": "staging"}
+        if transfer["state"] == "staging":
+            with self._open_clone_package(source, journal.storage) as package:
+                manifest = package.manifest
+                scope = getattr(manifest.get("scope"), "scalar", None)
+                scope = scope() if callable(scope) else manifest.get("scope")
+                if scope != "namespace":
+                    raise ValueError("Namespace cloning requires a complete Namespace Exchange package")
+                package._source.seek(0)
+                transfer = spool.freeze(
+                    package._source, filename="deposit-clone.zip",
+                    media_type="application/vnd.deposit.namespace-clone",
+                    transfer_id=intent["transfer_id"],
+                )
+        else:
+            if source is not None:
+                raise DepositError("CLONE_SOURCE_ALREADY_FROZEN", "Replacement input is not allowed after the first source completed")
+            spool.verify_content(transfer)
+        workflows.update(workflow_id, state="FROZEN", phase="frozen",
+                         sha256=transfer["sha256"], total_bytes=transfer["bytes"], verified_offset=0)
+
+    def _continue_clone_workflow(self, workflows, workflow_id, journal, identity, token):
+        from ._recovery.journal import RESULT_FORMAT_CLONE
+        from ._recovery.transfers import ProtectedTransferSpool, TRANSFER_CHUNK_BYTES
+
+        record = workflows.get(workflow_id)
+        if record["identity"] != identity.to_dict():
+            raise DepositError("IDENTITY_MISMATCH", "Clone workflow belongs to another server or actor")
+        if record["state"] == "COMMITTED":
+            clone_action = journal.load(identity, record["clone_action_key"])
+            outcome = clone_action.get("outcome")
+            if (clone_action["state"] != "released" or not isinstance(outcome, dict)
+                    or outcome.get("resultId") != record["result_id"]):
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone workflow result is unavailable or changed")
+            self._cleanup_clone_transfer(workflows, workflow_id, journal, identity)
+            from ._paging import CloneResult
+            return CloneResult(journal, record["clone_action_key"], outcome)
+        if record["state"] == "SOURCE_REQUIRED":
+            raise DepositError("CLONE_SOURCE_REQUIRED", "Supply a complete package to resume the interrupted freeze")
+        if record["state"] == "FAILED":
+            raise DepositError("CLONE_FAILED", "Clone workflow is in a retained failure state")
+        if (record["source_resource_id"] is not None or record["phase"] == "clone_pending"
+                or record["outstanding_role"] == "clone"):
+            clone_key = record["clone_action_key"] or (record["outstanding_action_key"]
+                        if record["clone_action_key"] is None
+                        and record["outstanding_role"] == "clone"
+                        else str(uuid.uuid4()))
+            workflows.update(workflow_id, state="CLONE_PENDING", phase="clone_pending",
+                             clone_action_key=clone_key, outstanding_role="clone", outstanding_action_key=clone_key)
+            record = workflows.get(workflow_id)
+            if record["source_resource_id"] is not None:
+                arguments = [{"resourceId": record["source_resource_id"]}]
+            else:
+                if record["upload_id"] is None or record["sha256"] is None:
+                    raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone action has no frozen package binding")
+                arguments = [{"uploadId": record["upload_id"], "sha256": record["sha256"]}]
+            action = self._run_server_action(
+                journal, identity, token, "deposit.import.cloneNamespace",
+                arguments,
+                result_format=RESULT_FORMAT_CLONE, recovery_key=clone_key,
+            )
+            outcome = action["outcome"]
+            return self._commit_clone_workflow(workflows, workflow_id, journal, clone_key, outcome)
+        spool = ProtectedTransferSpool(journal, identity)
+        transfer = spool.load(record["transfer_id"])
+        if (transfer["identity"] != identity.to_dict() or transfer["sha256"] != record["sha256"]
+                or transfer["bytes"] != record["total_bytes"]):
+            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone transfer does not match its protected workflow")
+
+        if record["upload_id"] is None or record["state"] == "FROZEN":
+            key = (record["outstanding_action_key"] or str(uuid.uuid4()))
+            workflows.update(workflow_id, state="FROZEN", phase="begin_pending",
+                             outstanding_role="begin", outstanding_action_key=key)
+            spool.update(transfer["transfer_id"], state="staged", begin_action_key=key, offset=0)
+            action = self._run_server_action(
+                journal, identity, token, "deposit.import.beginCloneUpload",
+                [transfer["filename"], transfer["bytes"], transfer["sha256"]], recovery_key=key,
+            )
+            started = action["outcome"]
+            upload_id = started.get("uploadId") if isinstance(started, dict) else None
+            if not isinstance(upload_id, str) or not upload_id:
+                raise DepositError("INVALID_RESPONSE", "Clone upload start returned no upload identity")
+            spool.update(transfer["transfer_id"], state="uploading", upload_id=upload_id, begin_action_key=key,
+                         offset=0, pending_action_key=None, pending_offset=None, pending_length=None)
+            workflows.update(workflow_id, state="UPLOADING", phase="uploading", upload_id=upload_id,
+                             verified_offset=0, outstanding_role=None, outstanding_action_key=None)
+            record = workflows.get(workflow_id)
+        record = workflows.get(workflow_id)
+        offset = record["verified_offset"]
+        while offset < transfer["bytes"]:
+            index = offset // TRANSFER_CHUNK_BYTES
+            block = spool.read_chunk(transfer["transfer_id"], index)
+            chunk_hash = hashlib.sha256(block).hexdigest()
+            key = (record["outstanding_action_key"] or str(uuid.uuid4()))
+            workflows.update(workflow_id, state="UPLOADING", phase="chunk_pending",
+                             outstanding_role="chunk", outstanding_action_key=key)
+            spool.update(transfer["transfer_id"], state="uploading", upload_id=record["upload_id"],
+                         pending_action_key=key, pending_offset=offset, pending_length=len(block))
+            action = self._run_server_action(
+                journal, identity, token, "deposit.import.cloneUploadChunk",
+                [record["upload_id"], offset, base64.b64encode(block).decode("ascii"), chunk_hash],
+                recovery_key=key,
+            )
+            outcome = action["outcome"]
+            next_offset = outcome.get("nextOffset") if isinstance(outcome, dict) else None
+            expected_offset = offset + len(block)
+            if next_offset != expected_offset:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone chunk receipt differs from its frozen offset")
+            spool.update(transfer["transfer_id"], offset=expected_offset, pending_action_key=None,
+                         pending_offset=None, pending_length=None)
+            workflows.update(workflow_id, phase="uploading", verified_offset=expected_offset,
+                             outstanding_role=None, outstanding_action_key=None)
+            offset = expected_offset
+            record = workflows.get(workflow_id)
+
+        record = workflows.get(workflow_id)
+        if record["phase"] not in {"ready", "clone_pending"}:
+            key = (record["outstanding_action_key"] or str(uuid.uuid4()))
+            workflows.update(workflow_id, state="UPLOADING", phase="finish_pending",
+                             outstanding_role="finish", outstanding_action_key=key)
+            spool.update(transfer["transfer_id"], finish_action_key=key, offset=transfer["bytes"],
+                         pending_action_key=None, pending_offset=None, pending_length=None)
+            action = self._run_server_action(
+                journal, identity, token, "deposit.import.finishCloneUpload", [record["upload_id"]],
+                recovery_key=key,
+            )
+            finished = action["outcome"]
+            if (not isinstance(finished, dict) or finished.get("state") != "ready"
+                    or finished.get("sha256") != transfer["sha256"]):
+                raise DepositError("INVALID_RESPONSE", "Clone upload finalization changed its package identity")
+            spool.update(transfer["transfer_id"], state="finished", finish_action_key=key,
+                         offset=transfer["bytes"], pending_action_key=None,
+                         pending_offset=None, pending_length=None)
+            workflows.update(workflow_id, state="READY", phase="ready", verified_offset=transfer["bytes"],
+                             outstanding_role=None, outstanding_action_key=None)
+            record = workflows.get(workflow_id)
+
+        clone_key = record["clone_action_key"] or (record["outstanding_action_key"]
+                    if record["outstanding_role"] == "clone" else str(uuid.uuid4()))
+        workflows.update(workflow_id, state="CLONE_PENDING", phase="clone_pending",
+                         clone_action_key=clone_key, outstanding_role="clone", outstanding_action_key=clone_key)
+        action = self._run_server_action(
+            journal, identity, token, "deposit.import.cloneNamespace",
+            [{"uploadId": record["upload_id"], "sha256": transfer["sha256"]}],
+            result_format=RESULT_FORMAT_CLONE, recovery_key=clone_key,
+        )
+        outcome = action["outcome"]
+        if not isinstance(outcome, dict) or not isinstance(outcome.get("namespaceId"), str):
+            raise DepositError("INVALID_RESPONSE", "Clone action returned no Namespace identity")
+        return self._commit_clone_workflow(workflows, workflow_id, journal, clone_key, outcome)
+
+    def _commit_clone_workflow(self, workflows, workflow_id, journal, clone_key, outcome):
+        from datetime import datetime, timezone
+        from ._paging import CloneResult
+        if not isinstance(outcome, dict) or not isinstance(outcome.get("namespaceId"), str):
+            raise DepositError("INVALID_RESPONSE", "Clone action returned no Namespace identity")
+        workflows.update(workflow_id, state="COMMITTED", phase="committed", result_id=outcome["resultId"],
+                         outstanding_role=None, outstanding_action_key=None,
+                         resolved_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                         cleanup_status="pending")
+        from ._recovery.identity import DeploymentIdentity
+        self._cleanup_clone_transfer(workflows, workflow_id, journal,
+                                     DeploymentIdentity.from_dict(workflows.get(workflow_id)["identity"]))
+        self._recovery_journals.update({item["public_id"]: journal for item in journal.records_all()})
+        return CloneResult(journal, clone_key, outcome)
+
+    @staticmethod
+    def _cleanup_clone_transfer(workflows, workflow_id, journal, identity):
+        from ._recovery.transfers import ProtectedTransferSpool
+        record = workflows.get(workflow_id)
+        transfer_id = record["transfer_id"]
+        if transfer_id is None:
+            workflows.update(workflow_id, cleanup_status="complete")
+            return
+        manifest_name = f"transfer-{transfer_id}-manifest"
+        try:
+            if journal.storage.has_record(manifest_name):
+                ProtectedTransferSpool(journal, identity).cleanup_resolved(transfer_id)
+            prefix = f"transfer-{transfer_id}-"
+            if any(name.startswith(prefix) for name in journal.storage.iter_records()):
+                raise RuntimeError("Clone transfer cleanup left protected spool records")
+            owned_admissions = []
+            for name in journal.storage.iter_records():
+                if not name.startswith("admission-"):
+                    continue
+                admission = json.loads(journal.storage.read(name))
+                if admission.get("owner_id") == transfer_id and admission.get("purpose") == "protected-upload-spool":
+                    owned_admissions.append(name)
+                    if len(owned_admissions) >= 64:
+                        break
+            for owned_admission in owned_admissions:
+                journal.storage.delete(owned_admission)
+
+            def has_owned_admission():
+                for name in journal.storage.iter_records():
+                    if not name.startswith("admission-"):
+                        continue
+                    admission = json.loads(journal.storage.read(name))
+                    if admission.get("owner_id") == transfer_id and admission.get("purpose") == "protected-upload-spool":
+                        return True
+                return False
+
+            if has_owned_admission():
+                raise RuntimeError("Clone transfer cleanup left protected admission records")
+            journal.storage.delete(f"clone-source-{workflow_id}-transfer")
+            workflows.update(workflow_id, cleanup_status="complete")
+        except Exception:
+            workflows.update(workflow_id, cleanup_status="pending")
+
+    @staticmethod
+    def _open_clone_package(source, storage):
+        from contextlib import contextmanager
+        from pathlib import Path
+        from ._imports import _checked_package_view, prepared_import_package
+        from .exchange import validate_exchange_archive
+        import io
+
+        @contextmanager
+        def open_package():
+            candidate = source
+            if isinstance(candidate, dict) and set(candidate) == {"resourceId"}:
+                if not isinstance(candidate["resourceId"], str) or not candidate["resourceId"]:
+                    raise ValueError("source resourceId must be a nonempty string")
+                from ._recovery.journal import _is_uuid
+                if not isinstance(candidate["resourceId"], str) or not _is_uuid(candidate["resourceId"]):
+                    raise ValueError("source resourceId must be a UUID")
+            materialize = getattr(candidate, "materialize", None)
+            if callable(materialize):
+                candidate = materialize()
+            view = _checked_package_view(candidate)
+            if view is not None:
+                with prepared_import_package(view, storage=storage) as package:
+                    yield package
+                return
+            if isinstance(candidate, (str, Path)):
+                stream_context = Path(candidate).open("rb")
+            elif isinstance(candidate, bytes):
+                stream_context = io.BytesIO(candidate)
+            elif callable(getattr(candidate, "read", None)):
+                stream_context = candidate
+            else:
+                raise TypeError("source must be a complete Exchange package or checked package provider")
+            close_stream = stream_context is not candidate or isinstance(candidate, (str, Path, bytes))
+            try:
+                with validate_exchange_archive(stream_context, storage=storage) as package:
+                    yield package
+            finally:
+                if close_stream:
+                    stream_context.close()
+        return open_package()
+
+    def _run_server_action(self, journal, identity, token, procedure, arguments, *,
+                           result_format=None, recovery_key=None):
+        from ._recovery.journal import RESULT_FORMAT_CLONE
+        if recovery_key is None or not isinstance(recovery_key, str):
+            raise ValueError("Server action recovery requires a durable caller-owned key")
+        key = recovery_key
+        record = journal.load_if_present(identity, key)
+        if record is None:
+            record = journal.create(identity, procedure, list(arguments), 0,
+                                    result_format=result_format, key=key)
+        elif (record["procedure"] != procedure or record["arguments"] != list(arguments)
+              or record.get("result_format") != result_format):
+            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved server action differs from clone workflow intent")
+        with journal.action_lock(key):
+            current = journal.load(identity, key)
+            if current["state"] == "released":
+                return {"key": key, "outcome": current["outcome"]}
+            if current["state"] == "failed":
+                from .errors import _saved_failure_error
+                raise _saved_failure_error(current["failure"])
+            already_saved = current["state"] in {"outcome_saved", "release_sent"}
+            if already_saved:
+                outcome = current["outcome"]
+                operation_id = current["operation_id"]
+            else:
+                if current["state"] == "intent":
+                    journal.update(identity, key, state="prepare_sent")
+                try:
+                    prepared = self._recovery_control("deposit.action.status", key, token)
+                except DepositError as exc:
+                    if exc.code != "NOT_FOUND":
+                        raise
+                    # Each server-scoped action advances the server revision. Refresh
+                    # the session baseline before preparing the next frozen action.
+                    self._invoke_client_procedure("deposit.utils.refresh", token, "server")
+                    prepared = self._invoke_client_procedure("deposit.action.prepare", token,
+                                                             key, procedure, list(arguments))
+                if prepared.get("state") == "committed":
+                    status = prepared
+                else:
+                    for field in ("operationId", "scope"):
+                        if not isinstance(prepared.get(field), str) or not prepared[field]:
+                            raise DepositError("INVALID_RESPONSE", "Prepared server action returned invalid identity")
+                    if (prepared.get("scope") != "server" or prepared.get("procedure") != procedure
+                            or prepared.get("recoveryKey") != key):
+                        raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Prepared server action does not match the saved operator intent")
+                    operation_id = prepared.get("operationId")
+                    if current["state"] == "COMMITTED_RESULT_PENDING":
+                        raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone result journal conflicts with Server action status")
+                    if current["state"] not in {"prepared", "executing"}:
+                        journal.update(identity, key, state="prepared", operation_id=operation_id)
+                    resumed = self._recovery_control("deposit.action.resume", key, token)
+                    if resumed.get("state") == "committed":
+                        status = resumed
+                    else:
+                        for field in ("operationId", "scope"):
+                            if not isinstance(resumed.get(field), str) or not resumed[field]:
+                                raise DepositError("INVALID_RESPONSE", "Resumed server action returned invalid identity")
+                        if (resumed.get("scope") != "server" or resumed.get("procedure") != procedure
+                                or resumed.get("recoveryKey") != key):
+                            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Resumed server action does not match the saved operator intent")
+                        journal.update(identity, key, state="executing", operation_id=resumed.get("operationId"))
+                        try:
+                            result = self._invoke_client_procedure(procedure, token, *arguments)
+                        except BaseException:
+                            # Keep the same prepared identity; callers can resume it after reconnecting.
+                            raise
+                        status = {"state": "committed", "operationId": resumed.get("operationId"),
+                                  "outcome": result}
+                outcome = status.get("outcome")
+                operation_id = status.get("operationId")
+                if not isinstance(outcome, dict):
+                    raise DepositError("INVALID_RESPONSE", "Prepared server action returned no saved result")
+                if result_format == RESULT_FORMAT_CLONE:
+                    from ._recovery.journal import valid_import_result_envelope
+                    if (not valid_import_result_envelope(outcome) or outcome.get("kind") != "clone"
+                            or outcome.get("operationId") != operation_id):
+                        raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone result does not match its committed action")
+                    if current["state"] != "COMMITTED_RESULT_PENDING":
+                        journal.update(identity, key, state="COMMITTED_RESULT_PENDING", outcome=outcome,
+                                       operation_id=operation_id)
+                    try:
+                        journal.persist_import_result(
+                            identity, key, outcome,
+                            lambda collection, cursor, limit: self._invoke_client_procedure(
+                                "deposit.get.cloneResultPage", token, outcome["resultId"], collection, cursor, limit
+                            ),
+                        )
+                    except BaseException as exc:
+                        raise DepositError("COMMITTED_RESULT_PENDING", "Clone committed, but its receipt-bound mappings are not fully saved") from exc
+                    journal.update(identity, key, state="outcome_saved")
+                else:
+                    journal.update(identity, key, state="outcome_saved", outcome=outcome,
+                                   operation_id=operation_id)
+            if current["state"] != "release_sent":
+                self._recovery_control("deposit.action.resume", key, token)
+                journal.update(identity, key, state="release_sent")
+            release = self._single("CYPHER 25 CALL deposit.action.release($token) YIELD value RETURN value",
+                                   {"token": token})
+            if release.get("value") is not True:
+                raise DepositError("RELEASE_UNCONFIRMED", "Prepared server action release was not confirmed")
+            journal.update(identity, key, state="released")
+            return {"key": key, "outcome": outcome}
+
     def recovered_operations(self, *, recovery_directory: str | Path | None = None) -> tuple[RecoveredOperation, ...]:
         """List retained results whose server release was confirmed."""
         from ._recovery.journal import ProtectedJournal
@@ -420,6 +855,126 @@ class Client:
                 self._import_workflow_stores[workflow.id] = workflows
                 return workflows.status(workflow.id)
         raise ValueError("Open the receiving Store or supply its recovery directory to pending_imports")
+
+    def pending_clones(self, *, recovery_directory: str | Path | None = None):
+        """Discover local clone workflows without revealing paths or authenticating remotely."""
+        from ._clone_workflows import CloneWorkflowStore
+        from ._recovery.journal import ProtectedJournal
+
+        workflows = CloneWorkflowStore(ProtectedJournal(recovery_directory).storage)
+        pending = workflows.pending()
+        self._clone_workflow_stores.update({workflow.id: workflows for workflow in pending})
+        return iter(pending)
+
+    def inspect_clone(self, workflow, *, recovery_directory: str | Path | None = None):
+        """Inspect one protected clone phase without contacting Neo4j or reading staged bytes."""
+        from ._clone_workflows import CloneWorkflow, CloneWorkflowStore
+        from ._recovery.journal import ProtectedJournal
+
+        if not isinstance(workflow, CloneWorkflow):
+            raise TypeError("workflow must be a CloneWorkflow reference")
+        workflows = self._clone_workflow_stores.get(workflow.id)
+        if workflows is None:
+            workflows = CloneWorkflowStore(ProtectedJournal(recovery_directory).storage)
+            self._clone_workflow_stores[workflow.id] = workflows
+        return workflows.status(workflow.id)
+
+    def resume_clone(self, workflow, *, username: str, password: str,
+                     source=None, recovery_directory: str | Path | None = None):
+        """Reauthenticate the original actor and continue a protected server-scoped clone."""
+        from ._clone_workflows import CloneWorkflow, CloneWorkflowStore
+        from ._recovery.identity import DeploymentIdentity, IdentityUnavailableError, read_deployment_identity
+        from ._recovery.journal import ProtectedJournal
+
+        if self._closed:
+            raise RuntimeError("Client is closed")
+        if not isinstance(workflow, CloneWorkflow):
+            raise TypeError("workflow must be a CloneWorkflow reference")
+        workflows = self._clone_workflow_stores.get(workflow.id)
+        if workflows is None:
+            workflows = CloneWorkflowStore(ProtectedJournal(recovery_directory).storage)
+            self._clone_workflow_stores[workflow.id] = workflows
+        record = workflows.get(workflow.id)
+        expected_identity = DeploymentIdentity.from_dict(record["identity"])
+        try:
+            initial = read_deployment_identity(
+                self._driver, database=self._database, actor_id=expected_identity.actor_id,
+                namespace_id=None, server_scope=True,
+            )
+        except IdentityUnavailableError as exc:
+            raise DepositError("IDENTITY_MISMATCH", "Clone workflow identity could not be verified") from exc
+        if not expected_identity.matches(initial):
+            raise DepositError("IDENTITY_MISMATCH", "Clone workflow belongs to another server or database")
+        recovery_client = Client(self._driver, database=initial.database_name)
+        token = recovery_client.login(username, password)
+        try:
+            profile = recovery_client.get_session(token)
+            user = profile.get("user")
+            actor_id = user.get("id") if isinstance(user, dict) else None
+            if actor_id != expected_identity.actor_id:
+                raise DepositError("IDENTITY_MISMATCH", "Credentials authenticate a different Deposit actor")
+            recovery_client.require_clone_capabilities()
+            current = read_deployment_identity(
+                self._driver, database=initial.database_name, actor_id=actor_id,
+                namespace_id=None, server_scope=True,
+            )
+            if not expected_identity.matches(current):
+                raise DepositError("IDENTITY_MISMATCH", "Clone workflow belongs to another server or database")
+            journal = ProtectedJournal(store=workflows.storage)
+            with workflows.lock(workflow.id):
+                record = workflows.get(workflow.id)
+                if record["transfer_id"] is not None and record["state"] == "SOURCE_REQUIRED":
+                    # Bind the reserved spool before deciding whether the caller
+                    # may supply a first source or before continuing recovery.
+                    self._recover_clone_source_intent(workflows, workflow.id, journal, current)
+                    record = workflows.get(workflow.id)
+                if record["state"] == "SOURCE_REQUIRED" and source is not None:
+                    self._freeze_clone_source(workflows, workflow.id, journal, current, source)
+                elif source is not None:
+                    raise DepositError("CLONE_SOURCE_ALREADY_FROZEN", "Replacement input is allowed only before package freeze")
+                if record["state"] == "SOURCE_REQUIRED" and source is None:
+                    return workflows.status(workflow.id)
+                result = recovery_client._continue_clone_workflow(
+                    workflows, workflow.id, journal, current, token
+                )
+                return workflows.status(workflow.id, result=result)
+        except IdentityUnavailableError as exc:
+            raise DepositError("IDENTITY_MISMATCH", "Clone workflow identity could not be verified") from exc
+        finally:
+            try:
+                recovery_client.logout(token)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _recover_clone_source_intent(workflows, workflow_id, journal, identity):
+        from ._recovery.transfers import ProtectedTransferSpool
+
+        record = workflows.get(workflow_id)
+        spool = ProtectedTransferSpool(journal, identity)
+        intent = spool.read_clone_intent(workflow_id)
+        if intent["transfer_id"] != record["transfer_id"]:
+            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone workflow and source reservation differ")
+        transfer = Client._clone_source_manifest(spool, intent)
+        if transfer["state"] == "staging":
+            raise DepositError(
+                "CLONE_SOURCE_INCOMPLETE",
+                "The reserved clone source was interrupted before freezing; retained storage cannot accept replacement input",
+            )
+        spool.verify_content(transfer)
+        workflows.update(workflow_id, state="FROZEN", phase="frozen", sha256=transfer["sha256"],
+                         total_bytes=transfer["bytes"], verified_offset=0)
+
+    @staticmethod
+    def _clone_source_manifest(spool, intent):
+        from ._recovery.transfers import TransferError
+        try:
+            transfer = spool.load(intent["transfer_id"])
+        except TransferError as exc:
+            raise DepositError("CLONE_SOURCE_INCOMPLETE", "The reserved clone source was interrupted before its first durable checkpoint") from exc
+        if transfer["media_type"] != "application/vnd.deposit.namespace-clone":
+            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone source reservation refers to another transfer")
+        return transfer
 
     def resume_import(self, workflow, *, target_store, source_store=None):
         """Resume exact frozen work; PLAN_READY remains an explicit apply barrier."""
@@ -640,7 +1195,7 @@ class Client:
     def recover(self, operation: PendingOperation, *, username: str, password: str) -> RecoveredOperation:
         """Authenticate and resolve one operation reference without exposing its recovery key."""
         from ._recovery.identity import DeploymentIdentity, IdentityUnavailableError, read_deployment_identity
-        from ._recovery.journal import ProtectedJournal
+        from ._recovery.journal import ProtectedJournal, _SERVER_SCOPED_OPERATIONS
         from .recovery import PendingOperation, RecoveredOperation, recovered_operation
         from .errors import _saved_failure_error
 
@@ -651,6 +1206,9 @@ class Client:
         journal = self._recovery_journals.get(operation.id) or ProtectedJournal()
         record = journal.find_public_id(operation.id)
         expected_identity = DeploymentIdentity.from_dict(record["identity"])
+        server_scope = expected_identity.namespace_id is None
+        if server_scope != (record["procedure"] in _SERVER_SCOPED_OPERATIONS):
+            raise DepositError("IDENTITY_MISMATCH", "Recovery procedure does not match its recorded scope")
         # Resolve and validate the Client's actual target before authenticating.
         # In particular, never follow the database name from the journal when
         # this Client is explicitly configured for another database.
@@ -660,6 +1218,7 @@ class Client:
                 database=self._database,
                 actor_id=expected_identity.actor_id,
                 namespace_id=expected_identity.namespace_id,
+                server_scope=server_scope,
             )
         except IdentityUnavailableError as exc:
             raise DepositError("IDENTITY_MISMATCH", "Recovery identity could not be verified") from exc
@@ -677,6 +1236,7 @@ class Client:
                 database=initial_identity.database_name,
                 actor_id=expected_identity.actor_id,
                 namespace_id=expected_identity.namespace_id,
+                server_scope=server_scope,
             )
             if not stored_identity.matches(expected_identity):
                 raise DepositError("IDENTITY_MISMATCH", "Recovery record belongs to a different server or database")
@@ -685,11 +1245,17 @@ class Client:
             actor_id = user.get("id") if isinstance(user, dict) else None
             if actor_id != stored_identity.actor_id:
                 raise DepositError("IDENTITY_MISMATCH", "Credentials authenticate a different Deposit actor")
+            if record["procedure"] in {
+                    "deposit.import.cloneNamespace", "deposit.import.beginCloneUpload",
+                    "deposit.import.cloneUploadChunk", "deposit.import.finishCloneUpload",
+                    "deposit.import.abortCloneUpload"}:
+                recovery_client.require_clone_capabilities()
             current_identity = read_deployment_identity(
                 self._driver,
                 database=initial_identity.database_name,
                 actor_id=actor_id,
                 namespace_id=expected_identity.namespace_id,
+                server_scope=server_scope,
             )
             if not stored_identity.matches(current_identity):
                 raise DepositError("IDENTITY_MISMATCH", "Recovery record belongs to a different server or database")
@@ -698,6 +1264,11 @@ class Client:
                 return recovered_operation(record, journal=journal)
             if record["state"] == "failed":
                 raise _saved_failure_error(record["failure"])
+
+            if server_scope:
+                if record["procedure"] == "deposit.import.cloneNamespace":
+                    return recovery_client._recover_server_clone(journal, stored_identity, record, token)
+                return recovery_client._recover_server_action(journal, stored_identity, record, token)
 
             if record["procedure"] == "deposit.delete.namespace":
                 with journal.action_lock(record["key"]):
@@ -769,6 +1340,116 @@ class Client:
                     recovery_client.logout(token)
                 except Exception:
                     pass
+
+    def _recover_server_action(self, journal, identity, record, token):
+        """Resolve one exact server-scoped staging action without a Namespace context."""
+        from ._recovery.journal import _SERVER_SCOPED_OPERATIONS
+        with journal.action_lock(record["key"]):
+            current = journal.load(identity, record["key"])
+            if current["state"] == "released":
+                from .recovery import recovered_operation
+                return recovered_operation(current, journal=journal)
+            if current["procedure"] not in _SERVER_SCOPED_OPERATIONS or current["procedure"] == "deposit.import.cloneNamespace":
+                raise DepositError("SCOPE_MISMATCH", "Recovery action is not a server-scoped staging operation")
+            try:
+                state = self._recovery_control("deposit.action.status", current["key"], token)
+            except DepositError as exc:
+                if exc.code != "NOT_FOUND":
+                    raise
+                self._invoke_client_procedure("deposit.utils.refresh", token, "server")
+                state = self._invoke_client_procedure("deposit.action.prepare", token, current["key"],
+                                                      current["procedure"], current["arguments"])
+            operation_id = state.get("operationId") or current.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Server action returned no operation identity")
+            if current.get("operation_id") is not None and current["operation_id"] != operation_id:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Server action identity changed")
+            if state.get("state") == "committed":
+                status = state
+            elif current["state"] in {"intent", "prepare_sent", "prepared", "executing"}:
+                current = journal.update(identity, current["key"], state="prepared", operation_id=operation_id)
+                self._recovery_control("deposit.action.resume", current["key"], token)
+                current = journal.update(identity, current["key"], state="executing",
+                                         operation_id=operation_id)
+                outcome = self._invoke_client_procedure(current["procedure"], token, *current["arguments"])
+                status = {"state": "committed", "operationId": operation_id, "outcome": outcome}
+            elif current["state"] == "outcome_saved":
+                status = {"state": "committed", "operationId": operation_id, "outcome": current["outcome"]}
+            else:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved Server action release cannot resolve before its outcome")
+            outcome = current["outcome"] if current["state"] == "outcome_saved" else status.get("outcome")
+            if not isinstance(outcome, dict):
+                raise DepositError("INVALID_RESPONSE", "Server staging action returned no saved result")
+            journal.update(identity, current["key"], state="outcome_saved", outcome=outcome,
+                            operation_id=operation_id)
+            self._recovery_control("deposit.action.resume", current["key"], token)
+            journal.update(identity, current["key"], state="release_sent")
+            release = self._single("CYPHER 25 CALL deposit.action.release($token) YIELD value RETURN value",
+                                   {"token": token})
+            if release.get("value") is not True:
+                raise DepositError("RELEASE_UNCONFIRMED", "Prepared server action release was not confirmed")
+            from .recovery import recovered_operation
+            released = journal.update(identity, current["key"], state="released")
+            return recovered_operation(released, journal=journal)
+
+    def _recover_server_clone(self, journal, identity, record, token):
+        from ._recovery.journal import RESULT_FORMAT_CLONE, valid_import_result_envelope
+        self.require_clone_capabilities()
+        with journal.action_lock(record["key"]):
+            current = journal.load(identity, record["key"])
+            if current["state"] == "released":
+                from .recovery import recovered_operation
+                return recovered_operation(current, journal=journal)
+            if (current["procedure"] != "deposit.import.cloneNamespace"
+                    or current.get("result_format") != RESULT_FORMAT_CLONE):
+                raise DepositError("SCOPE_MISMATCH", "Recovery action is not a durable Namespace clone")
+            try:
+                state = self._recovery_control("deposit.action.status", current["key"], token)
+            except DepositError as exc:
+                if exc.code != "NOT_FOUND":
+                    raise
+                self._invoke_client_procedure("deposit.utils.refresh", token, "server")
+                state = self._invoke_client_procedure("deposit.action.prepare", token, current["key"],
+                                                      current["procedure"], current["arguments"])
+            operation_id = state.get("operationId") or current.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone Server action returned no operation identity")
+            if current.get("operation_id") is not None and current["operation_id"] != operation_id:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone Server action identity changed")
+            elif current["state"] in {"outcome_saved", "release_sent", "COMMITTED_RESULT_PENDING"}:
+                envelope = current["outcome"]
+            elif state.get("state") == "committed":
+                envelope = state.get("outcome")
+            elif current["state"] in {"intent", "prepare_sent", "prepared", "executing"}:
+                current = journal.update(identity, current["key"], state="prepared", operation_id=operation_id)
+                self._recovery_control("deposit.action.resume", current["key"], token)
+                current = journal.update(identity, current["key"], state="executing", operation_id=operation_id)
+                envelope = self._invoke_client_procedure(current["procedure"], token, *current["arguments"])
+            else:
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Release-sent clone result has no protected outcome")
+            if (not valid_import_result_envelope(envelope) or envelope.get("kind") != "clone"
+                    or envelope.get("operationId") != operation_id):
+                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone result does not match its committed action")
+            if current["state"] not in {"outcome_saved", "release_sent", "COMMITTED_RESULT_PENDING"}:
+                current = journal.update(identity, current["key"], state="COMMITTED_RESULT_PENDING", outcome=envelope,
+                                        operation_id=operation_id)
+            journal.persist_import_result(
+                identity, current["key"], envelope,
+                lambda collection, cursor, limit: self._invoke_client_procedure(
+                    "deposit.get.cloneResultPage", token, envelope["resultId"], collection, cursor, limit
+                ),
+            )
+            if current["state"] != "outcome_saved":
+                current = journal.update(identity, current["key"], state="outcome_saved")
+            self._recovery_control("deposit.action.resume", current["key"], token)
+            current = journal.update(identity, current["key"], state="release_sent")
+            release = self._single("CYPHER 25 CALL deposit.action.release($token) YIELD value RETURN value",
+                                   {"token": token})
+            if release.get("value") is not True:
+                raise DepositError("RELEASE_UNCONFIRMED", "Prepared clone action release was not confirmed")
+            from .recovery import recovered_operation
+            released = journal.update(identity, current["key"], state="released")
+            return recovered_operation(released, journal=journal)
 
     def _recovery_control(self, procedure: str, key: str, token: str) -> dict[str, Any]:
         column = "value" if procedure == "deposit.action.release" else "data"

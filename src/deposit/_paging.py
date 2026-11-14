@@ -334,6 +334,26 @@ class ImportResult(MappingABC):
         self.close()
 
 
+class CloneResult(ImportResult):
+    """Receipt-bound lazy result for a full Namespace clone."""
+
+    @property
+    def namespace_id(self):
+        return self._envelope["namespaceId"]
+
+    @property
+    def name(self):
+        return self["metadata"]["name"]
+
+    @property
+    def identity_mappings(self):
+        return self["identityMappings"]
+
+    @property
+    def resource_mapping(self):
+        return self["resourceMapping"]
+
+
 def _lazy_collection(journal, action_key, collection, kind, count, owner):
     if kind == "mapping":
         return LazyResultMapping(journal, action_key, collection, count, owner)

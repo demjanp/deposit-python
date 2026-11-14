@@ -46,6 +46,7 @@ class ProtectedTransferSpool:
         *,
         filename: str,
         media_type: str,
+        transfer_id: str | None = None,
     ) -> dict[str, Any]:
         """Consume a binary source once and durably freeze it before any action."""
         if not isinstance(filename, str) or not filename or len(filename) > 255:
@@ -55,7 +56,9 @@ class ProtectedTransferSpool:
         if not callable(getattr(source, "read", None)):
             raise TypeError("resource source must be a readable binary stream")
 
-        transfer_id = uuid.uuid4().hex
+        transfer_id = uuid.uuid4().hex if transfer_id is None else transfer_id
+        if not isinstance(transfer_id, str) or not _TRANSFER_ID.fullmatch(transfer_id):
+            raise ValueError("Transfer reference is invalid")
         admission = StorageAdmissionCoordinator(self._storage)
         reservation = admission.acquire(transfer_id, "protected-upload-spool", {str(self._storage.root): 0})
         digest = hashlib.sha256()
@@ -107,6 +110,44 @@ class ProtectedTransferSpool:
                 # and commitments for restart diagnosis; never retry from a new
                 # caller stream under the old transfer identity.
                 raise
+
+    @staticmethod
+    def _clone_intent_name(workflow_id: str) -> str:
+        if not isinstance(workflow_id, str) or not _TRANSFER_ID.fullmatch(workflow_id):
+            raise ValueError("Clone workflow reference is invalid")
+        return f"clone-source-{workflow_id}-transfer"
+
+    def reserve_clone_source(self, workflow_id: str) -> dict[str, Any]:
+        """Own one clone input before the caller's first read."""
+        from .journal import _strict_json_loads
+        with self._storage.lock(self._clone_intent_name(workflow_id)):
+            if self._storage.has_record(self._clone_intent_name(workflow_id)):
+                return self.read_clone_intent(workflow_id)
+            record = {
+                "workflow_id": workflow_id,
+                "transfer_id": uuid.uuid4().hex,
+                "identity": self._identity.to_dict(),
+            }
+            payload = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ProtectedJournal(store=self._storage)._write_protected(
+                self._clone_intent_name(workflow_id), payload)
+            return record
+
+    def read_clone_intent(self, workflow_id: str) -> dict[str, Any]:
+        """Decode only the exact preallocated clone owner, not arbitrary spools."""
+        try:
+            record = _strict_json_loads(self._storage.read(self._clone_intent_name(workflow_id)))
+            if (not isinstance(record, dict) or set(record) != {"workflow_id", "transfer_id", "identity"}
+                    or record["workflow_id"] != workflow_id
+                    or not isinstance(record["transfer_id"], str)
+                    or not _TRANSFER_ID.fullmatch(record["transfer_id"])
+                    or DeploymentIdentity.from_dict(record["identity"]) != self._identity):
+                raise TransferError("Clone source reservation does not belong to this deployment")
+            return record
+        except TransferError:
+            raise
+        except Exception as exc:
+            raise TransferError("Clone source reservation is unavailable or corrupt") from exc
 
     def _write_staging_chunk(self, admission, reservation, manifest, block: bytes, digest) -> None:
         index = manifest["chunk_count"]
@@ -267,11 +308,13 @@ class ProtectedTransferSpool:
             if manifest["state"] != "finished":
                 raise TransferError("Unresolved upload spool cannot be removed")
             with self._storage.lock("journal-index"):
+                # Keep both admission and manifest until every payload chunk is gone.
+                # If a delete fails, retry still owns the disk bytes and has its index.
                 for index in range(self.chunk_count(manifest)):
                     self._storage.delete(self._chunk_name(transfer_id, index))
-                self._storage.delete(self._manifest_name(transfer_id))
                 if manifest.get("admission_id"):
                     self._storage.delete(f"admission-{manifest['admission_id']}")
+                self._storage.delete(self._manifest_name(transfer_id))
 
     def _save(self, manifest: dict[str, Any], *, creating: bool = False) -> None:
         self._validate(manifest, manifest.get("transfer_id"))

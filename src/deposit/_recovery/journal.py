@@ -22,6 +22,12 @@ from .storage import ProtectedStorageError, ProtectedStore, StorageAdmissionCoor
 
 RESULT_FORMAT_NAMED_ROWS = "named_rows"
 RESULT_FORMAT_IMPORT = "import_result"
+RESULT_FORMAT_CLONE = "clone_result"
+_SERVER_SCOPED_OPERATIONS = frozenset({
+    "deposit.import.cloneNamespace", "deposit.import.beginCloneUpload",
+    "deposit.import.cloneUploadChunk", "deposit.import.finishCloneUpload",
+    "deposit.import.abortCloneUpload",
+})
 MAX_UNRESOLVED = 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 OPERATION_CHUNK_BYTES = 1024 * 1024
@@ -125,9 +131,13 @@ class ProtectedJournal:
         key: str | None = None,
     ) -> dict[str, Any]:
         if result_format is not None and (
-            type(result_format) is not str or result_format not in {RESULT_FORMAT_NAMED_ROWS, RESULT_FORMAT_IMPORT}
+            type(result_format) is not str or result_format not in {RESULT_FORMAT_NAMED_ROWS, RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE}
         ):
             raise JournalError("Recovery result format is unsupported")
+        if (identity.namespace_id is None) != (procedure in _SERVER_SCOPED_OPERATIONS):
+            raise JournalError("Recovery action scope does not match its procedure")
+        if (procedure == "deposit.import.cloneNamespace") != (result_format == RESULT_FORMAT_CLONE):
+            raise JournalError("Clone action result format does not match its procedure")
         key = str(uuid.uuid4()) if key is None else key
         if not _is_uuid(key):
             raise JournalError("Recovery action key is invalid")
@@ -214,7 +224,15 @@ class ProtectedJournal:
         """Persist the exact immutable result before the prepared action is released."""
         if not _is_uuid(key) or not valid_import_result_envelope(envelope):
             raise JournalError("Import result envelope is invalid")
-        if envelope["namespaceId"] != identity.namespace_id:
+        clone_result = envelope["kind"] == "clone"
+        action = next((item for item in self.records(identity)
+                       if item["key"] == key and item["procedure"] == "deposit.import.cloneNamespace"), None)
+        if clone_result:
+            if (identity.namespace_id is not None or envelope["operationId"] is None
+                    or action is None or action.get("result_format") != RESULT_FORMAT_CLONE):
+                raise JournalError("Clone result is not bound to a server-scoped action")
+        elif (identity.namespace_id is None or envelope["namespaceId"] != identity.namespace_id
+                or envelope["kind"] not in {"analysis", "apply", "diagnostic", "plan_inspection"}):
             raise JournalError("Import result belongs to a different Namespace")
         index_name = _import_result_index_name(key)
         prior = None
@@ -514,7 +532,9 @@ class ProtectedJournal:
 
     def _cleanup_import_result_locked(self, key: str, *, identity: DeploymentIdentity) -> bool:
         """Delete expired result segments only when readers/workflows release them."""
-        if _record_name(identity, key) in self._workflow_dependencies_locked():
+        if (_record_name(identity, key) in self._workflow_dependencies_locked()
+                or _record_name(identity, key) in self._clone_workflow_dependencies_locked(
+                    datetime.now(timezone.utc) - RESULT_RETENTION)):
             return False
         prefix = f"import-result-{key}-"
         for name in self.storage.list_records():
@@ -687,7 +707,9 @@ class ProtectedJournal:
         cutoff = (now or datetime.now(timezone.utc)) - RESULT_RETENTION
         removed = 0
         with self.storage.lock("journal-index"):
-            dependencies = self._transfer_dependencies_locked() | self._workflow_dependencies_locked()
+            self._prune_clone_workflows_locked(cutoff)
+            dependencies = (self._transfer_dependencies_locked() | self._workflow_dependencies_locked()
+                           | self._clone_workflow_dependencies_locked(cutoff))
             for record in self._records_locked(identity):
                 if record["state"] not in {"released", "failed"}:
                     continue
@@ -698,7 +720,7 @@ class ProtectedJournal:
                 if resolved.tzinfo is None:
                     raise JournalError("Resolved journal record has invalid retention metadata")
                 if resolved <= cutoff and _record_name(identity, record["key"]) not in dependencies:
-                    if record.get("result_format") == RESULT_FORMAT_IMPORT:
+                    if record.get("result_format") in {RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE}:
                         if not self._cleanup_import_result_locked(record["key"], identity=DeploymentIdentity.from_dict(record["identity"])):
                             continue
                     self.storage.delete(_record_name(identity, record["key"]))
@@ -892,6 +914,52 @@ class ProtectedJournal:
                     raise JournalError("Protected workflow dependencies cannot be assessed safely") from exc
         return dependencies
 
+    def _clone_workflow_dependencies_locked(self, cutoff: datetime) -> set[str]:
+        """Pin outstanding clone actions and committed clone results to their local root."""
+        from .._clone_workflows import CloneWorkflowStore
+        dependencies = set()
+        for name in self.storage.iter_records():
+            match = re.fullmatch(r"clone-workflow-([0-9a-f]{32})", name)
+            if match is None:
+                continue
+            try:
+                record = _strict_json_loads(self.storage.read(name))
+                CloneWorkflowStore._validate(record, match.group(1))
+                if record["outstanding_action_key"] is not None:
+                    dependencies.add(_record_name(DeploymentIdentity.from_dict(record["identity"]),
+                                                   record["outstanding_action_key"]))
+                if record["clone_action_key"] is not None:
+                    resolved = record["resolved_at"]
+                    if (resolved is None or _aware_datetime(resolved) > cutoff
+                            or record["cleanup_status"] != "complete"):
+                        dependencies.add(_record_name(DeploymentIdentity.from_dict(record["identity"]),
+                                                       record["clone_action_key"]))
+            except Exception as exc:
+                raise JournalError("A clone workflow reference cannot be assessed safely") from exc
+        return dependencies
+
+    def _prune_clone_workflows_locked(self, cutoff: datetime) -> None:
+        """Remove terminal clone roots after the ordinary result retention window."""
+        from .._clone_workflows import CloneWorkflowStore
+        expired = []
+        for name in self.storage.iter_records():
+            match = re.fullmatch(r"clone-workflow-([0-9a-f]{32})", name)
+            if match is None:
+                continue
+            try:
+                record = _strict_json_loads(self.storage.read(name))
+                CloneWorkflowStore._validate(record, match.group(1))
+                if record["state"] not in {"COMMITTED", "FAILED"} or record["resolved_at"] is None:
+                    continue
+                if record["cleanup_status"] == "complete" and _aware_datetime(record["resolved_at"]) <= cutoff:
+                    expired.append(name)
+                    if len(expired) >= 64:
+                        break
+            except Exception as exc:
+                raise JournalError("A clone workflow record cannot be pruned safely") from exc
+        for name in expired:
+            self.storage.delete(name)
+
     def _transfer_dependencies_locked(self) -> set[str]:
         """Snapshot validated transfer pins under journal-index, never transfer locks."""
         from .transfers import ProtectedTransferSpool
@@ -916,8 +984,10 @@ class ProtectedJournal:
         return dependencies
 
     def _prune_expired_locked(self, identity: DeploymentIdentity) -> None:
-        dependencies = self._transfer_dependencies_locked() | self._workflow_dependencies_locked()
         cutoff = datetime.now(timezone.utc) - RESULT_RETENTION
+        self._prune_clone_workflows_locked(cutoff)
+        dependencies = (self._transfer_dependencies_locked() | self._workflow_dependencies_locked()
+                       | self._clone_workflow_dependencies_locked(cutoff))
         for name in self.storage.list_records():
             if not name.startswith("op-"):
                 continue
@@ -931,7 +1001,7 @@ class ProtectedJournal:
             except Exception as exc:
                 raise JournalError("An existing recovery journal record cannot be pruned safely") from exc
             if resolved <= cutoff and name not in dependencies:
-                if record.get("result_format") == RESULT_FORMAT_IMPORT:
+                if record.get("result_format") in {RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE}:
                     if not self._cleanup_import_result_locked(record["key"], identity=DeploymentIdentity.from_dict(record["identity"])):
                         continue
                 self.storage.delete(name)
@@ -1003,7 +1073,7 @@ class ProtectedJournal:
             raise JournalError("Recovery journal record has an unsupported format")
         if "result_format" in record and (
             type(record["result_format"]) is not str
-            or record["result_format"] not in {RESULT_FORMAT_NAMED_ROWS, RESULT_FORMAT_IMPORT}
+            or record["result_format"] not in {RESULT_FORMAT_NAMED_ROWS, RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE}
         ):
             raise JournalError("Recovery journal record has an unsupported format")
         if (
@@ -1018,6 +1088,10 @@ class ProtectedJournal:
             raise JournalError("Recovery journal identity does not match this Store")
         if not isinstance(record["procedure"], str) or not record["procedure"].startswith("deposit."):
             raise JournalError("Recovery journal procedure is invalid")
+        if (identity.namespace_id is None) != (record["procedure"] in _SERVER_SCOPED_OPERATIONS):
+            raise JournalError("Recovery journal action scope does not match its procedure")
+        if (record["procedure"] == "deposit.import.cloneNamespace") != (record.get("result_format") == RESULT_FORMAT_CLONE):
+            raise JournalError("Recovery journal result format does not match its procedure")
         if (
             not isinstance(record["arguments"], list)
             or type(record["snapshot_revision"]) is not int
@@ -1052,17 +1126,27 @@ class ProtectedJournal:
                 raise JournalError("Released recovery outcome is invalid")
         elif record["resolved_at"] is not None:
             raise JournalError("Unreleased recovery record has retention metadata")
+        if record.get("result_format") == RESULT_FORMAT_CLONE and (
+                record["state"] in {"COMMITTED_RESULT_PENDING", "outcome_saved", "release_sent", "released"}
+                or record["outcome"] is not None):
+            if record["outcome"] is None or record["outcome"].get("kind") != "clone" or (
+                    record["outcome"]["operationId"] != record["operation_id"]):
+                raise JournalError("Clone recovery result is incomplete or belongs to another action")
+        if (record.get("result_format") == RESULT_FORMAT_IMPORT
+                and record["outcome"] is not None
+                and record["outcome"].get("kind") == "clone"):
+            raise JournalError("Import recovery result cannot have server-scoped clone semantics")
         if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS and record["outcome"] is not None:
             if not valid_named_rows_result(record["outcome"]):
                 raise JournalError("Advanced recovery result is invalid")
-        if record.get("result_format") == RESULT_FORMAT_IMPORT and record["outcome"] is not None:
+        if record.get("result_format") in {RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE} and record["outcome"] is not None:
             if not valid_import_result_envelope(record["outcome"]):
-                raise JournalError("Import recovery result envelope is invalid")
+                raise JournalError("Recovery result envelope is invalid")
         if record["state"] == "COMMITTED_RESULT_PENDING" and (
-                record.get("result_format") != RESULT_FORMAT_IMPORT
+                record.get("result_format") not in {RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE}
                 or not valid_import_result_envelope(record.get("outcome"))
                 or not isinstance(record.get("operation_id"), str)):
-            raise JournalError("Committed import result recovery state is invalid")
+            raise JournalError("Committed result recovery state is invalid")
         return record
 
 
@@ -1302,13 +1386,24 @@ def valid_import_result_envelope(value: Any) -> bool:
             or not isinstance(value["resultId"], str) or not value["resultId"]
             or (value["operationId"] is not None
                 and (not isinstance(value["operationId"], str) or not value["operationId"]))
-            or not isinstance(value["kind"], str) or value["kind"] not in {"analysis", "apply", "diagnostic", "plan_inspection"}
+            or not isinstance(value["kind"], str) or value["kind"] not in {"analysis", "apply", "diagnostic", "plan_inspection", "clone"}
             or not isinstance(value["state"], str) or not value["state"]
             or not isinstance(value["namespaceId"], str) or not value["namespaceId"]
             or (value["planId"] is not None and not isinstance(value["planId"], str))
             or type(value["revision"]) is not int or not 0 <= value["revision"] <= _MAX_SAFE_INTEGER
             or type(value["expiresAt"]) is not int or not 0 <= value["expiresAt"] <= _MAX_SAFE_INTEGER
             or not isinstance(value["collections"], dict)):
+        return False
+    if value["kind"] == "clone" and value["operationId"] is None:
+        return False
+    if value["kind"] == "clone" and (
+        value["state"] != "committed" or value["planId"] is not None
+        or set(value["collections"]) != {"mapping", "identityMappings", "resourceMapping", "metadata"}
+        or any(not isinstance(value["collections"].get(key), dict)
+               for key in value["collections"])
+        or any(value["collections"][key].get("kind") != "mapping"
+               for key in value["collections"])
+    ):
         return False
     for name, descriptor in value["collections"].items():
         if (not isinstance(name, str) or not name or len(name) > 256

@@ -11,6 +11,7 @@ __pycache__/
 ### Codex ###
 .codex/
 .agents/
+.abcroute/
 
 # Distribution / packaging
 .Python
