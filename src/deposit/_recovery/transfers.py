@@ -312,6 +312,7 @@ class ProtectedTransferSpool:
                 # If a delete fails, retry still owns the disk bytes and has its index.
                 for index in range(self.chunk_count(manifest)):
                     self._storage.delete(self._chunk_name(transfer_id, index))
+                    self._storage.delete(self._chunk_meta_name(transfer_id, index))
                 if manifest.get("admission_id"):
                     self._storage.delete(f"admission-{manifest['admission_id']}")
                 self._storage.delete(self._manifest_name(transfer_id))

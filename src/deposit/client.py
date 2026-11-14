@@ -18,6 +18,7 @@ from ._gateway import (
     bind_client_arguments,
     build_query,
     client_procedure,
+    clone_coordinator_procedure,
     map_driver_error,
     prune_dry_run_procedure,
     recovery_read_procedure,
@@ -153,6 +154,16 @@ class Client:
         """Revoke a Deposit session without closing a caller-owned driver."""
         self.discover()
         self._single("CYPHER 25 CALL deposit.utils.logout($token) YIELD value RETURN value", {"token": token})
+
+    def _invoke_coordinated_server_procedure(self, procedure: str, token: str, *arguments: Any) -> Any:
+        """Execute only the declared clone action/recovery coordinator routes."""
+        entry = clone_coordinator_procedure(procedure)
+        bound = bind_client_arguments(entry, arguments)
+        query, parameters = build_query(entry, bound, token)
+        record = self._single(query, parameters)
+        if "data" not in record or not isinstance(record["data"], dict):
+            raise DepositError("INVALID_RESPONSE", f"{procedure} returned no data result")
+        return record["data"]
 
     def _invoke_client_procedure(self, procedure: str, token: str, *arguments: Any) -> Any:
         entry = client_procedure(procedure)
@@ -429,7 +440,7 @@ class Client:
         workflow = workflows.create(identity)
         self._clone_workflow_stores[workflow.id] = workflows
         self._recovery_journals = getattr(self, "_recovery_journals", {})
-        self._invoke_client_procedure("deposit.utils.refresh", token, "server")
+        self._invoke_coordinated_server_procedure("deposit.utils.refresh", token, "server")
         with workflows.lock(workflow.id):
             self._freeze_clone_source(workflows, workflow.id, journal, identity, source)
             return self._continue_clone_workflow(workflows, workflow.id, journal, identity, token)
@@ -750,8 +761,8 @@ class Client:
                         raise
                     # Each server-scoped action advances the server revision. Refresh
                     # the session baseline before preparing the next frozen action.
-                    self._invoke_client_procedure("deposit.utils.refresh", token, "server")
-                    prepared = self._invoke_client_procedure("deposit.action.prepare", token,
+                    self._invoke_coordinated_server_procedure("deposit.utils.refresh", token, "server")
+                    prepared = self._invoke_coordinated_server_procedure("deposit.action.prepare", token,
                                                              key, procedure, list(arguments))
                 if prepared.get("state") == "committed":
                     status = prepared
@@ -779,7 +790,7 @@ class Client:
                             raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Resumed server action does not match the saved operator intent")
                         journal.update(identity, key, state="executing", operation_id=resumed.get("operationId"))
                         try:
-                            result = self._invoke_client_procedure(procedure, token, *arguments)
+                            result = self._invoke_coordinated_server_procedure(procedure, token, *arguments)
                         except BaseException:
                             # Keep the same prepared identity; callers can resume it after reconnecting.
                             raise
@@ -800,7 +811,7 @@ class Client:
                     try:
                         journal.persist_import_result(
                             identity, key, outcome,
-                            lambda collection, cursor, limit: self._invoke_client_procedure(
+                            lambda collection, cursor, limit: self._invoke_coordinated_server_procedure(
                                 "deposit.get.cloneResultPage", token, outcome["resultId"], collection, cursor, limit
                             ),
                         )
@@ -1356,8 +1367,8 @@ class Client:
             except DepositError as exc:
                 if exc.code != "NOT_FOUND":
                     raise
-                self._invoke_client_procedure("deposit.utils.refresh", token, "server")
-                state = self._invoke_client_procedure("deposit.action.prepare", token, current["key"],
+                self._invoke_coordinated_server_procedure("deposit.utils.refresh", token, "server")
+                state = self._invoke_coordinated_server_procedure("deposit.action.prepare", token, current["key"],
                                                       current["procedure"], current["arguments"])
             operation_id = state.get("operationId") or current.get("operation_id")
             if not isinstance(operation_id, str) or not operation_id:
@@ -1371,7 +1382,7 @@ class Client:
                 self._recovery_control("deposit.action.resume", current["key"], token)
                 current = journal.update(identity, current["key"], state="executing",
                                          operation_id=operation_id)
-                outcome = self._invoke_client_procedure(current["procedure"], token, *current["arguments"])
+                outcome = self._invoke_coordinated_server_procedure(current["procedure"], token, *current["arguments"])
                 status = {"state": "committed", "operationId": operation_id, "outcome": outcome}
             elif current["state"] == "outcome_saved":
                 status = {"state": "committed", "operationId": operation_id, "outcome": current["outcome"]}
@@ -1408,8 +1419,8 @@ class Client:
             except DepositError as exc:
                 if exc.code != "NOT_FOUND":
                     raise
-                self._invoke_client_procedure("deposit.utils.refresh", token, "server")
-                state = self._invoke_client_procedure("deposit.action.prepare", token, current["key"],
+                self._invoke_coordinated_server_procedure("deposit.utils.refresh", token, "server")
+                state = self._invoke_coordinated_server_procedure("deposit.action.prepare", token, current["key"],
                                                       current["procedure"], current["arguments"])
             operation_id = state.get("operationId") or current.get("operation_id")
             if not isinstance(operation_id, str) or not operation_id:
@@ -1424,7 +1435,7 @@ class Client:
                 current = journal.update(identity, current["key"], state="prepared", operation_id=operation_id)
                 self._recovery_control("deposit.action.resume", current["key"], token)
                 current = journal.update(identity, current["key"], state="executing", operation_id=operation_id)
-                envelope = self._invoke_client_procedure(current["procedure"], token, *current["arguments"])
+                envelope = self._invoke_coordinated_server_procedure(current["procedure"], token, *current["arguments"])
             else:
                 raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Release-sent clone result has no protected outcome")
             if (not valid_import_result_envelope(envelope) or envelope.get("kind") != "clone"
@@ -1435,7 +1446,7 @@ class Client:
                                         operation_id=operation_id)
             journal.persist_import_result(
                 identity, current["key"], envelope,
-                lambda collection, cursor, limit: self._invoke_client_procedure(
+                lambda collection, cursor, limit: self._invoke_coordinated_server_procedure(
                     "deposit.get.cloneResultPage", token, envelope["resultId"], collection, cursor, limit
                 ),
             )

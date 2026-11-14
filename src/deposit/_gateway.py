@@ -44,6 +44,15 @@ _STORE_CONTROL_PROCEDURES = {
 
 _RECOVERY_READ_PROCEDURES = frozenset({"deposit.get.operation", "deposit.get.lastOperation"})
 
+_CLONE_COORDINATOR_ACTIONS = frozenset({
+    "deposit.import.cloneNamespace", "deposit.import.beginCloneUpload",
+    "deposit.import.cloneUploadChunk", "deposit.import.finishCloneUpload",
+    "deposit.import.abortCloneUpload",
+})
+_CLONE_COORDINATOR_CONTROLS = frozenset({
+    "deposit.utils.refresh", "deposit.action.prepare", "deposit.get.cloneResultPage",
+})
+
 
 def _manifest() -> dict[str, Any]:
     global _MANIFEST
@@ -80,6 +89,36 @@ def client_procedure(name: str) -> dict[str, Any]:
         or entry.get("action") is not False
     ):
         raise ValueError("procedure is not an allowlisted Client procedure")
+    return entry
+
+
+def clone_coordinator_procedure(name: str) -> dict[str, Any]:
+    """Return a declared clone/recovery route without widening Client's gateway."""
+    if not isinstance(name, str):
+        raise TypeError("procedure must be a manifest procedure name")
+    entry = next((item for item in _manifest()["procedures"] if item["name"] == name), None)
+    if (
+        entry is None
+        or name not in _CLONE_COORDINATOR_ACTIONS | _CLONE_COORDINATOR_CONTROLS
+        or entry.get("scope") != "server"
+        or entry.get("requires_token") is not True
+        or entry.get("action") is not (name in _CLONE_COORDINATOR_ACTIONS)
+        or entry.get("columns") != ["data"]
+    ):
+        raise ValueError("procedure is not an allowlisted clone coordinator route")
+    if name in _CLONE_COORDINATOR_CONTROLS:
+        owner = "Client" if name == "deposit.get.cloneResultPage" else "RecoveryCoordinator"
+        if entry.get("invocation_owner") != owner:
+            raise ValueError("clone coordinator control has an unexpected owner")
+        if name == "deposit.get.cloneResultPage":
+            if entry.get("mode") != "READ":
+                raise ValueError("clone result retrieval is registered as a write")
+        elif name != "deposit.utils.refresh" and entry.get("mode") != "WRITE":
+            raise ValueError("clone recovery control has an unexpected persistence mode")
+        elif name == "deposit.utils.refresh" and entry.get("mode") not in {"READ", "WRITE"}:
+            raise ValueError("clone recovery refresh has an invalid mode")
+    elif entry.get("invocation_owner") != "Client" or entry.get("mode") != "WRITE":
+        raise ValueError("clone action has an unexpected invocation contract")
     return entry
 
 
