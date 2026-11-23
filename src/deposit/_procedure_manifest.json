@@ -1,24 +1,10 @@
 {
   "source": {
     "repository": "deposit-server",
-    "files_sha256": {
-      "runtime/public-api.json": "d8afdd5cce6ef3aa17503d548caf3881edc53b026d9e3e783770f45179997a4d",
-      "plugin/src/main/java/deposit/api/DepositAPI.java": "6b897e5d97b6abc503388238afe7f30763e8290a44ae9980eb90b98be65727bb",
-      "plugin/src/main/java/org/deposit/runtime/Discovery.java": "a8e183bb8fdd3c7feea9ad1c975399e30755e0eca793200a8e738a1f41531df0",
-      "plugin/src/main/java/deposit/common/ProcedureCatalog.java": "3b5bbdf04a452f52161f8cce751ad9b1028d3855d13d72fa3869a7aa3752014e",
-      "plugin/src/main/java/deposit/common/PublicResults.java": "50b67a8f6af32f5385e052d9b7edaeb7070bef9401311617807a265cd3ad8a9c",
-      "plugin/src/main/java/deposit/service/DomainService.java": "7ca61bb9be8e7ea14455cbc9744997f015bab3d34705b85c73d9ab517f8dc90c"
-    },
-    "catalog_entries": 123,
-    "discovery_entry": "deposit.get.info",
-    "server_project_version": "0.0.0-dev",
-    "neo4j_version": "2026.05.0"
+    "path": "runtime/public-api.json"
   },
   "support": {
-    "tested_server_build": "2.0.0-dev.77-post.15.g7610e45-SNAPSHOT",
-    "tested_neo4j_version": "2026.05.0",
-    "target_python": "3.14.x (Windows x64)",
-    "supported_python": ">=3.14,<3.15",
+    "supported_python": ">=3.14, <3.15",
     "neo4j_driver": ">=6.1,<7"
   },
   "procedures": [
@@ -42,10 +28,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -68,10 +54,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -89,10 +75,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -110,10 +96,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -136,10 +122,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -162,10 +148,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -188,10 +174,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -209,10 +195,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -230,10 +216,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -256,10 +242,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -287,10 +273,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -318,10 +304,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -339,10 +325,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -360,10 +346,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -386,10 +372,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -422,10 +408,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -448,10 +434,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -469,10 +455,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -490,10 +476,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -516,10 +502,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -542,10 +528,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -568,10 +554,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -589,10 +575,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -610,10 +596,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -636,10 +622,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -672,10 +658,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -698,10 +684,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -719,10 +705,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -740,10 +726,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -766,10 +752,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -802,10 +788,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -828,10 +814,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -849,10 +835,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -870,10 +856,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -896,10 +882,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -922,10 +908,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -943,10 +929,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -964,10 +950,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -990,10 +976,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": false,
+      "token_index": null,
       "action": false,
       "admin": true,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1016,10 +1002,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": false,
+      "token_index": null,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1031,10 +1017,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1062,10 +1048,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1088,10 +1074,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1114,10 +1100,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1140,10 +1126,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1161,10 +1147,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -1182,10 +1168,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1208,10 +1194,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1229,10 +1215,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1244,10 +1230,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1265,10 +1251,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1280,10 +1266,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1301,10 +1287,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1327,10 +1313,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1348,10 +1334,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1374,10 +1360,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -1395,10 +1381,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1416,10 +1402,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1442,10 +1428,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1463,10 +1449,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1478,10 +1464,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1499,10 +1485,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1525,10 +1511,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -1540,10 +1526,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1555,10 +1541,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1576,10 +1562,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1597,10 +1583,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1618,10 +1604,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1639,10 +1625,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1660,10 +1646,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1682,10 +1668,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1697,10 +1683,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1718,10 +1704,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1744,10 +1730,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1777,10 +1763,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1808,10 +1794,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1844,10 +1830,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1880,10 +1866,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1901,10 +1887,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1922,10 +1908,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1943,10 +1929,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1974,10 +1960,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -1995,10 +1981,10 @@
       "mode": "WRITE",
       "scope": "prune",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -2016,10 +2002,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -2047,10 +2033,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -2073,10 +2059,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -2094,10 +2080,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2109,10 +2095,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -2130,10 +2116,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2145,10 +2131,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2160,10 +2146,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2175,10 +2161,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2196,10 +2182,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2227,10 +2213,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2248,10 +2234,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2269,10 +2255,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2284,10 +2270,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 0,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "RecoveryCoordinator"
     },
     {
@@ -2315,10 +2301,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -2336,10 +2322,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
     },
     {
@@ -2362,10 +2348,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2383,10 +2369,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2414,10 +2400,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2450,10 +2436,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 4,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2471,10 +2457,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2497,10 +2483,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2518,10 +2504,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2544,10 +2530,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2571,58 +2557,98 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "versioned plan inspection",
       "invocation_owner": "Store"
     },
     {
       "name": "deposit.get.importResult",
       "args": [
-        {"name": "resultId", "type": "String", "binding": "resultId"}
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        }
       ],
-      "columns": ["data"],
+      "columns": [
+        "data"
+      ],
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "import result retrieval",
       "invocation_owner": "Store"
     },
     {
       "name": "deposit.get.importResultPage",
       "args": [
-        {"name": "resultId", "type": "String", "binding": "resultId"},
-        {"name": "collection", "type": "String", "binding": "collection"},
-        {"name": "cursor", "type": "Map<String,Object>", "binding": "cursor"},
-        {"name": "limit", "type": "Long", "binding": "limit"}
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        },
+        {
+          "name": "collection",
+          "type": "String",
+          "binding": "collection"
+        },
+        {
+          "name": "cursor",
+          "type": "Map<String,Object>",
+          "binding": "cursor"
+        },
+        {
+          "name": "limit",
+          "type": "Long",
+          "binding": "limit"
+        }
       ],
-      "columns": ["data"],
+      "columns": [
+        "data"
+      ],
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 4,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "import result retrieval",
       "invocation_owner": "Store"
     },
     {
       "name": "deposit.get.importResultEntry",
       "args": [
-        {"name": "resultId", "type": "String", "binding": "resultId"},        {"name": "collection", "type": "String", "binding": "collection"},        {"name": "key", "type": "String", "binding": "key"}
+        {
+          "name": "resultId",
+          "type": "String",
+          "binding": "resultId"
+        },
+        {
+          "name": "collection",
+          "type": "String",
+          "binding": "collection"
+        },
+        {
+          "name": "key",
+          "type": "String",
+          "binding": "key"
+        }
       ],
-      "columns": ["data"],
+      "columns": [
+        "data"
+      ],
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "import result retrieval",
       "invocation_owner": "Store"
     },
     {
@@ -2640,10 +2666,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2671,10 +2697,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2707,10 +2733,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2733,10 +2759,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2759,10 +2785,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2785,10 +2811,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2808,10 +2834,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2834,10 +2860,10 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2860,10 +2886,10 @@
       "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2891,10 +2917,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2922,10 +2948,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2953,10 +2979,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -2979,10 +3005,10 @@
       "mode": "WRITE",
       "scope": "operational",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Store"
     },
     {
@@ -3005,25 +3031,11 @@
       "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
+      "token_index": 2,
       "action": true,
       "admin": false,
       "batch_eligible": true,
-      "batch_exclusion": null,
       "invocation_owner": "Store"
-    },
-    {
-      "name": "deposit.get.info",
-      "args": [],
-      "columns": [
-        "data"
-      ],
-      "mode": "READ",
-      "scope": "discovery",
-      "requires_token": false,
-      "action": false,
-      "batch_eligible": false,
-      "batch_exclusion": "discovery lifecycle route",
-      "invocation_owner": "Client"
     },
     {
       "name": "deposit.import.abortCloneUpload",
@@ -3040,10 +3052,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -3071,10 +3083,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 3,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -3092,10 +3104,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -3128,10 +3140,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 4,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -3149,10 +3161,10 @@
       "mode": "WRITE",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": true,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": "not registered in DomainService.COMMANDS",
       "invocation_owner": "Client"
     },
     {
@@ -3170,10 +3182,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": null,
       "invocation_owner": "Client"
     },
     {
@@ -3201,10 +3213,10 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 3,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": null,
       "invocation_owner": "Client"
     },
     {
@@ -3237,10 +3249,25 @@
       "mode": "READ",
       "scope": "server",
       "requires_token": true,
+      "token_index": 4,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "batch_exclusion": null,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.get.info",
+      "args": [],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "discovery",
+      "requires_token": false,
+      "token_index": null,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
       "invocation_owner": "Client"
     }
   ]

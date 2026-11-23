@@ -77,6 +77,8 @@ For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/depo
 
 ## Resource and import workflows
 
+The examples below describe the current checkout.
+
 Use an open Store to upload a local file or a caller-owned binary stream. Upload
 freezes the content in protected recovery storage before preparing server writes;
 changing the original file afterward cannot change a pending replay.

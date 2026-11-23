@@ -250,10 +250,13 @@ def bind_arguments(
 
 def build_query(entry: dict[str, Any], arguments: tuple[Any, ...], token: str, *, portable: bool = False) -> tuple[str, dict[str, Any]]:
     params = {f"a{index}": value for index, value in enumerate(arguments)}
-    params["token"] = token
-    call_args = ", ".join([*(f"$a{index}" for index in range(len(arguments))), "$token"])
+    call_args = [f"$a{index}" for index in range(len(arguments))]
+    token_index = entry["token_index"]
+    if token_index is not None:
+        params["token"] = token
+        call_args.insert(token_index, "$token")
     columns = tuple(entry["columns"])
-    query = f"CYPHER 25 CALL {entry['name']}({call_args}) YIELD {', '.join(columns)}"
+    query = f"CYPHER 25 CALL {entry['name']}({', '.join(call_args)}) YIELD {', '.join(columns)}"
     if portable:
         for column in columns:
             if column in {"node", "rel"}:
