@@ -23,6 +23,7 @@ _MANIFEST: dict[str, Any] | None = None
 _CLIENT_GATEWAY_PROCEDURES = frozenset(
     {
         "deposit.action.cancel",
+        "deposit.get.operation",
         "deposit.get.activeNamespace",
         "deposit.set.activeNamespace",
         "deposit.get.administrativeMode",
@@ -42,21 +43,10 @@ _CLIENT_GATEWAY_PROCEDURES = frozenset(
 
 _STORE_CONTROL_PROCEDURES = {
     "deposit.get.requests": "RecoveryCoordinator",
+    "deposit.get.lastOperation": "RecoveryCoordinator",
     "deposit.utils.cancel": "RecoveryCoordinator",
     "deposit.utils.cancelRequest": "RecoveryCoordinator",
 }
-
-_RECOVERY_READ_PROCEDURES = frozenset({"deposit.get.operation", "deposit.get.lastOperation"})
-
-_CLONE_COORDINATOR_ACTIONS = frozenset({
-    "deposit.import.cloneNamespace", "deposit.import.beginCloneUpload",
-    "deposit.import.cloneUploadChunk", "deposit.import.finishCloneUpload",
-    "deposit.import.abortCloneUpload",
-})
-_CLONE_COORDINATOR_CONTROLS = frozenset({
-    "deposit.utils.refresh", "deposit.action.prepare",
-})
-
 
 def _manifest() -> dict[str, Any]:
     global _MANIFEST
@@ -96,32 +86,6 @@ def client_procedure(name: str) -> dict[str, Any]:
     return entry
 
 
-def clone_coordinator_procedure(name: str) -> dict[str, Any]:
-    """Return a declared clone/recovery route without widening Client's gateway."""
-    if not isinstance(name, str):
-        raise TypeError("procedure must be a manifest procedure name")
-    entry = next((item for item in _manifest()["procedures"] if item["name"] == name), None)
-    if (
-        entry is None
-        or name not in _CLONE_COORDINATOR_ACTIONS | _CLONE_COORDINATOR_CONTROLS
-        or entry.get("scope") != "server"
-        or entry.get("requires_token") is not True
-        or entry.get("action") is not (name in _CLONE_COORDINATOR_ACTIONS)
-        or entry.get("columns") != ["data"]
-    ):
-        raise ValueError("procedure is not an allowlisted clone coordinator route")
-    if name in _CLONE_COORDINATOR_CONTROLS:
-        if entry.get("invocation_owner") != "RecoveryCoordinator":
-            raise ValueError("clone coordinator control has an unexpected owner")
-        if name != "deposit.utils.refresh" and entry.get("mode") != "WRITE":
-            raise ValueError("clone recovery control has an unexpected persistence mode")
-        elif name == "deposit.utils.refresh" and entry.get("mode") not in {"READ", "WRITE"}:
-            raise ValueError("clone recovery refresh has an invalid mode")
-    elif entry.get("invocation_owner") != "Client" or entry.get("mode") != "WRITE":
-        raise ValueError("clone action has an unexpected invocation contract")
-    return entry
-
-
 def store_control_procedure(name: str) -> dict[str, Any]:
     """Return only reviewed controls that may run beside a busy Store request."""
     if not isinstance(name, str):
@@ -135,23 +99,6 @@ def store_control_procedure(name: str) -> dict[str, Any]:
         or entry.get("action") is not False
     ):
         raise ValueError("procedure is not an allowlisted Store control")
-    return entry
-
-
-def recovery_read_procedure(name: str) -> dict[str, Any]:
-    """Return only reviewed, non-action operation-inspection routes."""
-    if not isinstance(name, str):
-        raise TypeError("procedure must be a manifest procedure name")
-    entry = next((item for item in _manifest()["procedures"] if item["name"] == name), None)
-    if (
-        name not in _RECOVERY_READ_PROCEDURES
-        or entry is None
-        or entry.get("invocation_owner") != "RecoveryCoordinator"
-        or entry.get("scope") != "server"
-        or entry.get("requires_token") is not True
-        or entry.get("action") is not False
-    ):
-        raise ValueError("procedure is not an allowlisted recovery read")
     return entry
 
 
@@ -174,28 +121,18 @@ def immutable_request(value: Any) -> Mapping[str, Any]:
     return MappingProxyType({"requestId": request_id, "actorId": actor_id, "namespaceId": namespace_id})
 
 
-def prune_dry_run_procedure(options: Any) -> dict[str, Any]:
-    """Allow only the explicitly non-prepared prune dry-run branch."""
-    entry = next(
-        (item for item in _manifest()["procedures"] if item["name"] == "deposit.admin.pruneResources"),
-        None,
-    )
-    if (
-        entry is None
-        or entry.get("invocation_owner") != "Client"
-        or entry.get("scope") != "prune"
-        or entry.get("requires_token") is not True
-        or entry.get("action") is not True
-    ):
-        raise ValueError("pruneResources manifest contract is unsupported")
-    if not isinstance(options, dict):
-        raise TypeError("prune_resources options must be a dictionary")
-    _reject_injected_values(options)
-    if options.get("dryRun") is not True:
-        raise DepositError(
-            "RECOVERY_DEFERRED",
-            "Prune execution is deferred until Client action recovery has a server-scope identity contract",
-        )
+def tracked_procedure(name: str) -> dict[str, Any]:
+    entry = next((item for item in _manifest()["procedures"] if item["name"] == name), None)
+    if (entry is None or entry.get("tracked") not in {"always", "conditional"}
+            or not entry["args"] or entry["args"][-1]["name"] != "operationId"):
+        raise ValueError("Procedure does not accept a tracked operation")
+    return entry
+
+
+def domain_arguments(entry: dict[str, Any]) -> dict[str, Any]:
+    """Expose domain arguments without the transport-owned operation ID."""
+    if entry.get("tracked") in {"always", "conditional"}:
+        return {**entry, "args": entry["args"][:-1]}
     return entry
 
 
@@ -497,25 +434,13 @@ class StoreResult(Iterator[dict[str, Any]]):
             self._finish(commit=False, suppress_errors=exc is not None)
 
 
-def detached_result(entry: dict[str, Any], outcome: Any, token: str) -> StoreResult:
+def detached_result(entry: dict[str, Any], row: dict[str, Any], token: str) -> StoreResult:
     columns = tuple(entry["columns"])
-    if (
-        not isinstance(outcome, dict)
-        or set(outcome) != {"columns", "rows"}
-        or not isinstance(outcome["columns"], list)
-        or tuple(outcome["columns"]) != columns
-        or not isinstance(outcome["rows"], list)
-        or any(not isinstance(row, dict) or set(row) != set(columns) for row in outcome["rows"])
-    ):
-        raise DepositError("INVALID_RESPONSE", "Prepared action has no portable named result")
-    rows = tuple(dict(row) for row in outcome["rows"])
-    result = StoreResult(columns, detached_rows=rows)
+    if set(row) != set(columns):
+        raise DepositError("INVALID_RESPONSE", "Tracked procedure returned unexpected columns")
+    result = StoreResult(columns, detached_rows=(row,))
     result._token = token
     return result
-
-
-def named_rows_result(columns: tuple[str, ...], rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"columns": list(columns), "rows": rows}
 
 
 def _validate_selector_provenance(

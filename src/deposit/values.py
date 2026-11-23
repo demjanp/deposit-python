@@ -38,7 +38,7 @@ class TypedValue:
 def typed(type_name: str, value: Any) -> TypedValue:
     if type_name not in _TYPES:
         raise TypeError(f"Unsupported Deposit type {type_name!r}")
-    # Validate now, before a Store has a chance to create a recovery journal.
+    # Validate before any Store request.
     encode_value(type_name, value)
     return TypedValue(type_name, value)
 
@@ -217,7 +217,6 @@ class DResource(DType):
         super().__init__(from_dict=from_dict)
         self._path = None
         self._stream = None
-        self._transfer_id = None
         if from_dict is None:
             if path is None and stream is None:
                 self._value = {}

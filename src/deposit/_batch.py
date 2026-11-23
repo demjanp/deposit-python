@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
-from ._gateway import store_procedure
+from ._gateway import domain_arguments, store_procedure
 from .store import _descriptor_payload, _encode_object_properties, _portable_input
 from .values import DType, TypedValue, _infer_type, encode_value
 
@@ -71,7 +71,7 @@ class Batch:
 
     def call(self, procedure: str, *arguments: Any) -> BatchReference:
         self._ensure_collecting()
-        entry = store_procedure(procedure)
+        entry = domain_arguments(store_procedure(procedure))
         if entry.get("action") is not True or entry.get("batch_eligible") is not True:
             raise ValueError(f"{procedure!r} is not eligible for an atomic batch")
         if len(arguments) != len(entry["args"]):
@@ -322,7 +322,7 @@ class Batch:
             key, procedure, arguments = command["key"], command["procedure"], command["arguments"]
             if not isinstance(key, str) or not key or key in prior_keys:
                 raise ValueError("Batch command keys must be unique nonempty strings")
-            entry = store_procedure(procedure)
+            entry = domain_arguments(store_procedure(procedure))
             if entry.get("action") is not True or entry.get("batch_eligible") is not True:
                 raise ValueError(f"{procedure!r} is not eligible for an atomic batch")
             if not isinstance(arguments, list) or len(arguments) != len(entry["args"]):

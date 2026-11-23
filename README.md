@@ -79,9 +79,10 @@ For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/depo
 
 The examples below describe the current checkout.
 
-Use an open Store to upload a local file or a caller-owned binary stream. Upload
-freezes the content in protected recovery storage before preparing server writes;
-changing the original file afterward cannot change a pending replay.
+Use an open Store to upload a local file or a caller-owned binary stream. The
+Server verifies the complete size and checksum before publishing it. A borrowed
+stream is read from its current position into a protected temporary buffer
+that is removed when the attempt ends.
 
 ```python
 from deposit import DGeometry, DResource
@@ -102,50 +103,38 @@ an incomplete download. The wrapper closes files it opens and leaves caller
 streams owned by the caller.
 
 `store.import_rows(...)`, `store.from_dict(...)`, `store.import_subtree(...)`
-and `store.from_networkx(...)` return lazy import analysis results. Apply
-explicitly with `store.import_apply(result["planId"])`. Inputs are frozen before
-analysis; a target revision conflict requires fresh analysis. Dictionary,
-subtree and NetworkX imports accept `resources` and `resource_source` providers.
-`resources` maps Exchange content entries to paths, bytes or
-caller-owned binary streams; streams are read from their current position and
-remain open. Explicit content takes precedence over `resource_source`, and bad
-content fails without fallback. A `resource_source` can be an authenticated
-source Store or checked Exchange bundle. Package bytes are staged and integrity-checked in protected
-storage before upload or analysis. A complete checked Exchange bundle can be
-passed directly as `data` without separate providers. To create a new
-Namespace from a complete Exchange package, call
-`client.clone_namespace(token, package)`; the resulting `CloneResult` exposes
-the created Namespace identity and lazy identity/resource mappings. The package
-Namespace name is preserved, and a name collision fails with `DUPLICATE`.
-Typed references and graph/domain semantics remain Server-validated.
-Clone transfers persist protected recovery workflows. Discover them with
-`client.pending_clones()`, inspect local phase and verified offset with
-`client.inspect_clone(workflow)`, and continue with
-`client.resume_clone(workflow, username=..., password=...)`. Resume verifies the
-original server, database and actor before using protected staging. If a process
-stops before the package is frozen, inspection reports `SOURCE_REQUIRED`; pass
-the replacement source to `resume_clone(..., source=...)`. After freezing,
-resume uses the immutable staged package and cannot replace its source.
+and `store.from_networkx(...)` return lazy analysis results. Call
+`store.import_apply(result.plan_id)` to commit the plan, or
+`store.discard_import_plan(result.plan_id)` to cancel an unused plan. Use
+`store.import_inspect(plan_id)` to inspect it from the authenticated Store.
+Apply uses the original live Store connection. A stale, expired or disconnected
+plan requires fresh analysis.
 
-Portable Exchange workflows use `store.export_exchange(...)` to return a
-context-managed `ExchangeBundle`. The bundle can be inspected lazily or saved
-as a portable ZIP with `bundle.save(path)`. Import a checked bundle or portable
-ZIP path/stream with `store.import_exchange(source, rules=...)`; use
-`target_store.import_from(source_store, ...)` for a Store-to-Store transfer.
-Both methods return an `ImportResult` plan and never apply it automatically.
-Direct handoff is used only when the current Server bindings and package grant
-allow it; otherwise the client relays the same frozen package through the two
-authenticated Stores.
+Dictionary, subtree and NetworkX imports accept `resources` and
+`resource_source` providers. Map `resources/<sha256>` members to paths, bytes,
+borrowed streams or stream factories. Explicit providers take precedence.
+A `resource_source` can be an authenticated Store or an Exchange bundle.
+Deposit Server validates the graph, package and resource content before analysis.
 
-Import workflows persist their frozen inputs and recovery state in protected
-storage. `client.pending_imports()` lists pending and retained terminal workflow
-references without credentials. Inspect locally with `client.inspect_import(workflow)`;
-resume with authenticated `target_store` and, only when source work remains,
-`source_store`. Resume stops at `PLAN_READY` unless explicit apply intent was
-already recorded durably; then it recovers that same apply. To start the apply,
-call `target_store.import_apply(plan_id)`. Call
-`client.abandon_import(workflow, target_store=target_store)` when you want to
-release a workflow; unresolved Server ownership remains pending.
+`store.export_exchange(...)` returns a context-managed `ExchangeBundle`. Read
+its manifest and graph lazily or use `bundle.save(path)` to publish a verified ZIP
+atomically. Use `store.import_exchange(source)` with a bundle, portable ZIP or
+binary stream. Keep a caller-owned bundle open through direct apply and result
+reads. Use `target_store.import_from(source_store)` to manage export and intake
+within the workflow. When both authenticated Stores can use the same live
+source grant, the Server handles the transfer directly. Other transfers relay
+the original ZIP in bounded chunks and obtain a verified receiving grant.
+
+```python
+with store.import_exchange("source.zip") as analysis:
+    with store.import_apply(analysis.plan_id) as result:
+        print(result.state)
+```
+
+Use `client.clone_namespace(token, package)` to create a Namespace from a
+complete package. The `CloneResult` exposes its identity and lazy mappings.
+Clone preserves the source name, retained history and resources. A name
+collision returns `DUPLICATE`.
 
 CSV/XLSX/GeoPackage load/save, table paging, history, undo/redo and confirmed
 restore use `store.call(...)` with the exact public Server arguments. Returned
@@ -188,13 +177,9 @@ input. Deposit Server performs matching and assigns receiver-side
 identities; source IDs are not a promise that imported entities keep those IDs.
 Apply the returned plan explicitly with `store.import_apply(...)`.
 
-Graph conversion represents current data, not history or a complete backup.
-Resource bytes never appear in graph attributes; provide them with
-`store.from_networkx(graph, resources=...)` or `resource_source=...`. Python
-checks package shape, ZIP safety, lengths and checksums, while the Server checks
-resource references and graph semantics before creating an analysis plan.
-`Client.recover` returns a clone result as `RecoveredOperation.result` without
-selecting the newly created Namespace.
+Graph conversion carries the current graph and resource metadata. Supply
+resource content through `resources` or `resource_source` when importing.
+The Server checks graph semantics and verifies bytes before analysis.
 
 ## Compatibility and migration <a name="compatibility-and-migration"></a>
 
@@ -203,16 +188,15 @@ promise API compatibility. There is no automatic 1.x-to-2.x migration; use
 separate environments when both generations are needed and migrate application
 code against the Deposit 2 client and Server contract.
 
-Operations return explicit analysis or action results. Import methods return a
-plan that must be applied; callers should retain its `planId` and returned
-mapping when they need to associate source records with receiver-side IDs.
-Store-scoped pending operations can be recovered through the Store recovery
-methods, subject to the configured protected recovery directory. Client-owned
-composed Exchange workflows use `pending_imports`, `inspect_import`,
-`resume_import`, and `abandon_import`. Full-Namespace clones use the separate
-`pending_clones`, `inspect_clone`, and `resume_clone` Client workflow methods.
-Close Stores, resources and download readers when finished; incomplete resource
-downloads are reported when a reader closes before all bytes are consumed.
+For cancellable workflows, pass a fresh `operation_id=Client.new_operation_id()`
+to identify the final Server action. Use `get_operation(operation_id)` and
+`cancel_operation(operation_id)` on the Store, or the token-taking Client
+methods for server-scoped actions. `DepositCancelled` indicates verified
+rollback. `OperationCommittedAfterCancel` carries the completed outcome and
+`OutcomeUnknown` identifies the original attempt to inspect. Once the original
+attempt is settled, a deliberate replacement starts from the original source
+with fresh operation and staging IDs. Close results, bundles, Stores and
+Clients when finished.
 
 ## Contact: <a name="contact"></a>
 Peter Demján (peter.demjan@gmail.com)

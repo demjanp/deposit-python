@@ -9,8 +9,7 @@ import uuid
 import math
 from typing import Any
 
-from ._imports import GRAPH_CATEGORIES, MANIFEST_FIELDS
-from .exchange import ProtectedChunkFile, validate_exchange_archive, _MANIFEST_ALLOWED
+from ._imports import GRAPH_CATEGORIES, MANIFEST_FIELDS, _MANIFEST_ALLOWED
 
 _NODE_KINDS = {"Class", "Object"}
 _EDGE_KINDS = {"Membership", "Relationship", "ClassRelationship"}
@@ -346,50 +345,3 @@ def _is_visible_descriptor_record(value, *, namespace_id, object_id, name):
         and value.get("objectId") == object_id
         and value.get("name") == name
     )
-
-
-def read_export_result(store, result):
-    """Return an inline export or validate a staged ZIP in protected storage."""
-    if isinstance(result, Mapping) and "manifest" in result and "graph" in result:
-        return _portable_snapshot(result)
-    resource_id = None
-    if isinstance(result, Mapping):
-        resource_id = result.get("packageResourceId") or result.get("resourceId")
-        if isinstance(result.get("package"), Mapping):
-            resource_id = resource_id or result["package"].get("resourceId")
-    if not isinstance(resource_id, str) or not resource_id:
-        raise ValueError("Export returned neither an inline graph snapshot nor a staged package reference")
-    from .values import DResource
-    resource = DResource(from_dict={
-        "type": "DResource",
-        "value": {"resourceId": resource_id, "namespaceId": store.namespace_id},
-    })
-    storage = getattr(getattr(store, "_journal", None), "storage", None)
-    if storage is None:
-        raise ValueError("Staged Exchange validation requires protected recovery storage")
-    import hashlib
-    digest = hashlib.sha256()
-    length = 0
-    with ProtectedChunkFile(storage) as staged:
-        with resource.open(store) as reader:
-            metadata = resource._value
-            while True:
-                block = reader.read(1024 * 1024)
-                if not block:
-                    break
-                staged.write(block)
-                digest.update(block)
-                length += len(block)
-        expected_bytes = result.get("bytes") if isinstance(result, Mapping) else None
-        expected_checksum = (result.get("checksum") or result.get("sha256")) if isinstance(result, Mapping) else None
-        if expected_bytes is not None and expected_bytes != length:
-            raise ValueError("Staged Exchange export byte length contradicts its resource metadata")
-        if expected_checksum is not None and expected_checksum != digest.hexdigest():
-            raise ValueError("Staged Exchange export checksum contradicts its resource metadata")
-        if metadata.get("bytes") is not None and metadata["bytes"] != length:
-            raise ValueError("Staged Exchange resource length verification failed")
-        if metadata.get("checksum") is not None and metadata["checksum"] != digest.hexdigest():
-            raise ValueError("Staged Exchange resource checksum verification failed")
-        staged.seek(0)
-        with validate_exchange_archive(staged) as package:
-            return _portable_snapshot(package.materialize())

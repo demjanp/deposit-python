@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from threading import RLock
+from weakref import WeakSet
 
 from .errors import DepositError, OperationCommittedAfterCancel, OutcomeUnknown, TransportError
 
@@ -26,11 +28,14 @@ def _invalid(message):
 class ExchangeBundle:
     """An immutable package reference with one fixed Server reader lease."""
 
-    def __init__(self, endpoint, reference):
+    def __init__(self, endpoint, reference, *, on_close=None):
         self._endpoint = endpoint
         self._reference = dict(reference)
         self._closed = False
         self._inspection = None
+        self._on_close = on_close
+        self._lock = RLock()
+        self._readers = WeakSet()
         if (not all(isinstance(reference.get(key), str) for key in ("packageId", "grant", "sha256"))
                 or not _DIGEST.fullmatch(reference["sha256"])
                 or type(reference.get("bytes")) is not int or reference["bytes"] < 0):
@@ -41,20 +46,28 @@ class ExchangeBundle:
         return {name: self._reference[name] for name in ("packageId", "grant")}
 
     def _request(self, method, *arguments):
-        if self._closed:
-            raise ValueError("Exchange bundle is closed")
-        return self._endpoint.call(f"deposit.exchange.{method}", *self.source.values(), *arguments)
+        with self._lock:
+            if self._closed:
+                raise ValueError("Exchange bundle is closed")
+            return self._endpoint.call(f"deposit.exchange.{method}", *self.source.values(), *arguments)
 
     def _inspect(self):
-        if self._closed:
-            raise ValueError("Exchange bundle is closed")
-        if self._inspection is None:
-            envelope = self._request("inspect")
-            if (not isinstance(envelope.get("leaseId"), str) or not isinstance(envelope.get("manifest"), dict)
-                    or not isinstance(envelope.get("collections"), dict)):
-                raise _invalid("Invalid Exchange inspection envelope")
-            self._inspection = envelope
-        return self._inspection
+        with self._lock:
+            if self._closed:
+                raise ValueError("Exchange bundle is closed")
+            if self._inspection is None:
+                envelope = self._request("inspect")
+                if (not isinstance(envelope.get("leaseId"), str) or not isinstance(envelope.get("manifest"), dict)
+                        or not isinstance(envelope.get("collections"), dict)):
+                    raise _invalid("Invalid Exchange inspection envelope")
+                self._inspection = envelope
+            return self._inspection
+
+    def _live_identity(self):
+        with self._lock:
+            if self._closed:
+                raise ValueError("Exchange bundle is closed")
+            return self._endpoint.live_identity()
 
     @property
     def manifest(self):
@@ -110,11 +123,19 @@ class ExchangeBundle:
         if not isinstance(entry, str) or not _RESOURCE.fullmatch(entry):
             raise ValueError("Invalid Exchange resource member")
         metadata = self.manifest["files"][entry]
-        return _Reader(self, entry, metadata["bytes"], metadata["sha256"])
+        return self._reader(entry, metadata["bytes"], metadata["sha256"])
 
     def open_package_stream(self):
         self._inspect()
-        return _Reader(self, "package", self._reference["bytes"], self._reference["sha256"])
+        return self._reader("package", self._reference["bytes"], self._reference["sha256"])
+
+    def _reader(self, member, size, checksum):
+        with self._lock:
+            if self._closed:
+                raise ValueError("Exchange bundle is closed")
+            reader = _Reader(self, member, size, checksum)
+            self._readers.add(reader)
+            return reader
 
     def save(self, path):
         target = Path(path)
@@ -135,13 +156,24 @@ class ExchangeBundle:
                 temporary.unlink(missing_ok=True)
 
     def close(self):
-        if not self._closed:
-            try:
-                with suppress(DepositError, TransportError):
-                    self._request("discard")
-            finally:
+        with self._lock:
+            if not self._closed:
+                try:
+                    discard_package(self._endpoint, self.source, control=True)
+                finally:
+                    self._detach()
+
+    def _detach(self):
+        with self._lock:
+            if not self._closed:
                 self._closed = True
-                self._endpoint.close()
+                for reader in tuple(self._readers):
+                    reader.close()
+                try:
+                    self._endpoint.close()
+                finally:
+                    if self._on_close is not None:
+                        self._on_close(self)
 
     def __enter__(self):
         return self
@@ -310,22 +342,45 @@ def stage_zip(endpoint, source):
         return execution.run("deposit.exchange.finishUpload", upload)
 
 
+def discard_package(endpoint, reference, *, control=False):
+    """Release any owned package that is no longer needed by a plan or reader."""
+    if not isinstance(reference, dict):
+        return
+    package_id, grant = reference.get("packageId"), reference.get("grant")
+    if isinstance(package_id, str) and isinstance(grant, str):
+        request = endpoint.control if control else endpoint.call
+        with suppress(DepositError, TransportError):
+            request("deposit.exchange.discard", package_id, grant)
+
+
 @contextmanager
 def _intake(endpoint, kind, metadata):
-    with endpoint.execution() as execution:
-        reference = execution.run("deposit.exchange.beginUpload", endpoint.scope, kind, metadata)
-        upload = reference.get("uploadId")
-        if not isinstance(upload, str):
-            raise _invalid("Exchange upload acknowledgement has no identity")
-        try:
-            yield execution, upload
-        except (OutcomeUnknown, OperationCommittedAfterCancel):
-            raise
-        except BaseException:
-            with suppress(Exception):
-                execution.run("deposit.exchange.abortUpload", upload)
-            raise
-
+    try:
+        with endpoint.execution() as execution:
+            reference = execution.run("deposit.exchange.beginUpload", endpoint.scope, kind, metadata)
+            upload = reference.get("uploadId")
+            if not isinstance(upload, str):
+                raise _invalid("Exchange upload acknowledgement has no identity")
+            try:
+                yield execution, upload
+            except OutcomeUnknown:
+                raise
+            except OperationCommittedAfterCancel as exc:
+                result = exc.details.get("result")
+                discard_package(endpoint, result, control=True)
+                with suppress(Exception):
+                    execution.run("deposit.exchange.abortUpload", upload, cleanup=True)
+                raise
+            except BaseException:
+                with suppress(Exception):
+                    execution.run("deposit.exchange.abortUpload", upload, cleanup=True)
+                raise
+    except BaseException:
+        # If the abort reply or upload identity was lost, an abandoned writer
+        # still becomes collectible as soon as its connection closes.
+        with suppress(Exception):
+            endpoint.interrupt_upload()
+        raise
 
 
 def _json_fragments(value):
@@ -413,17 +468,17 @@ def stage_snapshot(endpoint, snapshot, *, resources=None, resource_source=None):
             if entry in explicit:
                 continue
             if isinstance(resource_source, ExchangeBundle):
+                if entry in staged:
+                    continue
                 provider = lambda: resource_source.open_resource(entry)
             elif resource_source is not None:
-                from ._imports import _store_resource_provider
-                provider = _store_resource_provider(resource_source, record["id"])
+                reader = resource_source._open_import_resource(record, read=entry not in staged)
+                if reader is None:
+                    continue
+                provider = lambda: reader
             else:
                 raise ValueError(f"No content provider for Exchange resource {entry!r}")
             with _provider(provider) as stream:
-                if entry in staged:
-                    # Opening the exact source resource above still checks its
-                    # identity and access when several IDs share its content.
-                    continue
                 _upload(execution, upload, entry, _stream_blocks(stream))
                 staged.add(entry)
         return execution.run("deposit.exchange.finishUpload", upload)
@@ -431,10 +486,19 @@ def stage_snapshot(endpoint, snapshot, *, resources=None, resource_source=None):
 
 def package_for_target(bundle, endpoint):
     """Hand off a still-authorized local grant, or verify an opaque relay."""
-    if bundle._endpoint.live_identity() == endpoint.live_identity():
-        first = bundle._pages("files")
-        next(first, None)
-        return bundle.source
+    try:
+        same_actor_and_server = bundle._live_identity() == endpoint.live_identity()
+    except (DepositError, TransportError):
+        same_actor_and_server = False
+    if same_actor_and_server:
+        try:
+            next(bundle._pages("files"), None)
+        except (DepositError, TransportError):
+            # No destination action has been submitted. Relay still requires
+            # every byte to be authorized by the independent source endpoint.
+            pass
+        else:
+            return bundle.source
     with bundle.open_package_stream() as reader:
         verified = stage_zip(endpoint, reader)
     if (verified.get("bytes"), verified.get("sha256")) != (
@@ -443,3 +507,17 @@ def package_for_target(bundle, endpoint):
             endpoint.call("deposit.exchange.discard", verified["packageId"], verified["grant"])
         raise DepositError("RESOURCE_CORRUPT", "Receiving package digest differs from the source")
     return {name: verified[name] for name in ("packageId", "grant")}
+
+
+def materialize_snapshot(bundle):
+    """Materialize the public current-graph dictionary from a leased export."""
+    def portable(value):
+        if isinstance(value, Mapping):
+            return {key: portable(child) for key, child in value.items()}
+        if isinstance(value, Sequence) and not isinstance(value, str):
+            return [portable(child) for child in value]
+        if isinstance(value, _Text):
+            return str(value)
+        return value
+
+    return {"manifest": portable(bundle.manifest), "graph": portable(bundle.graph)}

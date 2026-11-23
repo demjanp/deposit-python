@@ -1,66 +1,41 @@
-"""Namespace-bound Store and the Stage 2 prepared-action coordinator."""
+"""Synchronous operations on an authenticated, Namespace-bound Store."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextvars import ContextVar
-from contextlib import contextmanager, nullcontext
-import base64
-import hashlib
+from contextlib import contextmanager, nullcontext, suppress
 import json
 import math
-import mimetypes
-from pathlib import Path
 import threading
-import time
 import weakref
 from typing import Any, Iterator
 import uuid
 
-from ._paging import ImportResult, _valid_plan_observation, valid_import_plan_wrapper, valid_import_result_envelope
-from ._recovery.identity import DeploymentIdentity
-from ._recovery.journal import (
-    RESULT_FORMAT_IMPORT,
-    RESULT_FORMAT_NAMED_ROWS,
-    JournalError,
-    ProtectedJournal,
-    UNRESOLVED_STATES,
-)
-from ._recovery.transfers import ProtectedTransferSpool, TransferError, TRANSFER_CHUNK_BYTES
+from ._exchange import ExchangeBundle, discard_package, package_for_target, stage_snapshot, stage_zip
+from ._exchange_transport import OperationEndpoint, _IMPORT_RESULTS
+from ._paging import ImportResult, _valid_plan_observation, valid_import_plan_wrapper
+from ._resources import ResourceReader, upload_resource
 from ._gateway import (
     StoreResult,
     bind_arguments,
     build_query,
     detached_result,
+    domain_arguments,
     immutable_request,
     map_driver_error,
     store_procedure,
     store_control_procedure,
-    named_rows_result,
 )
-from .errors import DepositError, TransportError, _saved_failure_error
+from .errors import DepositError, OperationCommittedAfterCancel, OutcomeUnknown, TransportError
 from .entities import DClass, DObject, DNode
 from .values import DResource
 
 
-_ENTITY_QUERY = {
-    "deposit.create.class": ("name", "properties"),
-    "deposit.create.object": ("class", "properties"),
-    "deposit.get.class": ("selection",),
-    "deposit.get.object": ("selection",),
-    "deposit.apply.batch": ("data",),
-}
 _STORE_FACTORY_TOKEN = object()
-_IMPORT_PLAN_LEASE_MS = 24 * 60 * 60 * 1000
-_verified_local_progress = ContextVar("deposit_verified_local_progress", default=None)
 _DOMAIN_VALUE_TYPES = {
     "String", "Integer", "Float", "Boolean", "Date", "Time", "LocalTime", "DateTime",
     "LocalDateTime", "Duration", "Point", "List", "DDict", "DGeometry", "DResource",
 }
-_DEFINITIVE_DOMAIN_FAILURE_CODES = frozenset({
-    "VALIDATION_FAILED", "TYPE_CONFLICT", "NOT_FOUND", "ALREADY_EXISTS",
-    "HISTORY_UNAVAILABLE", "IMPORT_CONFLICT", "PLAN_STALE", "LIMIT_EXCEEDED",
-})
 
 
 class Store:
@@ -73,11 +48,8 @@ class Store:
         token: str,
         actor_id: str,
         namespace_id: str,
-        identity: DeploymentIdentity,
-        recovery_directory: str | None,
         observed: Any,
         _factory_token: object | None = None,
-        _journal: ProtectedJournal | None = None,
     ):
         if _factory_token is not _STORE_FACTORY_TOKEN:
             raise TypeError("Store instances are created by Client.open_store()")
@@ -85,8 +57,6 @@ class Store:
         self._token = token
         self._actor_id = actor_id
         self._namespace_id = namespace_id
-        self._identity = identity
-        self._journal = _journal or ProtectedJournal(recovery_directory)
         self._operation_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -96,19 +66,26 @@ class Store:
         self._closing = False
         self._active = False
         self._active_result: StoreResult | None = None
+        self._active_endpoint = None
+        self._bundles = set()
+        self._readers = weakref.WeakValueDictionary()
+        self._ready_plans = set()
+        self._plan_packages = {}
+        self._result_packages = []
         self._batch_collection: Any = None
         # DNode equality intentionally follows stable domain identity.  A
         # WeakSet would therefore collapse separate snapshots of the same
         # entity; key by Python object identity so each cached snapshot is
         # invalidated independently.
         self._handles = weakref.WeakValueDictionary()
+        self._endpoint = OperationEndpoint(client, token, namespace_id, actor=actor_id)
         self._observed_revision = self._get_revision(observed)
-        if self._observed_revision is None:
-            self.refresh()
-        self._journal.cleanup_expired(self._identity)
-        with self._operation_lock:
-            self._recover_pending_locked()
-            self._resume_pending_uploads_locked()
+        try:
+            if self._observed_revision is None:
+                self.refresh()
+        except BaseException:
+            self._endpoint.close()
+            raise
 
     @property
     def namespace_id(self) -> str:
@@ -662,49 +639,17 @@ class Store:
     def delete_user_tool(self, user_tool_id: str):
         return self._run_action("deposit.delete.userTool", [{"id": _stable_id(user_tool_id)}])
 
-    def upload_resource(self, resource: DResource, *, _workflow_store=None, _workflow_id=None) -> DResource:
-        """Upload a frozen local resource source and return its ready reference."""
+    def upload_resource(self, resource: DResource) -> DResource:
+        """Upload a local resource once, consuming a borrowed stream from its current position."""
         self._assert_not_collecting_batch()
         if not isinstance(resource, DResource):
             raise TypeError("resource must be a DResource")
         if resource.resource_id is not None and resource._path is None and resource._stream is None:
+            if resource._value.get("namespaceId") not in (None, self.namespace_id):
+                raise DepositError("SCOPE_MISMATCH", "Resource belongs to another Namespace")
             return resource
-        if resource._transfer_id is None:
-            if resource._path is not None:
-                with open(resource._path, "rb") as source:
-                    resource._transfer_id = ProtectedTransferSpool(self._journal, self._identity).freeze(
-                        source,
-                        filename=resource.filename,
-                        media_type=resource._value.get("mediaType") or mimetypes.guess_type(resource.filename)[0] or "application/octet-stream",
-                    )["transfer_id"]
-            else:
-                resource._transfer_id = ProtectedTransferSpool(self._journal, self._identity).freeze(
-                    resource._stream,
-                    filename=resource.filename,
-                    media_type=resource._value.get("mediaType") or mimetypes.guess_type(resource.filename)[0] or "application/octet-stream",
-                )["transfer_id"]
-        spool = ProtectedTransferSpool(self._journal, self._identity)
-        manifest = spool.load(resource._transfer_id)
-        if manifest["begin_action_key"] is None:
-            spool.ensure_action_capacity(manifest)
-        with self._serialized():
-            result = self._resume_upload_locked(
-                resource._transfer_id, spool=spool, already_serialized=True,
-                on_resolved=(lambda value, transfer: _workflow_store.update(
-                    _workflow_id, package_resource_id=value["resourceId"],
-                    upload_id=transfer["transfer_id"], state="TARGET_PACKAGE_READY",
-                    phase="target_package_ready", action_keys={
-                        **_workflow_store.get(_workflow_id)["action_keys"],
-                        "upload_begin": transfer["begin_action_key"],
-                        "upload_finish": transfer["finish_action_key"],
-                    }
-                )) if _workflow_store is not None else None,
-            )
-        resource._value.update(result)
-        resource._path = None
-        resource._stream = None
-        resource._transfer_id = None
-        return resource
+        with self._serialized(), self._using_endpoint() as endpoint:
+            return upload_resource(endpoint, resource)
 
     def _open_resource(self, resource: DResource):
         self._assert_not_collecting_batch()
@@ -712,12 +657,31 @@ class Store:
             raise ValueError("resource must be a stored DResource reference")
         if resource._value.get("namespaceId") not in (None, self._namespace_id):
             raise DepositError("SCOPE_MISMATCH", "Resource belongs to another Namespace")
-        metadata = self._call_one("deposit.resource.info", resource.resource_id)
-        if not isinstance(metadata, dict) or metadata.get("resourceId") != resource.resource_id:
-            raise DepositError("INVALID_RESPONSE", "Resource metadata did not match the selected resource")
-        resource._value.update(metadata)
-        from ._recovery.transfers import ResourceReader
-        return ResourceReader(self, resource.resource_id, metadata)
+        with self._serialized():
+            metadata = self._endpoint.call("deposit.resource.info", resource.resource_id)
+            if not isinstance(metadata, dict) or metadata.get("resourceId") != resource.resource_id:
+                raise DepositError("INVALID_RESPONSE", "Resource metadata did not match the selected resource")
+            resource._value.update(metadata)
+            reader = ResourceReader(self._read_resource_chunk, resource.resource_id, metadata)
+            self._readers[id(reader)] = reader
+            return reader
+
+    def _read_resource_chunk(self, procedure, *arguments):
+        self._check_result_reader()
+        return self._endpoint.control(procedure, *arguments)
+
+    def _open_import_resource(self, record, *, read):
+        """Check the exact source resource even when another ID shares its bytes."""
+        self._check_result_reader()
+        resource_id = _stable_id(record.get("id"))
+        metadata = self._endpoint.control("deposit.resource.info", resource_id)
+        if (not isinstance(metadata, dict) or metadata.get("resourceId") != resource_id
+                or metadata.get("bytes") != record.get("bytes")
+                or record.get("entry") != f"resources/{metadata.get('checksum')}"):
+            raise DepositError("RESOURCE_CORRUPT", "Source resource differs from the snapshot")
+        if not read:
+            return None
+        return ResourceReader(self._read_resource_chunk, resource_id, metadata)
 
     def create_pattern(self, name: str, definition: Mapping[str, Any],
                        properties: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -800,27 +764,16 @@ class Store:
         pattern: Mapping[str, Any],
         values: Mapping[str, Any],
         rules: Mapping[str, Any] | None = None,
+        *, operation_id=None,
     ):
         """Submit form data for an ID-selected Pattern through the server workflow."""
         if not isinstance(pattern, Mapping) or not isinstance(values, Mapping):
             raise TypeError("Pattern must be an {id: UUID} selector and form values must be a mapping")
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("Pattern rules must be a mapping")
-        key = str(uuid.uuid4())
-        envelope = self._run_action(
-            "deposit.import.dataByPattern",
-            [
-                _pattern_id_selector(pattern),
-                _portable_input(dict(values)),
-                _portable_input(dict(rules or {})),
-            ],
-            _recovery_key=key,
-            result_format=RESULT_FORMAT_IMPORT,
-        )
-        result = self._import_result(key, envelope)
-        if result.state == "IMPORT_CONFLICT":
-            self._raise_import_diagnostic(result)
-        return result
+        return self._analyze("deposit.import.dataByPattern", [
+            _pattern_id_selector(pattern), _portable_input(dict(values)), _import_rules(rules),
+        ], operation_id=operation_id)
 
     def get_layout(
         self, selection: Mapping[str, Any], options: Mapping[str, Any] | None = None
@@ -845,38 +798,22 @@ class Store:
     def get_subtree(
         self, roots=None, *, max_hops: int | None = None, root_class_boundary: bool = True
     ) -> dict[str, Any]:
-        """Return a revision-pinned public graph export for roots or the Namespace."""
-        if roots is None:
-            if max_hops is not None or root_class_boundary is not True:
-                raise ValueError("max_hops and root_class_boundary apply only when roots are supplied")
-            data = self._call_one("deposit.get.namespaceData", {})
-        else:
-            if isinstance(roots, (str, bytes)):
-                raise TypeError("roots must be an iterable of Object UUID strings")
+        """Return a revision-pinned snapshot of the current scientific graph."""
+        self._assert_not_collecting_batch()
+        if roots is not None and not isinstance(roots, (str, bytes)):
+            roots = list(roots)
+        roots, options = self._export_arguments(roots, max_hops, root_class_boundary)
+        options["includeHistory"] = False
+        with self._serialized(), self._using_endpoint() as endpoint:
+            with endpoint.execution() as execution:
+                data = execution.run("deposit.get.data", roots, options)
+            if isinstance(data, dict) and "manifest" in data and "graph" in data:
+                return {"manifest": data["manifest"], "graph": data["graph"]}
+            from ._exchange import materialize_snapshot
             try:
-                root_ids = list(roots)
-            except TypeError as exc:
-                raise TypeError("roots must be an iterable of Object UUID strings") from exc
-            if not root_ids:
-                if max_hops is not None or root_class_boundary is not True:
-                    raise ValueError("Traversal options apply only to a nonempty root selection")
-                data = self._call_one("deposit.get.namespaceData", {})
-                from .networkx import read_export_result
-                return read_export_result(self, data)
-            if any(not isinstance(value, str) or not value for value in root_ids):
-                raise ValueError("roots must contain nonempty Object UUID strings")
-            if len(set(root_ids)) != len(root_ids):
-                raise ValueError("roots cannot contain duplicate Object UUIDs")
-            if max_hops is not None and (type(max_hops) is not int or not 0 <= max_hops <= 10):
-                raise ValueError("max_hops must be an integer from 0 through 10")
-            if type(root_class_boundary) is not bool:
-                raise TypeError("root_class_boundary must be bool")
-            options = {"rootClassBoundary": root_class_boundary}
-            if max_hops is not None:
-                options["maxHops"] = max_hops
-            data = self._call_one("deposit.get.data", root_ids, options)
-        from .networkx import read_export_result
-        return read_export_result(self, data)
+                return materialize_snapshot(ExchangeBundle(endpoint, data))
+            finally:
+                discard_package(endpoint, data)
 
     def to_networkx(
         self, roots=None, *, max_hops: int | None = None, root_class_boundary: bool = True
@@ -885,23 +822,17 @@ class Store:
         from .networkx import require_networkx, to_networkx
         require_networkx()
         return to_networkx(self.get_subtree(
-            roots, max_hops=max_hops, root_class_boundary=root_class_boundary
+            roots, max_hops=max_hops, root_class_boundary=root_class_boundary,
         ))
 
-    def from_networkx(self, graph, *, resources=None, resource_source=None,
-                      rules: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """Freeze a Deposit MultiDiGraph and submit it to Server import analysis."""
-        from .networkx import from_networkx, require_networkx
-        require_networkx()
-        if rules is not None and not isinstance(rules, Mapping):
-            raise TypeError("rules must be a mapping")
-        snapshot = from_networkx(graph)
-        return self._analyze_import_snapshot(
-            snapshot, resources=resources, resource_source=resource_source,
-            rules=rules, require_subgraph=False,
-        )
-    def import_rows(self, rows, relationships=None, *, targets=None, rules=None):
-        """Analyze a frozen tabular submission; matching remains server-owned."""
+    def from_networkx(self, graph, *, resources=None, resource_source=None, rules=None, operation_id=None):
+        """Analyze a Deposit MultiDiGraph using Server-owned intake."""
+        from .networkx import from_networkx
+        return self.from_dict(from_networkx(graph), resources=resources, resource_source=resource_source,
+                              rules=rules, operation_id=operation_id)
+
+    def import_rows(self, rows, relationships=None, *, targets=None, rules=None, operation_id=None):
+        """Analyze tabular input, leaving matching and plan validation to the Server."""
         frozen_rows = _freeze_import_rows(rows)
         if relationships is None:
             frozen_relationships = []
@@ -915,49 +846,30 @@ class Store:
                 frozen_relationships.append(dict(relationship))
         if targets is not None and not isinstance(targets, Mapping):
             raise TypeError("targets must be a mapping")
-        if rules is not None and not isinstance(rules, Mapping):
-            raise TypeError("rules must be a mapping")
-        request = [
-            _portable_input({"rows": frozen_rows}),
-            _portable_input(dict(targets or {})),
-            _portable_input(frozen_relationships),
-            _portable_input(dict(rules or {})),
-        ]
-        key = str(uuid.uuid4())
-        envelope = self._run_action("deposit.import.rows", request, _recovery_key=key,
-                                    result_format=RESULT_FORMAT_IMPORT)
-        result = self._import_result(key, envelope)
-        if result.state == "IMPORT_CONFLICT":
-            self._raise_import_diagnostic(result)
-        return result
+        return self._analyze("deposit.import.rows", [
+            _portable_input({"rows": frozen_rows}), _portable_input(dict(targets or {})),
+            _portable_input(frozen_relationships), _import_rules(rules),
+        ], operation_id=operation_id)
 
-    def import_subtree(
-        self, subtree: Mapping[str, Any], *, resources=None, resource_source=None,
-        rules: Mapping[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Analyze a fixed public subgraph with optional checked resource content."""
-        return self._analyze_import_snapshot(
-            subtree, resources=resources, resource_source=resource_source,
-            rules=rules, require_subgraph=True,
+    def import_subtree(self, subtree, *, resources=None, resource_source=None, rules=None, operation_id=None):
+        """Analyze a public subgraph with optional resource content."""
+        if not isinstance(subtree, Mapping) or not isinstance(subtree.get("manifest"), Mapping):
+            raise TypeError("Import snapshot requires a manifest mapping")
+        if subtree["manifest"].get("scope") != "subgraph":
+            raise ValueError("import_subtree requires a subgraph snapshot")
+        return self.from_dict(subtree, resources=resources, resource_source=resource_source,
+                              rules=rules, operation_id=operation_id)
+
+    def from_dict(self, data, *, resources=None, resource_source=None, rules=None, operation_id=None):
+        """Analyze a public graph and its resource providers without applying a plan."""
+        if not isinstance(data, Mapping):
+            raise TypeError("Import snapshot must be a manifest/graph mapping")
+        return self._analyze_package(
+            lambda endpoint: stage_snapshot(endpoint, data, resources=resources, resource_source=resource_source),
+            rules, operation_id=operation_id,
         )
 
-    def from_dict(
-        self, data: Mapping[str, Any], *, resources=None, resource_source=None,
-        rules: Mapping[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Analyze a fixed public graph/package with optional checked resource content."""
-        return self._analyze_import_snapshot(
-            data, resources=resources, resource_source=resource_source,
-            rules=rules, require_subgraph=False,
-        )
-
-    def export_exchange(self, *, roots=None, max_hops=None, root_class_boundary=True,
-                        operation_id=None):
-        """Export a canonical Server package and return its owning bundle."""
-        from .exchange import ExchangeBundle
-        from ._exchange_transport import ExchangeEndpoint
-
-        self._assert_not_collecting_batch()
+    def _export_arguments(self, roots, max_hops, root_class_boundary):
         selection = None
         if roots is not None:
             if not isinstance(roots, (list, tuple)):
@@ -969,6 +881,8 @@ class Store:
                 if isinstance(root, DObject):
                     self._validate_handle(root, "Object")
                     root = root.id
+                if isinstance(root, Mapping) and set(root) == {"id"}:
+                    root = root["id"]
                 root = _stable_id(root)
                 if len(root) != 36 or str(uuid.UUID(root)) != root.lower():
                     raise ValueError("Explicit export roots must be Object UUIDs")
@@ -976,513 +890,112 @@ class Store:
         options = {"rootClassBoundary": root_class_boundary}
         if max_hops is not None:
             options["maxHops"] = max_hops
+        return selection, options
+
+    def export_exchange(self, *, roots=None, max_hops=None, root_class_boundary=True, operation_id=None):
+        """Export a canonical Server package and return its owning bundle."""
+        self._assert_not_collecting_batch()
+        selection, options = self._export_arguments(roots, max_hops, root_class_boundary)
         with self._serialized():
-            endpoint = ExchangeEndpoint(self._client, self._token, self._namespace_id)
+            endpoint = OperationEndpoint(self._client, self._token, self.namespace_id,
+                                         expected=self._endpoint.binding, actor=self._actor_id)
             try:
-                with endpoint.execution() as execution:
-                    result = execution.run("deposit.exchange.export", selection, options, operation_id=operation_id)
-                return ExchangeBundle(endpoint, result)
+                with self._using_endpoint(endpoint), endpoint.execution() as execution:
+                    endpoint.require_exchange()
+                    reference = execution.run("deposit.exchange.export", selection, options, operation_id=operation_id)
+                bundle = ExchangeBundle(endpoint, reference, on_close=self._bundles.discard)
+                self._bundles.add(bundle)
+                return bundle
             except BaseException:
                 endpoint.close()
                 raise
 
-    def import_exchange(self, source, *, rules=None):
-        """Freeze an Exchange input, analyze it, and retain durable workflow ownership."""
-        from ._import_workflows import ImportWorkflowStore
-        if rules is not None and not isinstance(rules, Mapping):
-            raise TypeError("rules must be a mapping")
-        self._client.require_paged_import_results()
-        frozen_rules = _portable_input(dict(rules or {}))
-        workflows = ImportWorkflowStore(self._journal.storage)
-        workflow = workflows.create(source=getattr(source, "source_store", None), target=self)
-        with workflows.lock(workflow.id):
-            workflows.update(workflow.id, frozen_rules=frozen_rules,
-                             analysis_arguments={"rules": frozen_rules})
-            return self._import_exchange_workflow(source, frozen_rules, workflows, workflow)
-
-    def _import_exchange_workflow(self, source, rules, workflows, workflow):
-        from .exchange import _LegacyExchangeBundle, DurableExchangeFile, validate_exchange_archive
-        from ._imports import prepared_import_package
-        try:
-            if isinstance(source, _LegacyExchangeBundle):
-                source.pin(workflow.id)
-                record = workflows.get(workflow.id)
-                if source._stage is None:
-                    source._stage_id = record["source_stage_id"] or source._stage_id
-                workflows.update(workflow.id, state="SOURCE_STAGING", phase="source_staging",
-                                 source_stage_id=(source._stage_id if source._stage is not None else record["source_stage_id"]),
-                                 source_export_result=source._export_result)
-                result = self._analyze_import_bundle(source, rules, workflows, workflow)
-            elif isinstance(source, Mapping):
-                with prepared_import_package(_portable_input(dict(source)), storage=self._journal.storage) as package:
-                    self._freeze_workflow_package(package._source, workflows, workflow.id)
-                result = self._continue_import_workflow(workflows, workflow.id)
-            else:
-                # Paths are opened here; caller streams are consumed from their
-                # current position once and never closed or reopened by recovery.
-                is_path = isinstance(source, (str, Path))
-                if not is_path and not callable(getattr(source, "read", None)):
-                    # Borrow an already validated protected view without rebuilding it.
-                    from ._imports import _checked_package_view
-                    view = _checked_package_view(source)
-                    if view is None:
-                        raise TypeError("Exchange input must be a package, path, or binary stream")
-                    self._freeze_workflow_package(view._source, workflows, workflow.id)
-                else:
-                    with (Path(source).open("rb") if is_path else nullcontext(source)) as reader:
-                        self._freeze_workflow_package(reader, workflows, workflow.id)
-                record = workflows.get(workflow.id)
-                stage = DurableExchangeFile(self._journal.storage, record["package_stage_id"],
-                                            identity=self._identity.to_dict())
-                try:
-                    stage.seek(0)
-                    with validate_exchange_archive(stage, storage=self._journal.storage):
-                        pass
-                finally:
-                    stage.close()
-                result = self._continue_import_workflow(workflows, workflow.id)
-            return result
-        except Exception as exc:
-            self._import_workflow_failure(workflows, workflow.id, exc)
-            raise
-
-    def _freeze_workflow_package(self, reader, workflows, workflow_id):
-        from .exchange import DurableExchangeFile
-        record = workflows.get(workflow_id)
-        stage_id = record["package_stage_id"] or uuid.uuid4().hex
-        workflows.update(workflow_id, state="SOURCE_STAGING", phase="source_staging", package_stage_id=stage_id)
-        stage = DurableExchangeFile(self._journal.storage, stage_id, identity=self._identity.to_dict(), create=True)
-        try:
-            if not stage.manifest["complete"]:
-                offset = stage.manifest["bytes"]
-                if offset:
-                    reader.seek(offset)
-                while True:
-                    block = reader.read(1024 * 1024)
-                    if not isinstance(block, bytes) or len(block) > 1024 * 1024:
-                        raise TypeError("Exchange stream must return bounded binary bytes")
-                    if not block:
-                        break
-                    stage.write(block)
-                stage.complete()
-            workflows.update(workflow_id, state="SOURCE_STAGED", phase="source_staged")
-        finally:
-            stage.close()
-
-    def _workflow_action(self, key, procedure, arguments, *, import_result=False):
-        """Resolve the exact action, including durable intent before journal creation."""
-        loader = getattr(self._journal, "load_if_present", None)
-        action = loader(self._identity, key) if loader else None
-        if action is not None:
-            if action["procedure"] != procedure or action["arguments"] != arguments:
-                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Frozen import action inputs changed")
-            with self._serialized():
-                return self._resolve_action_locked(action, allow_new_prepare=True)
-        return self._run_action(procedure, arguments, _recovery_key=key,
-                                **({"result_format": RESULT_FORMAT_IMPORT} if import_result else {}))
-
-    def _workflow_analysis(self, workflows, workflow_id):
-        record = workflows.get(workflow_id)
-        key = record["action_keys"].get("analysis") or str(uuid.uuid4())
-        request = record["analysis_arguments"] if isinstance(record["analysis_arguments"], list) else [
-            {"packageResourceId": record["package_resource_id"]}, record["frozen_rules"]]
-        actions = dict(record["action_keys"], analysis=key)
-        workflows.update(workflow_id, state="ANALYSIS_REQUESTED", phase="analysis",
-                         action_keys=actions, analysis_arguments=request)
-        envelope = self._workflow_action(key, "deposit.import.analyze", request, import_result=True)
-        result = self._import_result(key, envelope)
-        if result.state == "IMPORT_CONFLICT":
-            workflows.update(workflow_id, state="FAILED", phase="diagnostic", result_action_key=key,
-                             failure="IMPORT_CONFLICT")
-            self._cleanup_import_workflow(workflows, workflow_id)
-            self._raise_import_diagnostic(result)
-        workflows.update(workflow_id, state="PLAN_READY", phase="plan_ready",
-                         plan_id=result.plan_id, result_action_key=key, plan_expires_at=result["expiresAt"],
-                         failure=None, resume_state=None)
-        return result
-
-    def _continue_import_workflow(self, workflows, workflow_id):
-        """Continue only frozen local or remote package boundaries; never apply."""
-        from .exchange import DurableExchangeFile, validate_exchange_archive
-        self._client.require_paged_import_results()
-        record = workflows.get(workflow_id)
-        state = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
-        if state in {"TARGET_PACKAGE_READY", "ANALYSIS_REQUESTED"}:
-            return self._workflow_analysis(workflows, workflow_id)
-        if state not in {"SOURCE_STAGED", "ROUTING_DECIDED", "TARGET_UPLOAD", "SOURCE_STAGING"}:
-            return None
-        if record["routing_decision"] == "same_server_actor_grant" and record["package_resource_id"]:
-            return self._workflow_analysis(workflows, workflow_id)
-        stage_id = record["package_stage_id"]
-        if not stage_id:
-            return None
-        stage = DurableExchangeFile(self._journal.storage, stage_id, identity=self._identity.to_dict())
-        try:
-            if not stage.manifest["complete"]:
-                # No caller input may replace a partial freeze during recovery.
-                raise DepositError("IMPORT_FREEZE_INTERRUPTED", "Exchange input freeze was interrupted before completion")
-            with stage.reader() as reader:
-                with validate_exchange_archive(reader, storage=self._journal.storage):
-                    pass
-                reader.seek(0)
-                spool = ProtectedTransferSpool(self._journal, self._identity)
-                transfer_id = record["upload_id"]
-                if transfer_id:
-                    # The first spool checkpoint is persisted after workflow intent.
-                    # Absence proves no upload action was prepared; exact bytes remain.
-                    if not self._journal.storage.has_record(spool._manifest_name(transfer_id)):
-                        transfer_id = None
-                    else:
-                        manifest = spool.load(transfer_id)
-                        if manifest["state"] == "staging":
-                            if any(manifest.get(k) for k in ("begin_action_key", "finish_action_key", "pending_action_key")):
-                                raise DepositError("RECOVERY_DEFERRED", "Partial spool has unresolved action ownership")
-                            with self._journal.storage.lock(spool._lock_name(transfer_id)):
-                                for name in self._journal.storage.list_records():
-                                    if name.startswith(f"transfer-{transfer_id}-"):
-                                        self._journal.storage.delete(name)
-                                self._journal.storage.delete(f"admission-{manifest['admission_id']}")
-                            transfer_id = None
-                if transfer_id is None:
-                    original_save = spool._save
-                    def save(manifest, *, creating=False):
-                        if creating:
-                            workflows.update(workflow_id, state="TARGET_UPLOAD", phase="target_upload",
-                                             upload_id=manifest["transfer_id"])
-                        return original_save(manifest, creating=creating)
-                    spool._save = save
-                    transfer_id = spool.freeze(reader, filename="deposit-import.zip", media_type="application/zip")["transfer_id"]
-                workflows.update(workflow_id, state="TARGET_UPLOAD", phase="target_upload", upload_id=transfer_id)
-                def saved(value, transfer):
-                    current = workflows.get(workflow_id)
-                    actions = dict(current["action_keys"], upload_begin=transfer["begin_action_key"],
-                                   upload_finish=transfer["finish_action_key"])
-                    workflows.update(workflow_id, state="TARGET_PACKAGE_READY", phase="target_package_ready",
-                                     package_resource_id=value["resourceId"], action_keys=actions)
-                with self._serialized():
-                    uploaded = self._resume_upload_locked(transfer_id, spool=spool,
-                        already_serialized=True, on_resolved=saved)
-                # Reconcile an interrupted acknowledgement after the upload callback.
-                if workflows.get(workflow_id)["state"] != "TARGET_PACKAGE_READY":
-                    saved(uploaded, spool.load(transfer_id))
-            return self._workflow_analysis(workflows, workflow_id)
-        finally:
-            stage.close()
-
-    def _direct_import_eligible(self, bundle):
-        """Require live provenance, actor context and a currently accessible grant."""
-        from ._recovery.identity import read_deployment_identity, IdentityUnavailableError
-        source = bundle.source_store
-        if source._identity.to_dict() != bundle.source_binding:
-            return False
-        try:
-            identities = []
-            for store in (source, self):
-                client = store._client
-                current = read_deployment_identity(client._driver, database=client._database,
-                    actor_id=store._identity.actor_id, namespace_id=store.namespace_id)
-                profile = client.get_session(store._token)
-                if (current != store._identity or profile.get("user", {}).get("id") != current.actor_id
-                        or profile.get("namespaceId") != current.namespace_id):
-                    return False
-                identities.append(current)
-            left, right = identities
-            if (left.endpoint, left.database_name, left.database_id, left.dbms_id, left.actor_id) != (
-                right.endpoint, right.database_name, right.database_id, right.dbms_id, right.actor_id):
-                return False
-            if not isinstance(bundle.package_reference, str) or not bundle.package_reference:
-                return False
-            # Resource info enforces current source Namespace role/history grant.
-            # Same live actor/deployment then qualifies for Server analysis checks.
-            metadata = source._call_one("deposit.resource.info", bundle.package_reference)
-            return isinstance(metadata, dict) and metadata.get("resourceId") == bundle.package_reference
-        except (IdentityUnavailableError, AttributeError, DepositError):
-            return False
-
-    def _analyze_import_bundle(self, bundle, rules, workflows, workflow):
-        self._client.require_paged_import_results()
-        record = workflows.get(workflow.id)
-        direct = record["routing_decision"] == "same_server_actor_grant" or (
-            record["routing_decision"] is None and self._direct_import_eligible(bundle))
-        if direct:
-            workflows.update(workflow.id, state="ROUTING_DECIDED", phase="direct_handoff",
-                             routing_decision="same_server_actor_grant", package_resource_id=bundle.package_reference)
-            try:
-                return self._workflow_analysis(workflows, workflow.id)
-            except DepositError as exc:
-                # _workflow_action resolves the original journal before returning
-                # a definitive denial. Transport/result uncertainty never reroutes.
-                if not self._relay_after_direct_denial(workflows, workflow.id, exc):
-                    raise
-        workflows.update(workflow.id, state="ROUTING_DECIDED", phase="client_relay",
-                         routing_decision="authenticated_client_relay", source_stage_id=bundle._stage_id)
-        bundle.materialize()
-        with bundle.open_package_stream() as reader:
-            self._freeze_workflow_package(reader, workflows, workflow.id)
-        return self._continue_import_workflow(workflows, workflow.id)
-
-    def _relay_after_direct_denial(self, workflows, workflow_id, exc):
-        current = workflows.get(workflow_id)
-        original_key = current["action_keys"].get("analysis")
-        original = self._journal.load_if_present(self._identity, original_key) if original_key else None
-        if (exc.code not in {"NOT_FOUND", "FORBIDDEN"} or original is None
-                or original["state"] != "failed" or original["failure"]["code"] != exc.code):
-            return False
-        actions = dict(current["action_keys"])
-        actions["direct_analysis"] = actions.pop("analysis")
-        workflows.update(workflow_id, state="ROUTING_DECIDED", phase="relay_source_required",
-                         routing_decision="authenticated_client_relay", action_keys=actions,
-                         analysis_arguments={"rules": current["frozen_rules"]}, package_resource_id=None,
-                         resume_state=None, failure=None)
-        return True
-
-    def _import_workflow_failure(self, workflows, workflow_id, exc):
-        record = workflows.get(workflow_id)
-        if record["state"] in {"FAILED", "CANCELLED", "EXPIRED", "ABANDONED", "APPLIED"}:
-            return
-        code = getattr(exc, "code", None)
-        terminal = {"IMPORT_CONFLICT": "FAILED", "IMPORT_FREEZE_INTERRUPTED": "FAILED",
-                    "CANCELLED": "CANCELLED", "OPERATION_CANCELLED": "CANCELLED",
-                    "PLAN_EXPIRED": "EXPIRED", "EXPIRED": "EXPIRED",
-                    "FORBIDDEN": "FAILED", "UNAUTHENTICATED": "FAILED", "NOT_FOUND": "FAILED"}
-        state = terminal.get(code)
-        if record["plan_id"] and code in {"NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED"}:
-            # The action may have failed definitively while the plan still
-            # exists. An authorization-hidden response cannot release it.
-            state = None
-        # A response code during receipt lookup is not evidence of rollback.
-        # Only finalized local action failures authorize terminal classification.
-        active_key = record["action_keys"].get("apply" if record["apply_requested"] else "analysis")
-        if active_key is not None and state is not None:
-            action = self._journal.load_if_present(self._identity, active_key)
-            if action is not None and action["state"] not in {"failed", "conflicted"}:
-                state = None
-        # Only an unstarted local caller input is proven unusable. Protected
-        # storage failures cannot discard an authenticated frozen input.
-        if (state is None and not record["action_keys"] and not record["source_namespace_id"]
-                and record["state"] in {"CREATED", "SOURCE_EXPORT_REQUESTED", "SOURCE_STAGING"} and code != "SESSION_EXPIRED"):
-            state = "FAILED"
-        if state:
-            workflows.update(workflow_id, state=state, phase=state.lower(), failure=code or type(exc).__name__)
-            self._cleanup_import_workflow(workflows, workflow_id)
-        else:
-            previous = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
-            failure = code or type(exc).__name__
-            if (record["state"] == "OUTCOME_UNCERTAIN" and record["resume_state"] == previous
-                    and record["failure"] == failure):
-                return
-            workflows.update(workflow_id, state="OUTCOME_UNCERTAIN", resume_state=previous,
-                             failure=failure)
-
-    def _observe_import_plan(self, workflows, workflow_id, *, abandoning=False):
-        record = workflows.get(workflow_id)
-        if not record["plan_id"]:
-            return None
-        if abandoning:
-            now = int(time.time() * 1000)
-            if record["phase"] == "abandon_waiting_for_plan_lease":
-                if record["plan_expires_at"] > now:
-                    return "ready"
-                # Recheck without renewing at the saved lease deadline. The
-                # Server distinguishes an authorized expired plan from hidden
-                # authorization responses.
-                pass
-            if (record["phase"] == "abandon_pending" and record["plan_expires_at"] is not None
-                    and record["plan_expires_at"] > now):
-                return "ready"
-            # Keep inputs protected across a lost response. Abandonment uses a
-            # nonrenewing observation; record the actual Server expiry below.
-            workflows.update(workflow_id, state="ABANDON_PENDING", phase="abandon_waiting_for_plan_lease",
-                             plan_expires_at=now + _IMPORT_PLAN_LEASE_MS, cleanup_status="pending")
-        try:
-            wrapper = self._call_one("deposit.get.importPlanMetadata", record["plan_id"])
-        except DepositError as exc:
-            if abandoning and exc.code == "PLAN_EXPIRED":
-                return "expired"
-            if exc.code not in {"NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED"}:
-                raise
-            # Authorization can be hidden behind any of these observations.
-            # A saved local deadline is not authoritative proof that a renewed
-            # Server plan is gone: fail closed until a later observation/retry.
-            if abandoning:
-                workflows.update(workflow_id, state="OUTCOME_UNCERTAIN",
-                                 resume_state="ABANDON_PENDING", phase="abandon_pending",
-                                 failure="RECOVERY_PENDING", cleanup_status="pending",
-                                 plan_expires_at=record["plan_expires_at"])
-                raise DepositError("RECOVERY_PENDING",
-                                   "Import plan availability is unconfirmed; protected inputs remain owned") from exc
-            # Ordinary resume must preserve the same protected ownership.
-            # Neither local expiry arithmetic nor an authorization-hidden read
-            # is an authoritative expiry/absence response. Keep the apply
-            # barrier and allow a later reauthenticated observation to continue.
-            previous = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
-            workflows.update(workflow_id, state="OUTCOME_UNCERTAIN", resume_state=previous,
-                             phase="plan_unavailable", failure=exc.code, cleanup_status="pending")
-            return "unavailable"
-        if (not _valid_plan_observation(wrapper) or wrapper["planId"] != record["plan_id"]
-                or wrapper["namespaceId"] != self.namespace_id):
-            raise DepositError("INVALID_RESPONSE", "Import plan observation returned invalid metadata")
-        state = wrapper["state"]
-        if state == "ready":
-            deadline = wrapper["expiresAt"]
-            if abandoning:
-                workflows.update(workflow_id, plan_expires_at=deadline, resume_state=None, failure=None)
-            else:
-                workflows.update(workflow_id, state="PLAN_READY", phase="plan_ready",
-                                 plan_expires_at=deadline, resume_state=None, failure=None)
-        if state == "applied" and not abandoning and not record["apply_requested"]:
-            # A caller may have applied this exact plan through another
-            # authorization owner; recover that terminal boundary idempotently
-            # rather than treating its plan receipt as unknown.
-            workflows.update(workflow_id, state="APPLIED", phase="applied",
-                             resume_state=None, failure=None)
-            self._cleanup_import_workflow(workflows, workflow_id)
-        return state
-
-    def _cleanup_import_workflow(self, workflows, workflow_id, *, source_store=None):
-        from .exchange import DurableExchangeFile
-        record = workflows.get(workflow_id)
-        pending = False
-        for stage_id, store in ((record["package_stage_id"], self), (record["source_stage_id"], source_store)):
-            if not stage_id:
-                continue
-            if store is None:
-                if self._journal.storage.has_record(f"import-stage-{stage_id}-manifest"):
-                    storage, identity = self._journal.storage, record["source_identity"]
-                else:
-                    pending = True
-                    continue
-            else:
-                storage, identity = store._journal.storage, store._identity.to_dict()
-            try:
-                pending |= not DurableExchangeFile.release_owned(storage, stage_id, workflow_id=workflow_id)
-            except Exception:
-                pending = True
-        transfer_id = record["upload_id"]
-        if transfer_id and self._journal.storage.has_record(f"transfer-{transfer_id}-manifest"):
-            spool = ProtectedTransferSpool(self._journal, self._identity)
-            try:
-                with self._journal.storage.lock(spool._lock_name(transfer_id)):
-                    manifest = spool.load(transfer_id)
-                    finish = (self._journal.load_if_present(self._identity, manifest["finish_action_key"])
-                              if manifest["finish_action_key"] is not None else None)
-                    abort_key = record["action_keys"].get("upload_abort")
-                    abort = self._journal.load_if_present(self._identity, abort_key) if abort_key else None
-                    aborted = (abort is not None and abort["state"] == "released"
-                               and (abort.get("outcome") or {}).get("aborted") is True)
-                    safe = (aborted or manifest["state"] in {"failed", "finished"}
-                            or (manifest["begin_action_key"] is None)
-                            or (finish is not None and finish["state"] == "released"))
-                    if safe:
-                        for name in self._journal.storage.list_records():
-                            if name.startswith(f"transfer-{transfer_id}-"):
-                                self._journal.storage.delete(name)
-                        self._journal.storage.delete(f"admission-{manifest['admission_id']}")
-                    else:
-                        pending = True
-            except Exception:
-                pending = True
-        workflows.update(workflow_id, cleanup_status="pending" if pending else "complete")
+    def import_exchange(self, source, *, rules=None, operation_id=None):
+        """Analyze ZIP bytes or an authorized Exchange bundle for explicit apply."""
+        if isinstance(source, ExchangeBundle):
+            return self._analyze_package(lambda endpoint: package_for_target(source, endpoint),
+                                         rules, operation_id=operation_id, source=source)
+        return self._analyze_package(lambda endpoint: stage_zip(endpoint, source),
+                                     rules, operation_id=operation_id)
 
     def import_from(self, source_store, *, roots=None, max_hops=None,
-                    root_class_boundary=True, rules=None):
-        """Import one immutable export using independently authenticated Stores."""
-        from ._import_workflows import ImportWorkflowStore
-        from .exchange import _LegacyExchangeBundle
+                    root_class_boundary=True, rules=None, operation_id=None):
+        """Analyze a source Store export using independently authenticated Stores."""
         if not isinstance(source_store, Store):
             raise TypeError("source_store must be an authenticated Store")
-        if rules is not None and not isinstance(rules, Mapping):
-            raise TypeError("rules must be a mapping")
-        if roots is not None and not isinstance(roots, (list, tuple)):
-            raise TypeError("roots must be a list or tuple of Object selectors")
-        if type(root_class_boundary) is not bool:
-            raise TypeError("root_class_boundary must be a bool")
-        export_selection = {"rootIds": [_portable_input(root) for root in roots]} if roots is not None else {}
-        export_options = {"rootClassBoundary": root_class_boundary}
-        if max_hops is not None:
-            if type(max_hops) is not int or max_hops < 0:
-                raise ValueError("max_hops must be a nonnegative integer or None")
-            export_options["maxHops"] = max_hops
+        _import_rules(rules)
+        with source_store.export_exchange(roots=roots, max_hops=max_hops,
+                                          root_class_boundary=root_class_boundary) as source:
+            return self._analyze_package(lambda endpoint: package_for_target(source, endpoint),
+                                         rules, operation_id=operation_id, source=source, own_source=True)
+
+    def _analyze_package(self, stage, rules, *, operation_id, source=None, own_source=False):
+        self._assert_not_collecting_batch()
+        rules = _import_rules(rules)
         self._client.require_paged_import_results()
-        frozen_rules = _portable_input(dict(rules or {}))
-        export_args = [export_selection, export_options]
-        workflows = ImportWorkflowStore(self._journal.storage)
-        workflow = workflows.create(source=source_store, target=self)
-        with workflows.lock(workflow.id):
-            export_key = str(uuid.uuid4())
-            workflows.update(workflow.id, state="SOURCE_EXPORT_REQUESTED", phase="source_export",
-                action_keys={"export": export_key}, source_export_arguments=export_args,
-                frozen_rules=frozen_rules, analysis_arguments={"rules": frozen_rules})
+        with self._serialized(), self._using_endpoint() as endpoint:
+            endpoint.require_exchange()
+            reference = stage(endpoint)
+            direct = source is not None and reference == source.source
+            owned = not direct
+            retained = False
             try:
-                export_result = source_store._workflow_action(export_key, "deposit.save.data", export_args)
-                workflows.update(workflow.id, state="SOURCE_REFERENCE_READY", phase="source_reference_ready",
-                                 source_export_result=export_result)
-                with _LegacyExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
-                    return self._import_exchange_workflow(bundle, frozen_rules, workflows, workflow)
-            except Exception as exc:
-                self._import_workflow_failure(workflows, workflow.id, exc)
+                with endpoint.execution() as execution:
+                    envelope = execution.run("deposit.import.analyze", {
+                        name: reference[name] for name in ("packageId", "grant")
+                    }, rules, operation_id=operation_id)
+                result = self._import_result(envelope)
+                if result.plan_id:
+                    with self._state_lock:
+                        self._ready_plans.add(result.plan_id)
+                        if owned or own_source:
+                            self._plan_packages[result.plan_id] = (reference, direct)
+                            retained = True
+                elif direct and own_source:
+                    # The conflict diagnostic itself still checks source authorization.
+                    self._result_packages.append(reference)
+                    retained = True
+                if direct and own_source and retained:
+                    source._detach()
+                if result.state == "IMPORT_CONFLICT":
+                    self._raise_import_diagnostic(result)
+                return result
+            except OperationCommittedAfterCancel as exc:
+                self._discard_cancelled_analysis(exc)
                 raise
+            except OutcomeUnknown:
+                # Admission may still be using the package. Expiry owns cleanup.
+                retained = True
+                if direct and own_source:
+                    source._detach()
+                raise
+            finally:
+                if owned and not retained:
+                    discard_package(endpoint, reference)
 
-    def _analyze_import_snapshot(
-        self,
-        source,
-        *,
-        resources=None,
-        resource_source=None,
-        rules: Mapping[str, Any] | None,
-        require_subgraph: bool,
-        _workflow_store=None,
-        _workflow_id=None,
-        _verified_package_stream=None,
-    ) -> dict[str, Any]:
-        from ._imports import _checked_package_view
-        package_source = (_checked_package_view(source) is not None or
-                          ((callable(getattr(source, "iter_content", None))
-                           or callable(getattr(source, "open_resource", None))
-                           or callable(getattr(source, "resource_reader", None)))
-                          and (callable(getattr(source, "materialize", None))
-                               or (hasattr(source, "manifest") and hasattr(source, "graph")))))
-        if not isinstance(source, Mapping) and not package_source:
-            raise TypeError("Import snapshot must be a manifest/graph mapping or Exchange package")
-        if rules is not None and not isinstance(rules, Mapping):
-            raise TypeError("rules must be a mapping")
+    def _analyze(self, procedure, arguments, *, operation_id=None):
+        self._assert_not_collecting_batch()
         self._client.require_paged_import_results()
-        frozen_source = source if package_source else _portable_input(dict(source))
-        frozen_rules = _portable_input(dict(rules or {}))
-        from ._imports import prepared_import_package
-        if _workflow_store is not None:
-            if _verified_package_stream is not None:
-                self._freeze_workflow_package(_verified_package_stream, _workflow_store, _workflow_id)
-            else:
-                with prepared_import_package(frozen_source, resources=resources, resource_source=resource_source,
-                    storage=self._journal.storage, require_subgraph=require_subgraph) as package:
-                    self._freeze_workflow_package(package._source, _workflow_store, _workflow_id)
-            return self._continue_import_workflow(_workflow_store, _workflow_id)
-        def upload_package(package_source):
-            package_source.seek(0)
-            package_resource = DResource(stream=package_source, filename="deposit-import.zip")
-            self.upload_resource(package_resource)
-            return package_resource
+        with self._serialized():
+            try:
+                result = self._import_result(self._run_action(
+                    procedure, arguments, operation_id=operation_id, _already_serialized=True,
+                ))
+            except OperationCommittedAfterCancel as exc:
+                self._discard_cancelled_analysis(exc)
+                raise
+            if result.plan_id:
+                with self._state_lock:
+                    self._ready_plans.add(result.plan_id)
+            if result.state == "IMPORT_CONFLICT":
+                self._raise_import_diagnostic(result)
+            return result
 
-        if _verified_package_stream is not None:
-            package_resource = upload_package(_verified_package_stream)
-        else:
-            with prepared_import_package(
-                frozen_source, resources=resources, resource_source=resource_source,
-                storage=self._journal.storage, require_subgraph=require_subgraph,
-            ) as package:
-                package_resource = upload_package(package._source)
-        resource_id = package_resource.resource_id
-        if not isinstance(resource_id, str) or not resource_id:
-            raise DepositError("INVALID_RESPONSE", "Exchange package upload returned no resource ID")
-        request = [{"packageResourceId": resource_id}, frozen_rules]
-        key = str(uuid.uuid4())
-        envelope = self._run_action("deposit.import.analyze", request, _recovery_key=key,
-                                    result_format=RESULT_FORMAT_IMPORT)
-        result = self._import_result(key, envelope)
-        if result.state == "IMPORT_CONFLICT":
-            self._raise_import_diagnostic(result)
-        return result
+    def _discard_cancelled_analysis(self, error):
+        summary = error.details.get("result")
+        if isinstance(summary, dict) and isinstance(summary.get("planId"), str):
+            with suppress(DepositError, TransportError):
+                self._discard_plan(summary["planId"])
 
     @staticmethod
     def _raise_import_diagnostic(result):
@@ -1500,119 +1013,103 @@ class Store:
         failure.import_result = result
         raise failure
 
-    def import_apply(self, plan_id: str):
-        """Persist explicit apply intent and retain ownership through its result."""
-        if not isinstance(plan_id, str) or not plan_id:
-            raise ValueError("plan_id must be a nonempty string")
+    def import_apply(self, plan_id: str, *, operation_id=None):
+        """Explicitly apply a ready plan in one Server transaction."""
+        _stable_id(plan_id)
         self._client.require_paged_import_results()
-        from ._import_workflows import ImportWorkflowStore
-        workflows = ImportWorkflowStore(self._journal.storage)
-        candidates = workflows.matching_plan(plan_id)
-        matches = [record for record in candidates if record["target_identity"] == self._identity.to_dict()
-                   and record["target_namespace_id"] == self.namespace_id]
-        if candidates and not matches:
-            raise DepositError("IDENTITY_MISMATCH", "Import plan workflow belongs to another authenticated Store")
-        if not matches:
-            key = str(uuid.uuid4())
-            return self._import_result(key, self._workflow_action(key, "deposit.import.apply", [plan_id], import_result=True))
-        workflow_id = matches[-1]["workflow_id"]
-        with workflows.lock(workflow_id):
-            record = workflows.get(workflow_id)
-            if record["target_identity"] != self._identity.to_dict() or record["target_namespace_id"] != self.namespace_id:
-                raise DepositError("IDENTITY_MISMATCH", "Import workflow target binding changed before apply")
-            state = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
-            if state in {"ABANDON_REQUESTED", "ABANDON_PENDING"} or record["state"] not in {
-                "PLAN_READY", "APPLY_REQUESTED", "APPLYING", "OUTCOME_UNCERTAIN", "APPLIED",
-            }:
-                raise DepositError("IMPORT_WORKFLOW_BUSY", "Import workflow cannot accept apply intent")
-            if record["state"] == "PLAN_READY":
-                key = str(uuid.uuid4())
-                workflows.update(workflow_id, state="APPLY_REQUESTED", phase="apply_requested", apply_requested=True,
-                                 action_keys=dict(record["action_keys"], apply=key))
-            else:
-                key = record["action_keys"].get("apply")
-                if not record["apply_requested"] or not isinstance(key, str):
-                    raise DepositError("RECOVERY_DEFERRED", "Apply action has no durable explicit intent")
-            return self._apply_import_workflow(workflows, workflow_id)
+        with self._serialized():
+            try:
+                envelope = self._run_action("deposit.import.apply", [plan_id],
+                                            operation_id=operation_id, _already_serialized=True)
+            except OutcomeUnknown:
+                with self._state_lock:
+                    self._ready_plans.discard(plan_id)
+                    self._plan_packages.pop(plan_id, None)
+                raise
+            except OperationCommittedAfterCancel:
+                self._finish_plan(plan_id, keep_source=True)
+                raise
+            except DepositError as exc:
+                if isinstance(exc.details, dict) and exc.details.get("state") == "COMMITTED":
+                    self._finish_plan(plan_id, keep_source=True)
+                elif exc.code != "OPERATION_MISMATCH":
+                    with suppress(DepositError, TransportError):
+                        self._discard_plan(plan_id)
+                raise
+            self._finish_plan(plan_id, keep_source=True)
+            return self._import_result(envelope)
 
-    def _apply_import_workflow(self, workflows, workflow_id):
-        record = workflows.get(workflow_id)
-        if record["target_identity"] != self._identity.to_dict() or record["target_namespace_id"] != self.namespace_id:
-            raise DepositError("IDENTITY_MISMATCH", "Import workflow target binding does not match apply Store")
-        key = record["action_keys"].get("apply")
-        if not record["apply_requested"] or not isinstance(key, str):
-            raise DepositError("RECOVERY_DEFERRED", "Apply action has no durable explicit intent")
+    def discard_import_plan(self, plan_id: str):
+        """Discard an unused plan and report the Server's plan state."""
+        self._assert_not_collecting_batch()
+        _stable_id(plan_id)
+        # Independent of the ordinary lock, so a concurrent apply and discard
+        # are ordered by the Server rather than by this Store.
+        if not self._begin_parallel_control():
+            raise RuntimeError("Store is closed")
         try:
-            workflows.update(workflow_id, state="APPLYING", phase="applying")
-            envelope = self._workflow_action(key, "deposit.import.apply", [record["plan_id"]], import_result=True)
-            result = self._import_result(key, envelope)
-            workflows.update(workflow_id, state="APPLIED", phase="applied", result_action_key=key,
-                             failure=None, resume_state=None)
-            self._cleanup_import_workflow(workflows, workflow_id)
-            return result
-        except Exception as exc:
-            self._import_workflow_failure(workflows, workflow_id, exc)
-            raise
+            return self._discard_plan(plan_id)
+        finally:
+            self._end_parallel_control()
+
+    def _discard_plan(self, plan_id):
+        result = self._endpoint.control("deposit.import.discardPlan", plan_id)
+        if (not _valid_plan_observation(result) or result["planId"] != plan_id
+                or result["namespaceId"] != self.namespace_id):
+            raise DepositError("INVALID_RESPONSE", "Plan discard returned an invalid observation")
+        self._finish_plan(plan_id, keep_source=result["state"] == "applied")
+        return result
+
+    def _finish_plan(self, plan_id, *, keep_source):
+        with self._state_lock:
+            self._ready_plans.discard(plan_id)
+            owned = self._plan_packages.pop(plan_id, None)
+            if owned is None:
+                return
+            reference, direct = owned
+            if direct and keep_source:
+                self._result_packages.append(reference)
+                return
+        discard_package(self._endpoint, reference, control=True)
 
     def import_inspect(self, plan_id: str):
         """Read a plan's immutable analysis result without applying it."""
-        if not isinstance(plan_id, str) or not plan_id:
-            raise ValueError("plan_id must be a nonempty string")
+        _stable_id(plan_id)
         self._client.require_paged_import_results()
         wrapper = self._call_one("deposit.get.importPlan", plan_id)
         if not valid_import_plan_wrapper(wrapper, plan_id=plan_id, namespace_id=self._namespace_id):
             raise DepositError("INVALID_RESPONSE", "Import plan inspection returned an invalid wrapper")
-        return self._import_result(None, wrapper["analysisResult"], plan_observation=wrapper["plan"])
+        return self._import_result(wrapper["analysisResult"], plan_observation=wrapper["plan"])
 
-    def _import_result(self, action_key, envelope: Any, *, plan_observation=None):
+    def _import_result(self, envelope: Any, *, plan_observation=None):
         if not isinstance(envelope, dict) or envelope.get("namespaceId") != self._namespace_id:
             raise DepositError("INVALID_RESPONSE", "Import action returned an invalid result envelope")
-        return self._client._result_view(self._token, envelope, ImportResult,
-                                         action_key=action_key, plan_observation=plan_observation,
-                                         check_open=self._check_result_reader)
+        result = self._client._result_view(self._token, envelope, ImportResult,
+                                           plan_observation=plan_observation, check_open=self._check_result_reader,
+                                           requester=self._endpoint.control)
+        self._readers[id(result)] = result
+        return result
 
     def _check_result_reader(self):
         if self._closed or self._closing:
             raise RuntimeError("Store is closed")
 
-    def call(self, procedure: str, *arguments: Any) -> StoreResult:
-        """Call an allowlisted namespace procedure using its manifest signature.
-
-        Results retain their transaction until exhausted or explicitly closed.
-        Action procedures use the same durable coordinator as the convenience
-        methods and return detached portable rows.
-        """
-        if self._batch_collection is not None:
-            raise RuntimeError("Store calls are unavailable while collecting a batch")
+    def call(self, procedure: str, *arguments: Any):
+        """Call an allowlisted Store procedure using its domain arguments."""
+        self._assert_not_collecting_batch()
         entry = store_procedure(procedure)
+        if procedure == "deposit.import.apply":
+            return self.import_apply(*arguments)
+        if procedure == "deposit.import.discardPlan":
+            return self.discard_import_plan(*arguments)
+        if entry.get("tracked") == "always":
+            if procedure in _IMPORT_RESULTS:
+                return self._analyze(procedure, arguments)
+            outcome = self._run_action(procedure, arguments)
+            columns = entry["columns"]
+            row = {columns[0]: outcome} if len(columns) == 1 else outcome
+            return detached_result(entry, row, self._token)
         bound = bind_arguments(entry, arguments, namespace_id=self._namespace_id)
-        if entry["action"]:
-            portable = _portable_input(list(bound))
-            result_format = RESULT_FORMAT_IMPORT if procedure in {
-                "deposit.import.analyze", "deposit.import.rows", "deposit.import.dataByPattern",
-                "deposit.import.apply"
-            } else RESULT_FORMAT_NAMED_ROWS
-            if result_format == RESULT_FORMAT_IMPORT:
-                self._client.require_paged_import_results()
-            with self._serialized():
-                self._update_observed_revision()
-                revision = self._observed_revision
-                if revision is None:
-                    raise DepositError("REVISION_UNAVAILABLE", "Store has no observed Namespace revision")
-                record = self._journal.create(
-                    self._identity,
-                    procedure,
-                    portable,
-                    revision,
-                    result_format=result_format,
-                )
-                outcome = self._resolve_action_locked(record, allow_new_prepare=True)
-                if result_format == RESULT_FORMAT_IMPORT:
-                    result = self._import_result(record["key"], outcome)
-                    if result.state == "IMPORT_CONFLICT":
-                        self._raise_import_diagnostic(result)
-                    return result
-                return detached_result(entry, outcome, self._token)
         return self._open_result(entry, bound)
 
     def get_requests(self) -> tuple[Mapping[str, Any], ...]:
@@ -1682,16 +1179,26 @@ class Store:
             return value
 
     def get_operation(self, operation_id: str) -> Any:
-        """Inspect an operation in this Store's fixed Namespace scope."""
-        self._assert_not_collecting_batch()
-        if not isinstance(operation_id, str) or not operation_id:
-            raise ValueError("operation_id must be a nonempty string")
-        with self._serialized():
-            return self._client.get_operation(self._token, operation_id, scope=self._namespace_id)
+        """Inspect an exact operation on the independent control connection."""
+        return self._operation_status(operation_id, cancel=False)
 
     def cancel_operation(self, operation_id: str) -> Any:
-        """Request cancellation from the Store's independent control connection."""
-        return self._client.cancel_operation(self._token, operation_id, scope=self._namespace_id)
+        """Request cancellation in this Store's immutable Namespace."""
+        return self._operation_status(operation_id, cancel=True)
+
+    def _operation_status(self, operation_id, *, cancel):
+        _stable_id(operation_id)
+        if not self._begin_parallel_control():
+            raise RuntimeError("Store is closed")
+        try:
+            if cancel:
+                with self._state_lock:
+                    endpoint = self._active_endpoint
+                if endpoint is not None:
+                    endpoint.note_cancel(operation_id)
+            return self._endpoint._operation_status(operation_id, cancel)
+        finally:
+            self._end_parallel_control()
 
     def get_last_operation(self) -> Any:
         """Return the last operation observed by this Store session."""
@@ -2015,22 +1522,20 @@ class Store:
         return result["results"]
 
     def cancel(self) -> bool:
-        """Request cancellation of all requests for this token.
-
-        Cancellation requests termination; it does not establish rollback.
-        Any action whose outcome is uncertain remains under its normal durable
-        receipt and recovery path.
-        """
-        self._assert_not_collecting_batch()
+        """Request cancellation of this Store's current operation or read."""
         return self._cancel(allow_closing=False)
 
     def _cancel(self, *, allow_closing: bool) -> bool:
         if not self._begin_parallel_control(allow_closing=allow_closing):
             return False
         try:
+            with self._state_lock:
+                endpoint = self._active_endpoint
+            if endpoint is not None:
+                endpoint.cancel_current()
+                return True
             entry = store_control_procedure("deposit.utils.cancel")
-            bound = bind_arguments(entry, ())
-            query, parameters = build_query(entry, bound, self._token)
+            query, parameters = build_query(entry, (), self._token)
             row = self._client._single(query, parameters)
             value = row.get("value")
             if not isinstance(value, bool):
@@ -2052,7 +1557,6 @@ class Store:
             self._control_condition.notify_all()
 
     def close(self) -> None:
-        self._assert_not_collecting_batch()
         with self._close_lock:
             with self._state_lock:
                 if self._closed:
@@ -2064,8 +1568,7 @@ class Store:
                 try:
                     self._cancel(allow_closing=True)
                 except Exception:
-                    # Closing is best-effort; recovery and logout still need
-                    # to run if the separate cancellation request fails.
+                    # Release local readers and the session even when cancellation fails.
                     pass
             failure: Exception | None = None
             if active_result is not None:
@@ -2077,11 +1580,24 @@ class Store:
                 while self._inflight_controls:
                     self._control_condition.wait()
             with self._operation_lock:
+                for reader in tuple(self._readers.values()):
+                    with suppress(Exception):
+                        reader.close()
+                for plan_id in tuple(self._ready_plans):
+                    with suppress(DepositError, TransportError):
+                        self._discard_plan(plan_id)
+                for reference in self._result_packages:
+                    discard_package(self._endpoint, reference, control=True)
+                self._ready_plans.clear()
+                self._plan_packages.clear()
+                self._result_packages.clear()
+                for bundle in tuple(self._bundles):
+                    with suppress(Exception):
+                        bundle.close()
                 try:
-                    self._recover_pending_locked()
+                    self._endpoint.close()
                 except Exception as exc:
-                    if failure is None:
-                        failure = exc
+                    failure = failure or exc
                 try:
                     self._client.logout(self._token)
                 except Exception as exc:
@@ -2196,8 +1712,7 @@ class Store:
             raise
 
     def _open_result(self, entry: dict[str, Any], arguments: tuple[Any, ...], *, _already_serialized: bool = False) -> StoreResult:
-        # Recovery and action completion already hold the operation lock.  A
-        # result page fetched there must share it instead of reacquiring it.
+        # Convenience calls may already hold the operation lock.
         guard = nullcontext() if _already_serialized else self._serialized()
         guard.__enter__()
         session = None
@@ -2265,650 +1780,66 @@ class Store:
         return self._run_action(procedure, arguments, pinned_revision=handle._baseline_revision,
                                 stale_handle=handle)
 
-    def _run_action(self, procedure: str, arguments: list[Any], *, pinned_revision: int | None = None,
+    @contextmanager
+    def _using_endpoint(self, endpoint=None):
+        endpoint = self._endpoint if endpoint is None else endpoint
+        with self._state_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("Store is closed")
+            endpoint.reset_cancellation()
+            self._active_endpoint = endpoint
+        try:
+            yield endpoint
+        finally:
+            with self._state_lock:
+                self._active_endpoint = None
+
+    def _run_action(self, procedure: str, arguments, *, pinned_revision: int | None = None,
                     stale_handle: DNode | None = None, post_snapshot: bool = False,
-                    _recovery_key: str | None = None, _already_serialized: bool = False,
-                    result_format: str | None = None):
+                    operation_id=None, _already_serialized: bool = False):
         if self._batch_collection is not None and procedure != "deposit.apply.batch":
             raise RuntimeError("Store mutations are unavailable while collecting a batch")
         entry = store_procedure(procedure)
-        if entry.get("action") is not True:
-            raise ValueError("Prepared action coordinator accepts only declared action procedures")
-        _portable_input(arguments)
+        if entry.get("tracked") != "always":
+            raise ValueError("Procedure does not accept a tracked operation")
+        bound = bind_arguments(domain_arguments(entry), tuple(arguments), namespace_id=self.namespace_id)
+        frozen = _portable_input(list(bound))
+        operation_id = self._client.new_operation_id() if operation_id is None else operation_id
         with nullcontext() if _already_serialized else self._serialized():
             self._update_observed_revision()
-            revision = self._observed_revision
-            if revision is None:
-                raise DepositError("REVISION_UNAVAILABLE", "Store has no observed Namespace revision")
-            if pinned_revision is not None and pinned_revision != revision:
+            if pinned_revision is not None and pinned_revision != self._observed_revision:
                 if stale_handle is not None:
                     stale_handle._mark_stale()
                 raise DepositError("REVISION_CONFLICT", "Entity handle baseline is stale; refresh and reapply explicitly")
-            if result_format == RESULT_FORMAT_IMPORT:
-                self._client.require_paged_import_results()
-            record = self._journal.create(self._identity, procedure, arguments, revision,
-                                          result_format=result_format, key=_recovery_key)
             try:
-                outcome = self._resolve_action_locked(record, allow_new_prepare=True)
-                if post_snapshot:
-                    kind = "Class" if procedure == "deposit.create.class" else "Object"
-                    snapshot = self._checked_entity_snapshot(kind, {"id": outcome["id"]},
-                                                             _already_serialized=True)
-                    return outcome, snapshot
-                return outcome
+                with self._using_endpoint() as endpoint, endpoint.execution() as execution:
+                    outcome = execution.run(procedure, *frozen, operation_id=operation_id)
             except DepositError as exc:
                 if exc.code == "REVISION_CONFLICT" and stale_handle is not None:
                     stale_handle._mark_stale()
+                if isinstance(exc, (OutcomeUnknown, OperationCommittedAfterCancel)) or (
+                        isinstance(exc.details, dict) and exc.details.get("state") == "COMMITTED"):
+                    self._invalidate_handles()
                 raise
+            if entry["scope"] == "namespace" or procedure == "deposit.import.apply":
+                self._invalidate_handles()
+            if entry["columns"] in (["node"], ["rel"]) and (
+                    not isinstance(outcome, dict) or outcome.get("namespaceId") != self.namespace_id):
+                raise DepositError("SCOPE_MISMATCH", "Mutation result belongs to another Namespace",
+                                   {"operationId": operation_id})
+            if post_snapshot:
+                kind = "Class" if procedure == "deposit.create.class" else "Object"
+                try:
+                    snapshot = self._checked_entity_snapshot(kind, {"id": outcome["id"]}, _already_serialized=True)
+                except (DepositError, TransportError, KeyError) as exc:
+                    raise DepositError("RESULT_UNAVAILABLE", "The mutation committed. Inspect its Server receipt.",
+                                       {"operationId": operation_id, "scope": self.namespace_id, "state": "COMMITTED"}) from exc
+                return outcome, snapshot
+            return _portable_input(outcome)
 
     def _assert_not_collecting_batch(self) -> None:
         if self._batch_collection is not None:
             raise RuntimeError("Store operations are unavailable while collecting a batch")
-
-    def _recover_pending_locked(self) -> None:
-        for record in self._journal.unresolved(self._identity):
-            try:
-                self._resolve_action_locked(record, allow_new_prepare=True)
-            except DepositError as exc:
-                # A definitive failure notice is retained for Client discovery,
-                # while Store lifecycle recovery only finishes its detachment.
-                if self._journal.load(self._identity, record["key"])["state"] == "failed":
-                    continue
-                if exc.code == "REVISION_CONFLICT":
-                    continue
-                raise DepositError("RECOVERY_PENDING", "An unresolved action could not be safely recovered") from exc
-            except (TransportError, JournalError):
-                raise
-
-    def _resume_pending_uploads_locked(self) -> None:
-        spool = ProtectedTransferSpool(self._journal, self._identity)
-        for manifest in spool.pending():
-            try:
-                self._resume_upload_locked(manifest["transfer_id"], spool=spool, already_serialized=True)
-            except DepositError:
-                if spool.load(manifest["transfer_id"])["state"] != "failed":
-                    raise
-
-    def _terminalize_upload_failure_locked(self, spool, manifest):
-        steps = {"begin_action_key": "deposit.resource.beginUpload",
-                 "pending_action_key": "deposit.resource.uploadChunk",
-                 "finish_action_key": "deposit.resource.finishUpload"}
-        references = {manifest[field]: field for field in steps if manifest[field] is not None}
-        for record in self._journal.records(self._identity):
-            field = references.get(record["key"])
-            if field is None or record["state"] != "failed":
-                continue
-            arguments = record["arguments"]
-            matches = record["procedure"] == steps[field]
-            if field == "begin_action_key":
-                matches &= arguments == [manifest["filename"], manifest["bytes"], manifest["sha256"], manifest["media_type"]]
-            elif field == "finish_action_key":
-                matches &= manifest["upload_id"] is not None and arguments == [manifest["upload_id"]]
-            else:
-                try:
-                    block = base64.b64decode(arguments[2], validate=True)
-                    matches &= (len(arguments) == 4 and arguments[0] == manifest["upload_id"]
-                                and arguments[1] == manifest["pending_offset"]
-                                and block == self._upload_block(spool, manifest,
-                                                                manifest["pending_offset"],
-                                                                manifest["pending_length"])
-                                and arguments[3] == hashlib.sha256(block).hexdigest())
-                except (IndexError, TypeError, ValueError, TransferError):
-                    matches = False
-            if not matches:
-                raise TransferError("Failed transfer action does not match its immutable inputs")
-            return spool.update(manifest["transfer_id"], _locked=True, state="failed",
-                                failed_action_key=record["key"], failure=record["failure"])
-        return manifest
-
-    def _run_transfer_step_locked(self, spool, manifest, procedure, arguments, key):
-        try:
-            return self._execute_transfer_action(procedure, arguments, key)
-        except Exception:
-            # The common coordinator alone proves rollback and detachment.
-            # Persist terminal state before allowing a later Store to skip work.
-            self._terminalize_upload_failure_locked(spool, manifest)
-            raise
-
-    def _resume_upload_locked(self, transfer_id: str, *, spool=None, already_serialized: bool = False,
-                              on_resolved=None) -> dict[str, Any]:
-        spool = spool or ProtectedTransferSpool(self._journal, self._identity)
-        lock = nullcontext() if already_serialized else self._serialized()
-        with lock, self._journal.storage.lock(f"transfer-{transfer_id}", timeout=0.0):
-            manifest = spool.load(transfer_id)
-            if manifest["state"] == "staging":
-                raise TransferError("Interrupted input staging is retained for inspection and cannot resume from a new stream")
-            if manifest["state"] in {"staged", "uploading"}:
-                manifest = self._terminalize_upload_failure_locked(spool, manifest)
-            if manifest["state"] == "failed":
-                raise _saved_failure_error(manifest["failure"])
-            if manifest["state"] == "finished":
-                try:
-                    record = self._journal.load(self._identity, manifest["finish_action_key"])
-                except JournalError as exc:
-                    raise TransferError("Finished transfer outcome is unavailable") from exc
-                result = record.get("outcome")
-                if not isinstance(result, dict):
-                    raise TransferError("Finished transfer outcome is invalid")
-                spool.cleanup_resolved(transfer_id, _locked=True)
-                return result
-
-            spool.verify_content(manifest, on_verified=_verified_local_progress.get())
-            if manifest["begin_action_key"] is None:
-                spool.ensure_action_capacity(manifest)
-
-            begin_args = [manifest["filename"], manifest["bytes"], manifest["sha256"], manifest["media_type"]]
-            begin_key = manifest["begin_action_key"]
-            if begin_key is None:
-                begin_key = str(uuid.uuid4())
-                manifest = spool.update(transfer_id, _locked=True, begin_action_key=begin_key)
-            begin = self._run_transfer_step_locked(spool, manifest, "deposit.resource.beginUpload", begin_args, begin_key)
-            if (
-                not isinstance(begin, dict)
-                or not isinstance(begin.get("uploadId"), str)
-                or type(begin.get("nextOffset")) is not int
-                or type(begin.get("chunkBytes")) is not int
-                or not 1 <= begin["chunkBytes"] <= TRANSFER_CHUNK_BYTES
-            ):
-                raise TransferError("Server returned invalid upload continuation metadata")
-            if manifest["upload_id"] not in (None, begin["uploadId"]):
-                raise TransferError("Server upload identity changed during recovery")
-            offset = begin["nextOffset"]
-            if offset < 0 or offset > manifest["bytes"]:
-                raise TransferError("Server upload offset is outside the frozen input")
-            manifest = spool.update(transfer_id, _locked=True, upload_id=begin["uploadId"], state="uploading")
-
-            pending_offset = manifest["pending_offset"]
-            pending_length = manifest["pending_length"]
-            pending_key = manifest["pending_action_key"]
-            if pending_offset is not None:
-                if pending_length is None or pending_key is None:
-                    raise TransferError("Protected transfer has incomplete pending chunk metadata")
-                if offset not in {pending_offset, pending_offset + pending_length}:
-                    raise TransferError("Server upload offset does not match the protected pending chunk")
-                if offset == pending_offset:
-                    block = self._upload_block(spool, manifest, pending_offset, pending_length)
-                    arguments = [begin["uploadId"], pending_offset, base64.b64encode(block).decode("ascii"), hashlib.sha256(block).hexdigest()]
-                    result = self._run_transfer_step_locked(spool, manifest, "deposit.resource.uploadChunk", arguments, pending_key)
-                    if not isinstance(result, dict) or result.get("nextOffset") != pending_offset + pending_length:
-                        raise TransferError("Server did not confirm the pending upload chunk")
-                    offset = result["nextOffset"]
-                manifest = spool.update(
-                    transfer_id,
-                    _locked=True,
-                    offset=offset,
-                    pending_action_key=None,
-                    pending_offset=None,
-                    pending_length=None,
-                )
-            elif manifest["offset"] != offset:
-                # The server's contiguous offset is authoritative after a
-                # restart; a saved local begin result is only provenance.
-                manifest = spool.update(transfer_id, _locked=True, offset=offset)
-
-            while offset < manifest["bytes"]:
-                remaining_action_bytes = min(manifest["bytes"] - offset, 4 * TRANSFER_CHUNK_BYTES)
-                block = self._upload_block(spool, manifest, offset, remaining_action_bytes)
-                action_key = str(uuid.uuid4())
-                manifest = spool.update(
-                    transfer_id,
-                    _locked=True,
-                    pending_action_key=action_key,
-                    pending_offset=offset,
-                    pending_length=len(block),
-                )
-                arguments = [begin["uploadId"], offset, base64.b64encode(block).decode("ascii"), hashlib.sha256(block).hexdigest()]
-                result = self._run_transfer_step_locked(spool, manifest, "deposit.resource.uploadChunk", arguments, action_key)
-                if not isinstance(result, dict) or type(result.get("nextOffset")) is not int or result["nextOffset"] != offset + len(block):
-                    raise TransferError("Server did not confirm the uploaded chunk")
-                offset = result["nextOffset"]
-                manifest = spool.update(
-                    transfer_id,
-                    _locked=True,
-                    offset=offset,
-                    pending_action_key=None,
-                    pending_offset=None,
-                    pending_length=None,
-                )
-
-            finish_key = manifest["finish_action_key"]
-            if finish_key is None:
-                finish_key = str(uuid.uuid4())
-                manifest = spool.update(transfer_id, _locked=True, finish_action_key=finish_key)
-            result = self._run_transfer_step_locked(spool, manifest, "deposit.resource.finishUpload", [begin["uploadId"]], finish_key)
-            if (
-                not isinstance(result, dict)
-                or result.get("state") != "ready"
-                or not isinstance(result.get("resourceId"), str)
-                or result.get("checksum") != manifest["sha256"]
-                or result.get("bytes") != manifest["bytes"]
-            ):
-                raise TransferError("Server returned invalid completed resource metadata")
-            result = {
-                **result,
-                "filename": manifest["filename"],
-                "mediaType": manifest["media_type"],
-                "checksum": manifest["sha256"],
-                "bytes": manifest["bytes"],
-                "state": "ready",
-            }
-            if on_resolved is not None:
-                on_resolved(result, manifest)
-            spool.update(transfer_id, _locked=True, state="finished", offset=manifest["bytes"])
-            spool.cleanup_resolved(transfer_id, _locked=True)
-            return result
-
-    def _upload_block(self, spool, manifest: dict[str, Any], offset: int, length: int) -> bytes:
-        """Join the exact frozen protected-chunk range for one upload action."""
-        if type(length) is not int or length < 1 or offset + length > manifest["bytes"]:
-            raise TransferError("Upload action range is outside the frozen input")
-        blocks = []
-        while sum(map(len, blocks)) < length:
-            index = self._upload_chunk_index(manifest, offset + sum(map(len, blocks)))
-            block = spool.read_chunk(manifest["transfer_id"], index)
-            if sum(map(len, blocks)) + len(block) > length:
-                raise TransferError("Upload action does not end at a frozen chunk boundary")
-            blocks.append(block)
-        return b"".join(blocks)
-
-    @staticmethod
-    def _upload_chunk_index(manifest: dict[str, Any], offset: int) -> int:
-        if type(offset) is not int or offset < 0:
-            raise TransferError("Server upload offset is invalid")
-        total = 0
-        for index in range(ProtectedTransferSpool.chunk_count(manifest)):
-            if total == offset:
-                return index
-            total += ProtectedTransferSpool.chunk_length(manifest, index)
-        if offset == total:
-            return ProtectedTransferSpool.chunk_count(manifest)
-        raise TransferError("Server upload offset is not a frozen chunk boundary")
-
-    def _execute_transfer_action(self, procedure: str, arguments: list[Any], key: str) -> dict[str, Any]:
-        """Execute or replay one transfer action through the common coordinator."""
-        record = self._journal.load_if_present(self._identity, key)
-        if record is None:
-            return self._run_action(procedure, arguments, _recovery_key=key, _already_serialized=True)
-        if record["procedure"] != procedure or record["arguments"] != arguments:
-            raise TransferError("Transfer action key is bound to different immutable inputs")
-        if record["state"] != "released":
-            return self._resolve_action_locked(record, allow_new_prepare=True)
-        return self._replay_released_action(key)
-
-    def _replay_released_action(self, key: str) -> dict[str, Any]:
-        """Reattach a durable receipt and reissue its exact call for dynamic data."""
-        with self._journal.action_lock(key):
-            record = self._journal.load(self._identity, key)
-            if record["state"] != "released":
-                outcome = self._resolve_action_with_lock(record, allow_new_prepare=True)
-                if not isinstance(outcome, dict):
-                    raise TransferError("Recovered action returned an invalid result")
-                return outcome
-            self._control("deposit.action.resume", key)
-            try:
-                entry = store_procedure(record["procedure"])
-                arguments = bind_arguments(entry, tuple(record["arguments"]), namespace_id=self._namespace_id)
-                query, parameters = build_query(entry, arguments, self._token, portable=True)
-                row = self._client._single(query, parameters)
-                if tuple(row) != tuple(entry["columns"]):
-                    raise DepositError("INVALID_RESPONSE", f"{record['procedure']} returned unexpected columns")
-                result = _portable_input(row[entry["columns"][0]])
-                if not isinstance(result, dict):
-                    raise DepositError("INVALID_RESPONSE", f"{record['procedure']} returned no portable result")
-                return result
-            finally:
-                self._control("deposit.action.release")
-
-    def _resolve_action_locked(self, record: dict[str, Any], *, allow_new_prepare: bool) -> dict[str, Any]:
-        with self._journal.action_lock(record["key"]):
-            # Another process may have resolved or recorded a definitive
-            # failure after this caller enumerated the journal.
-            record = self._journal.load(self._identity, record["key"])
-            return self._resolve_action_with_lock(record, allow_new_prepare=allow_new_prepare)
-
-    def _resolve_action_with_lock(self, record: dict[str, Any], *, allow_new_prepare: bool) -> dict[str, Any]:
-        key = record["key"]
-        state = record["state"]
-        if state == "conflicted":
-            raise DepositError("REVISION_CONFLICT", "Pending action requires explicit refresh and reapplication")
-        if state == "failed":
-            raise _saved_failure_error(record["failure"])
-        if state == "failure_saved":
-            return self._finish_failed_action(record)
-
-        if state == "COMMITTED_RESULT_PENDING":
-            status = self._control("deposit.action.status", key)
-            if status.get("state") != "committed":
-                raise DepositError("RECOVERY_PENDING", "The committed import result receipt is temporarily unavailable")
-            return self._save_and_release(record, status)
-
-        if state in {"intent", "prepare_sent"}:
-            # Keep the freshly durable intent itself through the uncertain first
-            # remote call. A prepare_sent checkpoint is needed only when a prior
-            # interrupted request is being reconciled: no later local transition
-            # has yet bound the acknowledged operation to this action. The new
-            # intent is already sufficient for recovery to query the exact key.
-            if state == "prepare_sent":
-                self._journal.update(self._identity, key, state="prepare_sent")
-            if state == "intent" and allow_new_prepare:
-                # This newly created intent has not been prepared remotely here.
-                # Skip one status RPC; the encrypted intent remains durable first.
-                # Recovered `prepare_sent` itself still checks the authoritative
-                # Server receipt before any call can be considered resolved.
-                self._assert_preconditions_unchanged(record, allow_new_prepare)
-                prepared = self._control("deposit.action.prepare", key, record["procedure"], record["arguments"])
-            else:
-                try:
-                    status = self._control("deposit.action.status", key)
-                except DepositError as exc:
-                    if exc.code != "NOT_FOUND":
-                        raise
-                    self._assert_preconditions_unchanged(record, allow_new_prepare)
-                    prepared = self._control("deposit.action.prepare", key, record["procedure"], record["arguments"])
-                else:
-                    prepared = status
-            if prepared.get("state") == "committed":
-                return self._save_and_release(record, prepared)
-            self._journal.update(self._identity, key, state="prepared", operation_id=prepared.get("operationId"))
-            state = "prepared"
-
-        if state in {"prepared", "executing"}:
-            status = self._control("deposit.action.status", key)
-            if status.get("state") == "committed":
-                return self._save_and_release(record, status)
-            resumed = self._control("deposit.action.resume", key)
-            if resumed.get("state") == "committed":
-                return self._save_and_release(record, resumed)
-            # Reconciled execution is a distinct permitted transition. It may
-            # return a Server operation identity (including one chosen by the
-            # implementation), distinct from preparation; preserve it before
-            # actual remote work rather than assuming the initial ID is reused.
-            self._journal.update(self._identity, key, state="executing", operation_id=resumed.get("operationId"))
-            try:
-                result = self._execute_entity_action(record)
-            except DepositError as exc:
-                status = self._control("deposit.action.status", key)
-                if status.get("state") == "committed":
-                    return self._save_and_release(record, status)
-                if exc.code == "REVISION_CONFLICT":
-                    self._release_conflict(record)
-                    raise
-                if (status.get("state") == "prepared"
-                        and getattr(exc, "_server_reported", False) is True
-                        and exc.retryable is False
-                        and (exc.code in _DEFINITIVE_DOMAIN_FAILURE_CODES
-                             or (record["procedure"] in {"deposit.import.analyze", "deposit.import.apply"}
-                                 and exc.code in {"CANCELLED", "FORBIDDEN", "UNAUTHENTICATED", "PLAN_EXPIRED"}))):
-                    failed = self._journal.update(
-                        self._identity, key, state="failure_saved",
-                        failure={"code": exc.code, "message": exc.message, "details": exc.details,
-                                 "request_id": exc.request_id, "retryable": False},
-                    )
-                    return self._finish_failed_action(failed, status=status)
-                raise
-            return self._save_and_release(
-                record,
-                {"state": "committed", "operationId": resumed.get("operationId"), "outcome": result},
-                outcome_is_named_rows=record.get("result_format") == RESULT_FORMAT_NAMED_ROWS,
-            )
-
-        if state in {"outcome_saved", "release_sent"}:
-            status = self._control("deposit.action.status", key)
-            self._assert_bound_operation_id(current, status)
-            if status.get("state") not in {"prepared", "committed"}:
-                raise DepositError("RECOVERY_PENDING", "Prepared action is unavailable; the saved outcome remains protected")
-            resumed = self._control("deposit.action.resume", key)
-            self._assert_bound_operation_id(self._journal.load(self._identity, key), resumed)
-            self._journal.update(self._identity, key, state="release_sent")
-            self._control("deposit.action.release")
-            saved = self._journal.update(self._identity, key, state="released")
-            self._update_observed_revision()
-            self._invalidate_handles()
-            return saved["outcome"]
-
-        if state == "released":
-            return record["outcome"]
-        raise JournalError("Recovery journal state cannot be resumed")
-
-    def _finish_failed_action(self, record: dict[str, Any], *, status: dict[str, Any] | None = None):
-        """Reconcile and detach a known rollback without executing it again."""
-        key = record["key"]
-        status = status if status is not None else self._control("deposit.action.status", key)
-        self._assert_bound_operation_id(self._journal.load(self._identity, record["key"]), status)
-        if status.get("state") == "committed":
-            return self._save_and_release(record, status)
-        if status.get("state") != "prepared":
-            raise DepositError("RECOVERY_PENDING", "Failed action release remains unconfirmed")
-        resumed = self._control("deposit.action.resume", key)
-        self._assert_bound_operation_id(self._journal.load(self._identity, key), resumed)
-        if resumed.get("state") == "committed":
-            return self._save_and_release(record, resumed)
-        if resumed.get("state") != "prepared":
-            raise DepositError("RECOVERY_PENDING", "Failed action release remains unconfirmed")
-        self._control("deposit.action.release")
-        saved = self._journal.update(self._identity, key, state="failed")
-        raise _saved_failure_error(saved["failure"])
-
-    def _assert_bound_operation_id(self, record: dict[str, Any], observation: dict[str, Any]) -> None:
-        """Refuse to release under a contradictory Server operation identity.
-
-        A receipt that never bound an identity adopts the one proved by the
-        authoritative observation. A receipt that already bound one must see it
-        confirmed exactly: a different or withheld identity leaves the durable
-        failure untouched and pending instead of finalizing it.
-        """
-        bound = record.get("operation_id")
-        if bound is None or bound == "":
-            return
-        observed = observation.get("operationId")
-        if observed == bound:
-            return
-        raise DepositError("RECOVERY_PENDING", "Recovery observation contradicts the bound operation identity")
-
-    def _assert_preconditions_unchanged(self, record: dict[str, Any], allowed: bool) -> None:
-        if not allowed:
-            raise DepositError("RECOVERY_PENDING", "An absent prepared action cannot be recreated")
-        entry = store_procedure(record["procedure"])
-        # Operational preparations retain the same Store identity and exact
-        # inputs, but deliberately do not capture a Namespace revision on the
-        # server. Keep the observed revision as provenance; do not turn it into
-        # a client-side precondition for recreating this same prepared key.
-        if entry["scope"] == "operational":
-            self._validate_store_session()
-            return
-        self._update_observed_revision()
-        if self._observed_revision != record["snapshot_revision"]:
-            current = self._journal.load(self._identity, record["key"])
-            if current["state"] in {"intent", "prepare_sent"}:
-                self._journal.update(self._identity, record["key"], state="conflicted")
-            raise DepositError("REVISION_CONFLICT", "Namespace revision changed before the action was prepared")
-
-    def _execute_entity_action(self, record: dict[str, Any]) -> dict[str, Any]:
-        entry = store_procedure(record["procedure"])
-        arguments = bind_arguments(entry, tuple(record["arguments"]), namespace_id=self._namespace_id)
-        query, parameters = build_query(entry, arguments, self._token, portable=True)
-        row = self._client._single(query, parameters)
-        values = {}
-        for column in entry["columns"]:
-            value = row.get(column)
-            # Stage 2's narrow fake client returns the converted entity as data;
-            # real server calls return the manifest column name.
-            if column not in row and column in {"node", "rel"}:
-                value = row.get("data")
-            values[column] = value
-        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS:
-            return self._normalize_named_rows_result(
-                entry,
-                named_rows_result(tuple(entry["columns"]), [_portable_input(values)]),
-                outcome_is_named_rows=True,
-            )
-        if len(entry["columns"]) == 1 and entry["columns"][0] in {"node", "rel"}:
-            outcome = values[entry["columns"][0]]
-            if not isinstance(outcome, dict):
-                raise DepositError("INVALID_RESPONSE", "Mutation returned no portable entity")
-            if entry["scope"] == "namespace" and outcome.get("namespaceId") != self._namespace_id:
-                raise DepositError("INVALID_RESPONSE", "Mutation returned no portable entity in the bound Namespace")
-            return _portable_input(outcome)
-        if len(entry["columns"]) == 1:
-            return _portable_input(values[entry["columns"][0]])
-        return _portable_input(values)
-
-    def _normalize_named_rows_result(
-        self,
-        entry: dict[str, Any],
-        value: Any,
-        *,
-        outcome_is_named_rows: bool = False,
-    ) -> dict[str, Any]:
-        columns = tuple(entry["columns"])
-        if outcome_is_named_rows:
-            payload = value
-        elif len(columns) == 1:
-            payload = named_rows_result(columns, [{columns[0]: value}])
-        elif isinstance(value, dict) and set(value) == set(columns):
-            payload = named_rows_result(columns, [value])
-        else:
-            raise DepositError("INVALID_RESPONSE", "Prepared action has no portable named result")
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"columns", "rows"}
-            or not isinstance(payload["columns"], list)
-            or tuple(payload["columns"]) != columns
-            or not isinstance(payload["rows"], list)
-            or any(not isinstance(row, dict) or set(row) != set(columns) for row in payload["rows"])
-        ):
-            raise DepositError("INVALID_RESPONSE", "Prepared action has invalid named result rows")
-        if entry["scope"] == "namespace":
-            for row in payload["rows"]:
-                for column in ("node", "rel"):
-                    if column in row:
-                        entity = row[column]
-                        if not isinstance(entity, dict) or entity.get("namespaceId") != self._namespace_id:
-                            raise DepositError("SCOPE_MISMATCH", "Prepared result belongs to another Namespace")
-        return _portable_input(payload)
-
-    def _save_and_release(
-        self,
-        record: dict[str, Any],
-        status: dict[str, Any],
-        *,
-        outcome_is_named_rows: bool = False,
-    ) -> dict[str, Any]:
-        outcome = status.get("outcome")
-        if not isinstance(outcome, dict):
-            raise DepositError("INVALID_RESPONSE", "Prepared action has no saved portable outcome")
-        entry = store_procedure(record["procedure"])
-        if record.get("result_format") == RESULT_FORMAT_NAMED_ROWS:
-            outcome = self._normalize_named_rows_result(
-                entry,
-                outcome,
-                outcome_is_named_rows=outcome_is_named_rows,
-            )
-        elif record.get("result_format") == RESULT_FORMAT_IMPORT:
-            named = self._normalize_named_rows_result(
-                entry, outcome, outcome_is_named_rows=outcome_is_named_rows,
-            )
-            if (named["columns"] != ["data"] or len(named["rows"]) != 1
-                    or not isinstance(named["rows"][0].get("data"), dict)):
-                raise DepositError("INVALID_RESPONSE", "Prepared import action returned an invalid result")
-            outcome = named["rows"][0]["data"]
-            outcome = {k: v for k, v in outcome.items() if k not in {"leaseId", "leaseExpiresAt"}}
-            if not valid_import_result_envelope(outcome, leased=False):
-                raise DepositError("INVALID_RESPONSE", "Prepared import action returned an invalid envelope")
-            if (outcome["namespaceId"] != self._namespace_id
-                    or outcome["operationId"] != status.get("operationId")):
-                raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Import result does not match its committed action")
-            expected_kind = "analysis" if record["procedure"] in {
-                "deposit.import.analyze", "deposit.import.rows", "deposit.import.dataByPattern"
-            } else "apply"
-            if outcome["kind"] != expected_kind:
-                raise DepositError("INVALID_RESPONSE", "Import result kind does not match its action")
-        elif (
-            entry["scope"] == "namespace"
-            and len(entry["columns"]) == 1
-            and entry["columns"][0] in {"node", "rel"}
-        ):
-            if outcome.get("namespaceId") != self._namespace_id:
-                raise DepositError("SCOPE_MISMATCH", "Recovered outcome belongs to another Namespace")
-        else:
-            outcome = _portable_input(outcome)
-        key = record["key"]
-        # Status belongs to the actual durable recovery root, not necessarily
-        # the unbound intent passed by resume of an older caller.
-        current = self._journal.load(self._identity, key)
-        self._assert_bound_operation_id(current, status)
-        if (record.get("result_format") == RESULT_FORMAT_IMPORT
-                and current["state"] in {"outcome_saved", "release_sent", "released"}
-                and current["outcome"] != outcome):
-            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved import result changed during recovery")
-        if current["state"] not in {"outcome_saved", "release_sent", "released"}:
-            failure_changes = {"failure": None} if "failure" in current else {}
-            current = self._journal.update(
-                self._identity,
-                key,
-                state="outcome_saved",
-                outcome=_portable_input(outcome),
-                operation_id=status.get("operationId"),
-                **failure_changes,
-            )
-        # The caller may supply the originally unbound initial intent, while
-        # the authoritative protected root already contains its first prepared
-        # ID. Compare against the persisted record before any value overwrite.
-        persisted_operation_id = current.get("operation_id")
-        if persisted_operation_id is not None and status.get("operationId") is not None:
-            if status["operationId"] != persisted_operation_id:
-                raise DepositError("RECOVERY_PENDING", "Server committed identity differs from the durable receipt")
-        if current["state"] == "released":
-            if (current.get("operation_id") is not None and status.get("operationId") is not None
-                    and status["operationId"] != current["operation_id"]):
-                raise DepositError("RECOVERY_PENDING", "Server committed identity differs from the durable receipt")
-            return current["outcome"]
-        # A resumed Store must preserve the original bound operation identity,
-        # including the committed branch covered by ordinary result replay.
-        resumed = self._control("deposit.action.resume", key)
-        self._assert_bound_operation_id(current, resumed)
-        self._journal.update(self._identity, key, state="release_sent")
-        self._control("deposit.action.release")
-        saved = self._journal.update(self._identity, key, state="released")
-        self._update_observed_revision()
-        self._invalidate_handles()
-        return saved["outcome"]
-
-    def _validated_release_signal(self, record, status):
-        """Reject a mismatched actor-qualified result before write/release any more.
-
-        Root status for a prepared rollback and committed success must carry the
-        durable action identity. Ordinary supplied records are unbound intent;
-        existing protected snapshots carry the actual prepared operation.
-        """
-        bound = record.get("operation_id")
-        observed = status.get("operationId") if isinstance(status, dict) else None
-        if bound is not None and observed != bound:
-            raise DepositError("RECOVERY_PENDING", "Recovery observation contradicts the bound operation identity")
-
-    def _release_conflict(self, record: dict[str, Any]) -> None:
-        self._control("deposit.action.release")
-        current = self._journal.load(self._identity, record["key"])
-        if current["state"] in {"prepared", "executing", "prepare_sent"}:
-            self._journal.update(self._identity, record["key"], state="conflicted")
-
-    def _control(self, procedure: str, *arguments: Any) -> dict[str, Any]:
-        placeholders = ", ".join(f"$a{i}" for i in range(len(arguments)))
-        if placeholders:
-            placeholders += ", "
-        params = {f"a{i}": value for i, value in enumerate(arguments)}
-        params["token"] = self._token
-        column = "value" if procedure == "deposit.action.release" else "data"
-        query = f"CYPHER 25 CALL {procedure}({placeholders}$token) YIELD {column} RETURN {column}"
-        row = self._client._single(query, params)
-        value = row.get(column)
-        if procedure == "deposit.action.release":
-            if value is not True:
-                raise DepositError("RELEASE_UNCONFIRMED", "Prepared action release was not confirmed")
-            return {"released": True}
-        if not isinstance(value, dict):
-            raise DepositError("INVALID_RESPONSE", f"{procedure} returned no recovery state")
-        return value
 
     def _update_observed_revision(self) -> None:
         session = self._validate_store_session()
@@ -2918,7 +1849,7 @@ class Store:
         self._observed_revision = revision
 
     def _validate_store_session(self) -> dict[str, Any]:
-        session = self._client.get_session(self._token)
+        session = self._endpoint.call("deposit.get.session")
         user = session.get("user")
         if not isinstance(user, dict) or user.get("id") != self._actor_id:
             raise DepositError("IDENTITY_MISMATCH", "Store session actor changed")
@@ -2966,6 +1897,12 @@ def _pattern_id_selector(value: Mapping[str, Any]) -> dict[str, str]:
     if set(selector) != {"id"} or not isinstance(selector["id"], str) or not selector["id"]:
         raise TypeError("Pattern selector must contain only a nonempty 'id' string")
     return {"id": selector["id"]}
+
+
+def _import_rules(rules):
+    if rules is not None and not isinstance(rules, Mapping):
+        raise TypeError("rules must be a mapping")
+    return _portable_input(dict(rules or {}))
 
 
 def _freeze_import_rows(rows: Any) -> list[dict[str, Any]]:
@@ -3184,30 +2121,30 @@ def _portable_input(value: Any) -> Any:
         encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         return json.loads(encoded)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise TypeError("Stage 2 recovery accepts only losslessly JSON-portable values") from exc
+        raise TypeError("Procedure arguments must be losslessly JSON-portable") from exc
 
 
 def _validate_portable_value(value: Any) -> None:
-    """Reject values JSON would coerce or silently alter before journaling them."""
+    """Reject values JSON would coerce or silently alter before sending them."""
     if value is None or type(value) in {bool, int, str}:
         return
     if type(value) is float:
         if not math.isfinite(value):
-            raise TypeError("Stage 2 recovery accepts only losslessly JSON-portable values")
+            raise TypeError("Procedure arguments must be losslessly JSON-portable")
         return
     if isinstance(value, Mapping):
         if type(value) is not dict:
-            raise TypeError("Stage 2 recovery accepts only built-in JSON mappings")
+            raise TypeError("Procedure arguments require built-in JSON mappings")
         for key, item in value.items():
             if not isinstance(key, str):
-                raise TypeError("Stage 2 recovery requires string mapping keys")
+                raise TypeError("Procedure arguments require string mapping keys")
             _validate_portable_value(item)
         return
     if type(value) is list:
         for item in value:
             _validate_portable_value(item)
         return
-    raise TypeError("Stage 2 recovery accepts only losslessly JSON-portable values")
+    raise TypeError("Procedure arguments must be losslessly JSON-portable")
 
 
 def _session_already_unavailable(exc: Exception) -> bool:

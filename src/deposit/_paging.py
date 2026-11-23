@@ -244,13 +244,12 @@ class ImportResult(MappingABC):
     _FIELDS = ("format", "resultId", "leaseId", "leaseExpiresAt", "operationId", "kind",
                "state", "namespaceId", "planId", "revision", "expiresAt", "collections")
 
-    def __init__(self, request, envelope: dict[str, Any], *, plan_observation=None, action_key=None):
+    def __init__(self, request, envelope: dict[str, Any], *, plan_observation=None):
         if not valid_import_result_envelope(envelope):
             raise _invalid_result("Invalid import result envelope")
         if plan_observation is not None and not _valid_plan_observation(plan_observation, envelope):
             raise _invalid_result("Import plan observation does not match its immutable result")
         self._request = request
-        self._action_key = action_key
         immutable = dict(envelope)
         immutable["collections"] = MappingProxyType({
             key: MappingProxyType(dict(value)) for key, value in envelope["collections"].items()
@@ -265,8 +264,10 @@ class ImportResult(MappingABC):
             raise RuntimeError("ImportResult is closed")
 
     def _read(self, suffix, *arguments):
-        self._check_open()
-        return self._request("deposit.get.importResult" + suffix, self.result_id,
+        request = self._request
+        if request is None:
+            self._check_open()
+        return request("deposit.get.importResult" + suffix, self.result_id,
                              self._envelope["leaseId"], *arguments)
 
     def _entries(self, collection, count=None):
@@ -310,10 +311,6 @@ class ImportResult(MappingABC):
         return self._envelope["operationId"]
 
     @property
-    def action_key(self):
-        return self._action_key
-
-    @property
     def state(self):
         return self._envelope["state"]
 
@@ -354,6 +351,7 @@ class ImportResult(MappingABC):
     def close(self):
         """Close this view. The Server lease expires at its fixed deadline."""
         self._closed = True
+        self._request = None
 
     @property
     def closed(self):

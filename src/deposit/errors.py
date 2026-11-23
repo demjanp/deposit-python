@@ -20,13 +20,6 @@ class DepositError(Exception):
         super().__init__(f"{code}: {message}")
 
 
-def _saved_failure_error(failure: dict[str, Any]) -> DepositError:
-    error = DepositError(failure["code"], failure["message"], failure["details"], failure["request_id"])
-    error.retryable = False
-    error._server_reported = True
-    return error
-
-
 class CompatibilityError(DepositError):
     """The connected server is outside the package's tested support matrix."""
 
