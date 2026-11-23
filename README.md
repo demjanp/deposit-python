@@ -1,9 +1,7 @@
 # <img src="dep_cube.svg" width="32">Deposit Python
 
-Synchronous Python client for Deposit Server 2. The distribution and import are
-named `deposit`; the 2.x generation is distinct from Deposit 1.x and does not
-promise API compatibility. Applications that use both generations should use
-separate environments.
+Synchronous Python client for Deposit Server. The distribution and import are
+named `deposit`.
 
 This repository is part of the [Deposit Hub](https://github.com/demjanp/deposit-hub).
 
@@ -16,7 +14,7 @@ Deposit was created on 29. 4. 2013
 2. [Installation](#installation)
 3. [Resource and import workflows](#resource-and-import-workflows)
 4. [NetworkX graph conversion](#networkx-graph-conversion)
-5. [Compatibility and migration](#compatibility-and-migration)
+5. [Exchange results and operation cancellation](#exchange-results-and-operation-cancellation)
 6. [Contact](#contact)
 7. [Acknowledgements](#acknowledgements)
 8. [License](#license)
@@ -35,8 +33,8 @@ It serves as a backend for the following applications:
 
 ## Installation <a name="installation"></a>
 
-Install a locally built alpha wheel with `python -m pip install <wheel-path>`.
-After publication to PyPI, choose a 2.x release with:
+Install a locally built wheel with `python -m pip install <wheel-path>`.
+If installing from PyPI, use:
 
 ```
 pip install "deposit>=2,<3"
@@ -183,15 +181,9 @@ Graph conversion carries the current graph and resource metadata. Supply
 resource content through `resources` or `resource_source` when importing.
 The Server checks graph semantics and verifies bytes before analysis.
 
-## Compatibility and migration <a name="compatibility-and-migration"></a>
+## Exchange results and operation cancellation
 
-Deposit Python 2.x is a separate client generation from Deposit 1.x and does not
-promise API compatibility. There is no automatic 1.x-to-2.x migration; use
-separate environments when both generations are needed and migrate application
-code against the Deposit 2 client and Server contract.
-
-Deposit 2 alpha removes restart journals, transfer continuation, saved local
-import results and Python Exchange ZIP parsing. Pass ZIPs directly to
+Pass ZIPs directly to
 `store.import_exchange(...)`, use `ExchangeBundle` to inspect or save an
 export, and consume result mappings from the Server while their lease is valid.
 Keep a public operation ID if your application needs to inspect its outcome
