@@ -17,6 +17,7 @@ import weakref
 from typing import Any, Iterator
 import uuid
 
+from ._paging import ImportResult, _valid_plan_observation, valid_import_plan_wrapper, valid_import_result_envelope
 from ._recovery.identity import DeploymentIdentity
 from ._recovery.journal import (
     RESULT_FORMAT_IMPORT,
@@ -24,8 +25,6 @@ from ._recovery.journal import (
     JournalError,
     ProtectedJournal,
     UNRESOLVED_STATES,
-    valid_import_result_envelope,
-    valid_import_plan_wrapper,
 )
 from ._recovery.transfers import ProtectedTransferSpool, TransferError, TRANSFER_CHUNK_BYTES
 from ._gateway import (
@@ -819,7 +818,7 @@ class Store:
             result_format=RESULT_FORMAT_IMPORT,
         )
         result = self._import_result(key, envelope)
-        if result["kind"] == "diagnostic":
+        if result.state == "IMPORT_CONFLICT":
             self._raise_import_diagnostic(result)
         return result
 
@@ -928,7 +927,7 @@ class Store:
         envelope = self._run_action("deposit.import.rows", request, _recovery_key=key,
                                     result_format=RESULT_FORMAT_IMPORT)
         result = self._import_result(key, envelope)
-        if result["kind"] == "diagnostic":
+        if result.state == "IMPORT_CONFLICT":
             self._raise_import_diagnostic(result)
         return result
 
@@ -1092,7 +1091,7 @@ class Store:
                          action_keys=actions, analysis_arguments=request)
         envelope = self._workflow_action(key, "deposit.import.analyze", request, import_result=True)
         result = self._import_result(key, envelope)
-        if result["kind"] == "diagnostic":
+        if result.state == "IMPORT_CONFLICT":
             workflows.update(workflow_id, state="FAILED", phase="diagnostic", result_action_key=key,
                              failure="IMPORT_CONFLICT")
             self._cleanup_import_workflow(workflows, workflow_id)
@@ -1296,7 +1295,7 @@ class Store:
             workflows.update(workflow_id, state="ABANDON_PENDING", phase="abandon_waiting_for_plan_lease",
                              plan_expires_at=now + _IMPORT_PLAN_LEASE_MS, cleanup_status="pending")
         try:
-            wrapper = self._call_one("deposit.get.importPlan", record["plan_id"], not abandoning)
+            wrapper = self._call_one("deposit.get.importPlanMetadata", record["plan_id"])
         except DepositError as exc:
             if abandoning and exc.code == "PLAN_EXPIRED":
                 return "expired"
@@ -1320,11 +1319,12 @@ class Store:
             workflows.update(workflow_id, state="OUTCOME_UNCERTAIN", resume_state=previous,
                              phase="plan_unavailable", failure=exc.code, cleanup_status="pending")
             return "unavailable"
-        if not valid_import_plan_wrapper(wrapper, plan_id=record["plan_id"], namespace_id=self.namespace_id):
-            raise DepositError("INVALID_RESPONSE", "Import plan observation returned an invalid wrapper")
-        state = wrapper["plan"]["state"]
+        if (not _valid_plan_observation(wrapper) or wrapper["planId"] != record["plan_id"]
+                or wrapper["namespaceId"] != self.namespace_id):
+            raise DepositError("INVALID_RESPONSE", "Import plan observation returned invalid metadata")
+        state = wrapper["state"]
         if state == "ready":
-            deadline = wrapper["plan"]["expiresAt"]
+            deadline = wrapper["expiresAt"]
             if abandoning:
                 workflows.update(workflow_id, plan_expires_at=deadline, resume_state=None, failure=None)
             else:
@@ -1480,7 +1480,7 @@ class Store:
         envelope = self._run_action("deposit.import.analyze", request, _recovery_key=key,
                                     result_format=RESULT_FORMAT_IMPORT)
         result = self._import_result(key, envelope)
-        if result["kind"] == "diagnostic":
+        if result.state == "IMPORT_CONFLICT":
             self._raise_import_diagnostic(result)
         return result
 
@@ -1559,80 +1559,21 @@ class Store:
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("plan_id must be a nonempty string")
         self._client.require_paged_import_results()
-        wrapper = self._call_one("deposit.get.importPlan", plan_id, True)
+        wrapper = self._call_one("deposit.get.importPlan", plan_id)
         if not valid_import_plan_wrapper(wrapper, plan_id=plan_id, namespace_id=self._namespace_id):
             raise DepositError("INVALID_RESPONSE", "Import plan inspection returned an invalid wrapper")
-        plan_observation = wrapper["plan"]
-        envelope = wrapper["analysisResult"]
-        try:
-            key = self._journal.get_or_create_local_import_result(self._identity, envelope["resultId"])
-        except JournalError as exc:
-            raise DepositError("RESULT_RETRIEVAL_PENDING", "Plan inspection result reference is unavailable") from exc
+        return self._import_result(None, wrapper["analysisResult"], plan_observation=wrapper["plan"])
 
-        # A previously attached result is already protected locally. Reuse its
-        # immutable pages without another remote read, while refreshing only
-        # the separately observed lifecycle fields.
-        index_name = f"import-result-{key}-index"
-        if self._journal.storage.has_record(index_name):
-            try:
-                index = self._journal.read_import_index(key)
-                if index["envelope"] != envelope:
-                    raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved inspection result envelope changed")
-                self._journal.complete_local_import_result(self._identity, key, envelope, plan_observation)
-            except DepositError:
-                raise
-            except Exception as exc:
-                raise DepositError("RESULT_RETRIEVAL_PENDING", "Protected inspection result is unavailable") from exc
-            return self._import_result(key, envelope, plan_observation=plan_observation)
-
-        selected_identity = self._identity
-        selected_identity_data = selected_identity.to_dict()
-        selected_actor = self._actor_id
-        selected_namespace = self._namespace_id
-        selected_client = self._client
-        selected_result_id = envelope["resultId"]
-
-        def fetch_page(collection, cursor, limit):
-            if (self._identity != selected_identity or self._identity.to_dict() != selected_identity_data
-                    or self._actor_id != selected_actor or self._namespace_id != selected_namespace
-                    or self._client is not selected_client or self._closed or self._closing):
-                raise DepositError("STORE_SELECTION_CHANGED", "Import result reader is bound to its original Store selection")
-            return self._call_one("deposit.get.importResultPage", selected_result_id,
-                                  collection, cursor, limit)
-
-        def attach_result():
-            try:
-                self._journal.persist_import_result(selected_identity, key, envelope, fetch_page)
-                self._journal.complete_local_import_result(selected_identity, key, envelope, plan_observation)
-            except DepositError:
-                # Authorization and other server-reported denials must remain
-                # visible; wrapping them as a pending result would obscure the
-                # actor-only page boundary.
-                raise
-            except Exception as exc:
-                raise DepositError("RESULT_RETRIEVAL_PENDING", "Plan inspection result retrieval is incomplete") from exc
-
-        return self._import_result(key, envelope, plan_observation=plan_observation,
-                                   deferred_loader=attach_result)
-
-    def _import_result(self, action_key: str, envelope: Any, *, plan_observation=None, deferred_loader=None):
-        from ._paging import ImportResult
-
-        if not valid_import_result_envelope(envelope) or envelope["namespaceId"] != self._namespace_id:
+    def _import_result(self, action_key, envelope: Any, *, plan_observation=None):
+        if not isinstance(envelope, dict) or envelope.get("namespaceId") != self._namespace_id:
             raise DepositError("INVALID_RESPONSE", "Import action returned an invalid result envelope")
-        index_name = f"import-result-{action_key}-index"
-        if deferred_loader is not None and not self._journal.storage.has_record(index_name):
-            index = None
-        else:
-            try:
-                index = self._journal.read_import_index(action_key)
-            except JournalError as exc:
-                code = "RESULT_RETRIEVAL_PENDING" if deferred_loader is not None else "COMMITTED_RESULT_PENDING"
-                raise DepositError(code, "Import result backing is retained for retrieval") from exc
-        if index is not None and index["envelope"] != envelope:
-            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Local result index belongs to another committed result")
-        return ImportResult(self._journal, action_key, envelope, plan_observation=plan_observation,
-                            deferred_loader=deferred_loader)
+        return self._client._result_view(self._token, envelope, ImportResult,
+                                         action_key=action_key, plan_observation=plan_observation,
+                                         check_open=self._check_result_reader)
+
+    def _check_result_reader(self):
+        if self._closed or self._closing:
+            raise RuntimeError("Store is closed")
 
     def call(self, procedure: str, *arguments: Any) -> StoreResult:
         """Call an allowlisted namespace procedure using its manifest signature.
@@ -1668,7 +1609,7 @@ class Store:
                 outcome = self._resolve_action_locked(record, allow_new_prepare=True)
                 if result_format == RESULT_FORMAT_IMPORT:
                     result = self._import_result(record["key"], outcome)
-                    if result["kind"] == "diagnostic":
+                    if result.state == "IMPORT_CONFLICT":
                         self._raise_import_diagnostic(result)
                     return result
                 return detached_result(entry, outcome, self._token)
@@ -2868,18 +2809,19 @@ class Store:
                 entry, outcome, outcome_is_named_rows=outcome_is_named_rows,
             )
             if (named["columns"] != ["data"] or len(named["rows"]) != 1
-                    or not valid_import_result_envelope(named["rows"][0].get("data"))):
+                    or not isinstance(named["rows"][0].get("data"), dict)):
                 raise DepositError("INVALID_RESPONSE", "Prepared import action returned an invalid result")
             outcome = named["rows"][0]["data"]
+            outcome = {k: v for k, v in outcome.items() if k not in {"leaseId", "leaseExpiresAt"}}
+            if not valid_import_result_envelope(outcome, leased=False):
+                raise DepositError("INVALID_RESPONSE", "Prepared import action returned an invalid envelope")
             if (outcome["namespaceId"] != self._namespace_id
                     or outcome["operationId"] != status.get("operationId")):
                 raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Import result does not match its committed action")
             expected_kind = "analysis" if record["procedure"] in {
                 "deposit.import.analyze", "deposit.import.rows", "deposit.import.dataByPattern"
             } else "apply"
-            valid_kind = (outcome["kind"] in {"analysis", "diagnostic"}
-                          if expected_kind == "analysis" else outcome["kind"] == expected_kind)
-            if not valid_kind:
+            if outcome["kind"] != expected_kind:
                 raise DepositError("INVALID_RESPONSE", "Import result kind does not match its action")
         elif (
             entry["scope"] == "namespace"
@@ -2895,43 +2837,10 @@ class Store:
         # the unbound intent passed by resume of an older caller.
         current = self._journal.load(self._identity, key)
         self._assert_bound_operation_id(current, status)
-        if record.get("result_format") == RESULT_FORMAT_IMPORT:
-            bound_operation_id = current.get("operation_id")
-            if bound_operation_id is not None and status.get("operationId") is not None:
-                if bound_operation_id != status.get("operationId"):
-                    raise DepositError("RECOVERY_PENDING", "Committed import identity differs from the durable receipt")
-            if current["state"] in {"outcome_saved", "release_sent", "released"}:
-                if current["outcome"] != outcome:
-                    raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved import result changed during recovery")
-                try:
-                    self._journal.read_import_index(key)
-                except JournalError as exc:
-                    raise DepositError("COMMITTED_RESULT_PENDING", "Committed import result index is unavailable") from exc
-            else:
-                if current["state"] != "COMMITTED_RESULT_PENDING":
-                    current = self._journal.update(
-                        self._identity, key, state="COMMITTED_RESULT_PENDING",
-                        outcome=_portable_input(outcome), operation_id=status.get("operationId"),
-                    )
-                elif current["outcome"] != outcome or current["operation_id"] != status.get("operationId"):
-                    raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Committed import result changed during recovery")
-
-                def fetch_page(collection, cursor, limit):
-                    return self._call_one("deposit.get.importResultPage",
-                                          outcome["resultId"], collection, cursor, limit,
-                                          _already_serialized=True)
-
-                try:
-                    self._journal.persist_import_result(self._identity, key, outcome, fetch_page)
-                except Exception as exc:
-                    raise DepositError(
-                        "COMMITTED_RESULT_PENDING",
-                        "Import committed; protected result retrieval is pending and can be resumed",
-                    ) from exc
-                current = self._journal.update(
-                    self._identity, key, state="outcome_saved", outcome=_portable_input(outcome),
-                    operation_id=status.get("operationId"),
-                )
+        if (record.get("result_format") == RESULT_FORMAT_IMPORT
+                and current["state"] in {"outcome_saved", "release_sent", "released"}
+                and current["outcome"] != outcome):
+            raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved import result changed during recovery")
         if current["state"] not in {"outcome_saved", "release_sent", "released"}:
             failure_changes = {"failure": None} if "failure" in current else {}
             current = self._journal.update(

@@ -51,17 +51,8 @@ def recovered_operation(record: dict[str, Any], *, journal=None) -> RecoveredOpe
     result = record["outcome"]
     result_format = record.get("result_format")
     if result_format in {RESULT_FORMAT_IMPORT, RESULT_FORMAT_CLONE}:
-        if not valid_import_result_envelope(result) or journal is None:
-            raise ValueError("Recovered result is invalid or its protected index is unavailable")
-        index = journal.read_import_index(record["key"])
-        if index["envelope"] != result:
-            raise ValueError("Recovered result index belongs to another action")
-        if result_format == RESULT_FORMAT_CLONE:
-            from ._paging import CloneResult
-            result = CloneResult(journal, record["key"], result)
-        else:
-            from ._paging import ImportResult
-            result = ImportResult(journal, record["key"], result)
+        if not valid_import_result_envelope(result, leased=False):
+            raise ValueError("Recovered operation has an invalid result envelope")
     elif result_format is not None:
         if result_format != RESULT_FORMAT_NAMED_ROWS or not valid_named_rows_result(result):
             raise ValueError("Advanced recovered operation has an invalid named result")

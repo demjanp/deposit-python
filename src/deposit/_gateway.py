@@ -31,6 +31,9 @@ _CLIENT_GATEWAY_PROCEDURES = frozenset(
         "deposit.get.userPage",
         "deposit.get.namespace",
         "deposit.get.namespacePage",
+        "deposit.get.importResult",
+        "deposit.get.importResultPage",
+        "deposit.get.importResultEntry",
         "deposit.admin.pruneResourcesStatus",
         "deposit.utils.coordinatesToWKT",
         "deposit.utils.wktToCoordinates",
@@ -51,7 +54,7 @@ _CLONE_COORDINATOR_ACTIONS = frozenset({
     "deposit.import.abortCloneUpload",
 })
 _CLONE_COORDINATOR_CONTROLS = frozenset({
-    "deposit.utils.refresh", "deposit.action.prepare", "deposit.get.cloneResultPage",
+    "deposit.utils.refresh", "deposit.action.prepare",
 })
 
 
@@ -108,13 +111,9 @@ def clone_coordinator_procedure(name: str) -> dict[str, Any]:
     ):
         raise ValueError("procedure is not an allowlisted clone coordinator route")
     if name in _CLONE_COORDINATOR_CONTROLS:
-        owner = "Client" if name == "deposit.get.cloneResultPage" else "RecoveryCoordinator"
-        if entry.get("invocation_owner") != owner:
+        if entry.get("invocation_owner") != "RecoveryCoordinator":
             raise ValueError("clone coordinator control has an unexpected owner")
-        if name == "deposit.get.cloneResultPage":
-            if entry.get("mode") != "READ":
-                raise ValueError("clone result retrieval is registered as a write")
-        elif name != "deposit.utils.refresh" and entry.get("mode") != "WRITE":
+        if name != "deposit.utils.refresh" and entry.get("mode") != "WRITE":
             raise ValueError("clone recovery control has an unexpected persistence mode")
         elif name == "deposit.utils.refresh" and entry.get("mode") not in {"READ", "WRITE"}:
             raise ValueError("clone recovery refresh has an invalid mode")

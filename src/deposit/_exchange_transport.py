@@ -15,6 +15,7 @@ _INFO = "CYPHER 25 CALL deposit.get.info() YIELD data RETURN data"
 _ROUTES = frozenset({
     "deposit.action.begin", "deposit.action.cancel", "deposit.get.operation", "deposit.get.session",
     "deposit.import.analyze", "deposit.import.apply", "deposit.import.cloneNamespace",
+    "deposit.get.importResult",
     *(f"deposit.exchange.{name}" for name in (
         "export", "beginUpload", "uploadChunk", "finishUpload", "abortUpload",
         "inspect", "memberPage", "graphPage", "readChunk", "discard",
@@ -170,5 +171,19 @@ class ExchangeExecution:
                 raise OperationCommittedAfterCancel(operation_id, endpoint.scope, status) from failure
             if isinstance(status.get("result"), dict) and status.get("code") is None and procedure.startswith("deposit.exchange."):
                 return status["result"]
+            if procedure in {"deposit.import.analyze", "deposit.import.apply", "deposit.import.cloneNamespace"}:
+                summary = status.get("result")
+                if status.get("code") is None and isinstance(summary, dict) and isinstance(summary.get("resultId"), str):
+                    from ._paging import valid_import_result_envelope
+                    try:
+                        envelope = endpoint.call("deposit.get.importResult", summary["resultId"])
+                    except (DepositError, TransportError) as exc:
+                        code = exc.code if isinstance(exc, DepositError) and exc.code == "RESULT_EXPIRED" else "RESULT_UNAVAILABLE"
+                        raise DepositError(code, "The operation finished but its result cannot be read", status) from exc
+                    if (valid_import_result_envelope(envelope) and envelope["resultId"] == summary["resultId"]
+                            and envelope["operationId"] == operation_id and envelope["namespaceId"] == endpoint.scope):
+                        return envelope
+                code = status.get("code") or "RESULT_UNAVAILABLE"
+                raise DepositError(code, "The operation finished but its result cannot be read", status) from failure
             raise DepositError("COMMITTED_RESULT_UNAVAILABLE", "Inspect the committed Exchange operation", status) from failure
         raise OutcomeUnknown(operation_id, endpoint.scope) from failure

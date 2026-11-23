@@ -2793,18 +2793,33 @@
           "name": "planId",
           "type": "String",
           "binding": "planId"
-        },
-        {
-          "name": "renewLease",
-          "type": "Boolean",
-          "binding": "renewLease",
-          "default": true
         }
       ],
       "columns": [
         "data"
       ],
-      "mode": "WRITE",
+      "mode": "READ",
+      "scope": "namespace",
+      "requires_token": true,
+      "token_index": 1,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.get.importPlanMetadata",
+      "args": [
+        {
+          "name": "planId",
+          "type": "String",
+          "binding": "planId"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
       "scope": "namespace",
       "requires_token": true,
       "token_index": 1,
@@ -2826,13 +2841,13 @@
         "data"
       ],
       "mode": "READ",
-      "scope": "namespace",
+      "scope": "server",
       "requires_token": true,
       "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "Store"
+      "invocation_owner": "Client"
     },
     {
       "name": "deposit.get.importResultPage",
@@ -2841,6 +2856,11 @@
           "name": "resultId",
           "type": "String",
           "binding": "resultId"
+        },
+        {
+          "name": "leaseId",
+          "type": "String",
+          "binding": "leaseId"
         },
         {
           "name": "collection",
@@ -2862,13 +2882,13 @@
         "data"
       ],
       "mode": "READ",
-      "scope": "namespace",
+      "scope": "server",
       "requires_token": true,
-      "token_index": 4,
+      "token_index": 5,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "Store"
+      "invocation_owner": "Client"
     },
     {
       "name": "deposit.get.importResultEntry",
@@ -2877,6 +2897,11 @@
           "name": "resultId",
           "type": "String",
           "binding": "resultId"
+        },
+        {
+          "name": "leaseId",
+          "type": "String",
+          "binding": "leaseId"
         },
         {
           "name": "collection",
@@ -2893,13 +2918,13 @@
         "data"
       ],
       "mode": "READ",
-      "scope": "namespace",
+      "scope": "server",
       "requires_token": true,
-      "token_index": 3,
+      "token_index": 4,
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "Store"
+      "invocation_owner": "Client"
     },
     {
       "name": "deposit.import.apply",
@@ -3509,94 +3534,6 @@
       "action": true,
       "tracked": "always",
       "cancellable": true,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
-      "name": "deposit.get.cloneResult",
-      "args": [
-        {
-          "name": "resultId",
-          "type": "String",
-          "binding": "resultId"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "READ",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 1,
-      "action": false,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
-      "name": "deposit.get.cloneResultEntry",
-      "args": [
-        {
-          "name": "resultId",
-          "type": "String",
-          "binding": "resultId"
-        },
-        {
-          "name": "collection",
-          "type": "String",
-          "binding": "collection"
-        },
-        {
-          "name": "key",
-          "type": "String",
-          "binding": "key"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "READ",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 3,
-      "action": false,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
-      "name": "deposit.get.cloneResultPage",
-      "args": [
-        {
-          "name": "resultId",
-          "type": "String",
-          "binding": "resultId"
-        },
-        {
-          "name": "collection",
-          "type": "String",
-          "binding": "collection"
-        },
-        {
-          "name": "cursor",
-          "type": "Map<String,Object>",
-          "binding": "cursor"
-        },
-        {
-          "name": "limit",
-          "type": "Long",
-          "binding": "limit"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "READ",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 4,
-      "action": false,
       "admin": false,
       "batch_eligible": false,
       "invocation_owner": "Client"

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import threading
+import json
+import math
 from typing import Any, Iterator
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 from types import MappingProxyType
@@ -218,19 +219,37 @@ class EntityPageIterator:
         self.close()
 
 
+_MAX_SAFE_INTEGER = (1 << 63) - 1
+_PAGE_LIMIT = 256
+_PAGE_BYTES = 512 * 1024
+_ENTRY_BYTES = 32 * 1024
+_TEXT_BYTES = 16 * 1024
+
+
+def _nonnegative_long(value):
+    return type(value) is int and 0 <= value <= _MAX_SAFE_INTEGER
+
+
+def _encoded_size(value):
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _invalid_result(message):
+    return DepositError("INVALID_RESPONSE", message)
+
+
 class ImportResult(MappingABC):
-    """Immutable scalar import envelope with locally persisted lazy collections."""
+    """Immutable result envelope with collections read on demand from the Server."""
 
-    _FIELDS = ("format", "resultId", "operationId", "kind", "state", "namespaceId",
-               "planId", "revision", "expiresAt")
+    _FIELDS = ("format", "resultId", "leaseId", "leaseExpiresAt", "operationId", "kind",
+               "state", "namespaceId", "planId", "revision", "expiresAt", "collections")
 
-    def __init__(self, journal, action_key: str, envelope: dict[str, Any], *, plan_observation=None,
-                 deferred_loader=None):
-        if plan_observation is not None:
-            from ._recovery.journal import _valid_plan_observation
-            if not _valid_plan_observation(plan_observation, envelope):
-                raise DepositError("INVALID_RESPONSE", "Import plan observation does not match its immutable result")
-        self._journal = journal
+    def __init__(self, request, envelope: dict[str, Any], *, plan_observation=None, action_key=None):
+        if not valid_import_result_envelope(envelope):
+            raise _invalid_result("Invalid import result envelope")
+        if plan_observation is not None and not _valid_plan_observation(plan_observation, envelope):
+            raise _invalid_result("Import plan observation does not match its immutable result")
+        self._request = request
         self._action_key = action_key
         immutable = dict(envelope)
         immutable["collections"] = MappingProxyType({
@@ -240,27 +259,47 @@ class ImportResult(MappingABC):
         self._plan_observation = (None if plan_observation is None
                                   else MappingProxyType(dict(plan_observation)))
         self._closed = False
-        self._deferred_loader = deferred_loader
-        self._attachment_lock = threading.RLock()
-        self._pin_name = None
-        self._pin_lock = None
-        if deferred_loader is None:
-            self._attach_backing()
 
-    def _attach_backing(self):
-        if self._pin_name is None:
-            self._pin_name, self._pin_lock = self._journal.pin_import_result(self._action_key)
-
-    def _ensure_attached(self):
+    def _check_open(self):
         if self._closed:
             raise RuntimeError("ImportResult is closed")
-        with self._attachment_lock:
-            if self._pin_name is not None:
+
+    def _read(self, suffix, *arguments):
+        self._check_open()
+        return self._request("deposit.get.importResult" + suffix, self.result_id,
+                             self._envelope["leaseId"], *arguments)
+
+    def _entries(self, collection, count=None):
+        position = 0
+        cursor = None
+        while True:
+            page = self._read("Page", collection, cursor, _PAGE_LIMIT)
+            if (not isinstance(page, dict) or set(page) != {"resultId", "collection", "entries", "nextCursor"}
+                    or page["resultId"] != self.result_id or page["collection"] != collection
+                    or not isinstance(page["entries"], list) or len(page["entries"]) > _PAGE_LIMIT):
+                raise _invalid_result("Invalid import result page")
+            entries = page["entries"]
+            sizes = [_encoded_size(entry) for entry in entries]
+            if any(size > _ENTRY_BYTES for size in sizes) or sum(sizes) > _PAGE_BYTES:
+                raise _invalid_result("Import result page exceeds its byte bounds")
+            position += len(entries)
+            cursor = page["nextCursor"]
+            if cursor is not None and (
+                not isinstance(cursor, dict)
+                or set(cursor) != {"resultId", "leaseId", "collection", "position", "integrity"}
+                or cursor["resultId"] != self.result_id or cursor["leaseId"] != self._envelope["leaseId"]
+                or cursor["collection"] != collection or not _nonnegative_long(cursor["position"])
+                or cursor["position"] != position or not entries
+                or not isinstance(cursor["integrity"], str) or not cursor["integrity"]
+            ):
+                raise _invalid_result("Invalid import result cursor")
+            if count is not None and (position > count or (cursor is None) != (position == count)):
+                raise _invalid_result("Import result collection count differs from its descriptor")
+            for entry in entries:
+                self._check_open()
+                yield entry
+            if cursor is None:
                 return
-            if self._deferred_loader is not None:
-                self._deferred_loader()
-                self._deferred_loader = None
-            self._attach_backing()
 
     @property
     def result_id(self):
@@ -303,8 +342,7 @@ class ImportResult(MappingABC):
         descriptor = self._envelope["collections"].get(key)
         if descriptor is None:
             raise KeyError(key)
-        self._ensure_attached()
-        return _lazy_collection(self._journal, self._action_key, key, descriptor["kind"], descriptor["count"], self)
+        return _lazy_collection(key, descriptor["kind"], descriptor["count"], self)
 
     def __iter__(self):
         plan = ("plan",) if self._plan_observation is not None else ()
@@ -314,12 +352,8 @@ class ImportResult(MappingABC):
         return len(self._FIELDS) + (self._plan_observation is not None) + len(self._envelope["collections"])
 
     def close(self):
-        """Release this reader; protected result segments remain retained."""
-        with self._attachment_lock:
-            if not self._closed:
-                self._closed = True
-                if self._pin_name is not None:
-                    self._journal.release_import_result_pin(self._pin_name, self._pin_lock)
+        """Close this view. The Server lease expires at its fixed deadline."""
+        self._closed = True
 
     @property
     def closed(self):
@@ -354,41 +388,31 @@ class CloneResult(ImportResult):
         return self["resourceMapping"]
 
 
-def _lazy_collection(journal, action_key, collection, kind, count, owner):
+def _lazy_collection(collection, kind, count, owner):
     if kind == "mapping":
-        return LazyResultMapping(journal, action_key, collection, count, owner)
-    return LazyResultSequence(journal, action_key, collection, count, owner)
+        return LazyResultMapping(collection, count, owner)
+    return LazyResultSequence(collection, count, owner)
 
 
 class _LazyResultBase:
-    def __init__(self, journal, action_key, collection, count, owner):
-        self._journal = journal
-        self._action_key = action_key
+    def __init__(self, collection, count, owner):
         self._collection = collection
         self._count = count
         self._owner = owner
 
-    def _check_open(self):
-        if self._owner.closed:
-            raise RuntimeError("ImportResult is closed")
-
     def _entries(self):
-        self._check_open()
-        meta = self._journal.read_import_collection_meta(self._action_key, self._collection)
-        for page_index in range(meta["pageCount"]):
-            response = self._journal.read_import_page(self._action_key, self._collection, page_index)["response"]
-            yield from response["entries"]
+        return self._owner._entries(self._collection, self._count)
 
 
 class LazyResultSequence(_LazyResultBase, SequenceABC):
-    """Indexable, bounded-page sequence backed by protected local segments."""
+    """Indexable, bounded-page sequence backed by remote pages."""
 
     def __len__(self):
         return self._count
 
     def __iter__(self):
         for descriptor in self._entries():
-            yield _decode_import_value(descriptor, self)
+            yield _decode_import_value(descriptor, self._owner)
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -416,7 +440,10 @@ class LazyResultMapping(_LazyResultBase, MappingABC):
                 key, value = entry["key"], entry["value"]
             else:
                 raise DepositError("INVALID_RESPONSE", "Import mapping entry is invalid")
-            yield _decode_import_value(key, self), _decode_import_value(value, self)
+            decoded_key = _decode_import_value(key, self._owner)
+            if not isinstance(decoded_key, (str, LazyText)):
+                raise _invalid_result("Invalid import mapping key")
+            yield decoded_key, _decode_import_value(value, self._owner)
 
     def __iter__(self):
         for key, _value in self._pairs():
@@ -426,33 +453,51 @@ class LazyResultMapping(_LazyResultBase, MappingABC):
         return self._pairs()
 
     def __getitem__(self, key):
+        if isinstance(key, str) and len(key.encode("utf-8")) <= _TEXT_BYTES:
+            response = self._owner._read("Entry", self._collection, key)
+            if (not isinstance(response, dict) or type(response.get("found")) is not bool
+                    or response.get("resultId") != self._owner.result_id
+                    or response.get("collection") != self._collection):
+                raise _invalid_result("Invalid import mapping lookup")
+            fields = {"resultId", "collection", "found"}
+            if response["found"] and set(response) == fields | {"value"}:
+                if _encoded_size(response["value"]) > _ENTRY_BYTES:
+                    raise _invalid_result("Import mapping lookup exceeds its byte bound")
+                return _decode_import_value(response["value"], self._owner)
+            if not response["found"] and set(response) == fields:
+                raise KeyError(key)
+            raise _invalid_result("Invalid import mapping lookup")
         for actual_key, value in self._pairs():
             if actual_key == key:
                 return value
         raise KeyError(key)
 
 
-def _decode_import_value(descriptor: Any, parent: _LazyResultBase):
+def _decode_import_value(descriptor: Any, owner: ImportResult):
     if not isinstance(descriptor, dict) or not isinstance(descriptor.get("type"), str):
-        raise DepositError("INVALID_RESPONSE", "Import result descriptor is invalid")
+        raise _invalid_result("Invalid import result descriptor")
     kind = descriptor["type"]
     if kind == "scalar" and set(descriptor) == {"type", "value"}:
-        return descriptor["value"]
-    if kind in {"mapping", "sequence"} and set(descriptor) == {"type", "collection", "count"}:
-        return _lazy_collection(parent._journal, parent._action_key, descriptor["collection"],
-                                kind, descriptor["count"], parent._owner)
-    if kind == "text" and set(descriptor) == {"type", "collection", "bytes"}:
-        return LazyText(parent._journal, parent._action_key, descriptor["collection"],
-                        descriptor["bytes"], parent._owner)
-    raise DepositError("INVALID_RESPONSE", "Import result descriptor type is unsupported")
+        value = descriptor["value"]
+        if (value is None or isinstance(value, (str, bool))
+                or type(value) is int and -_MAX_SAFE_INTEGER - 1 <= value <= _MAX_SAFE_INTEGER
+                or type(value) is float and math.isfinite(value)):
+            return value
+    collection = descriptor.get("collection")
+    if isinstance(collection, str) and 0 < len(collection) <= 512:
+        if (kind in {"mapping", "sequence"} and set(descriptor) == {"type", "collection", "count"}
+                and _nonnegative_long(descriptor["count"])):
+            return _lazy_collection(collection, kind, descriptor["count"], owner)
+        if (kind == "text" and set(descriptor) == {"type", "collection", "bytes"}
+                and _nonnegative_long(descriptor["bytes"])):
+            return LazyText(collection, descriptor["bytes"], owner)
+    raise _invalid_result("Invalid import result descriptor")
 
 
 class LazyText:
     """Chunk-readable UTF-8 text that never joins the complete value implicitly."""
 
-    def __init__(self, journal, action_key, collection, byte_count, owner):
-        self._journal = journal
-        self._action_key = action_key
+    def __init__(self, collection, byte_count, owner):
         self._collection = collection
         self._byte_count = byte_count
         self._owner = owner
@@ -463,18 +508,18 @@ class LazyText:
         return self._byte_count
 
     def iter_chunks(self) -> Iterator[str]:
-        if self._owner.closed:
-            raise RuntimeError("ImportResult is closed")
-        meta = self._journal.read_import_collection_meta(self._action_key, self._collection)
-        if meta["kind"] != "text" or meta["textBytes"] != self._byte_count:
-            raise DepositError("INVALID_RESPONSE", "Import text descriptor disagrees with its local index")
-        for page_index in range(meta["pageCount"]):
-            page = self._journal.read_import_page(self._action_key, self._collection, page_index)["response"]
-            for chunk in page["entries"]:
-                if (not isinstance(chunk, dict) or set(chunk) != {"type", "value"}
-                        or chunk.get("type") != "scalar" or not isinstance(chunk.get("value"), str)):
-                    raise DepositError("INVALID_RESPONSE", "Import text chunk is invalid")
-                yield chunk["value"]
+        total = 0
+        for descriptor in self._owner._entries(self._collection):
+            value = _decode_import_value(descriptor, self._owner)
+            if not isinstance(value, str):
+                raise _invalid_result("Invalid import text chunk")
+            size = len(value.encode("utf-8"))
+            total += size
+            if not 0 < size <= _TEXT_BYTES or total > self._byte_count:
+                raise _invalid_result("Import text exceeds its descriptor bounds")
+            yield value
+        if total != self._byte_count:
+            raise _invalid_result("Import text length differs from its descriptor")
 
     def read(self, size: int) -> str:
         if type(size) is not int or size < 0:
@@ -515,3 +560,84 @@ class LazyText:
                 return False
             offset += len(chunk)
         return offset == len(other)
+
+
+def valid_import_result_envelope(value: Any, *, leased: bool = True) -> bool:
+    fields = {
+        "format", "resultId", "operationId", "kind", "state", "namespaceId",
+        "planId", "revision", "expiresAt", "collections",
+    }
+    if leased:
+        fields.update({"leaseId", "leaseExpiresAt"})
+    if not isinstance(value, dict) or set(value) != fields:
+        return False
+    if leased and (not isinstance(value["leaseId"], str) or not 0 < len(value["leaseId"]) <= 2048
+                   or not _nonnegative_long(value["leaseExpiresAt"])):
+        return False
+    if (value["format"] != "deposit.import-result"
+            or not isinstance(value["resultId"], str) or not value["resultId"]
+            or (not isinstance(value["operationId"], str) or not value["operationId"])
+            or not isinstance(value["kind"], str) or value["kind"] not in {"analysis", "apply", "clone"}
+            or not isinstance(value["state"], str) or not value["state"]
+            or not isinstance(value["namespaceId"], str) or not value["namespaceId"]
+            or (value["planId"] is not None and not isinstance(value["planId"], str))
+            or type(value["revision"]) is not int or not 0 <= value["revision"] <= _MAX_SAFE_INTEGER
+            or type(value["expiresAt"]) is not int or not 0 <= value["expiresAt"] <= _MAX_SAFE_INTEGER
+            or not isinstance(value["collections"], dict)):
+        return False
+    if value["kind"] == "apply" and value["state"] != "APPLIED":
+        return False
+    if value["kind"] == "analysis" and (value["state"], value["planId"] is not None) not in {
+        ("PLAN_READY", True), ("IMPORT_CONFLICT", False),
+    }:
+        return False
+    if value["kind"] == "clone" and (
+        value["state"] != "COMMITTED" or value["planId"] is not None
+        or set(value["collections"]) != {"mapping", "identityMappings", "resourceMapping", "metadata"}
+        or any(not isinstance(value["collections"].get(key), dict)
+               for key in value["collections"])
+        or any(value["collections"][key].get("kind") != "mapping"
+               for key in value["collections"])
+    ):
+        return False
+    for name, descriptor in value["collections"].items():
+        if (not isinstance(name, str) or not name or len(name) > 256
+                or name in fields or name in {"plan", "leaseId", "leaseExpiresAt"}
+                or not isinstance(descriptor, dict) or set(descriptor) != {"kind", "count"}
+                or not isinstance(descriptor["kind"], str) or descriptor["kind"] not in {"sequence", "mapping"}
+                or type(descriptor["count"]) is not int
+                or not 0 <= descriptor["count"] <= _MAX_SAFE_INTEGER):
+            return False
+    return True
+
+
+def _valid_plan_observation(value: Any, envelope: dict[str, Any] | None = None) -> bool:
+    if (not isinstance(value, dict)
+            or set(value) != {"planId", "namespaceId", "state", "targetRevision", "expiresAt"}
+            or not isinstance(value["planId"], str) or not value["planId"]
+            or not isinstance(value["namespaceId"], str) or not value["namespaceId"]
+            or not isinstance(value["state"], str) or value["state"] not in {"ready", "applied", "cancelled", "expired"}
+            or type(value["targetRevision"]) is not int
+            or not 0 <= value["targetRevision"] <= _MAX_SAFE_INTEGER
+            or type(value["expiresAt"]) is not int or not 0 <= value["expiresAt"] <= _MAX_SAFE_INTEGER):
+        return False
+    return (envelope is None or (value["planId"] == envelope["planId"]
+                                 and value["namespaceId"] == envelope["namespaceId"]
+                                 and value["targetRevision"] == envelope["revision"]))
+
+
+def valid_import_plan_wrapper(value: Any, *, plan_id: str | None = None,
+                              namespace_id: str | None = None) -> bool:
+    if (not isinstance(value, dict) or set(value) != {"plan", "analysisResult"}
+            or not valid_import_result_envelope(value.get("analysisResult"))
+            or not _valid_plan_observation(value.get("plan"), value["analysisResult"])):
+        return False
+    envelope, plan = value["analysisResult"], value["plan"]
+    if (envelope["kind"] != "analysis" or envelope["state"] != "PLAN_READY"
+            or envelope["revision"] != plan["targetRevision"]):
+        return False
+    if plan_id is not None and plan["planId"] != plan_id:
+        return False
+    if namespace_id is not None and plan["namespaceId"] != namespace_id:
+        return False
+    return True

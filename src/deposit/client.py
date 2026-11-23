@@ -179,6 +179,35 @@ class Client:
             raise DepositError("INVALID_RESPONSE", f"{procedure} returned no data result")
         return record["data"]
 
+    def _result_request(self, token, procedure, *arguments):
+        entry = client_procedure(procedure)
+        bound = bind_client_arguments(entry, arguments)
+        query, parameters = build_query(entry, bound, token)
+        return self._single(query, parameters).get("data")
+
+    def _result_view(self, token, envelope, result_type, *, action_key=None,
+                     plan_observation=None, check_open=None):
+        from ._paging import valid_import_result_envelope
+
+        def request(procedure, *arguments):
+            if self._closed:
+                raise RuntimeError("Client is closed")
+            if check_open is not None:
+                check_open()
+            try:
+                return self._result_request(token, procedure, *arguments)
+            except TransportError as exc:
+                raise DepositError("RESULT_UNAVAILABLE", "Could not reach the Server for the result",
+                                   {"operationId": envelope["operationId"], "resultId": envelope["resultId"]}) from exc
+
+        if valid_import_result_envelope(envelope, leased=False):
+            acquired = request("deposit.get.importResult", envelope["resultId"])
+            if (not valid_import_result_envelope(acquired)
+                    or any(acquired[key] != value for key, value in envelope.items())):
+                raise DepositError("INVALID_RESPONSE", "Result lease does not match its immutable envelope")
+            envelope = acquired
+        return result_type(request, envelope, action_key=action_key, plan_observation=plan_observation)
+
     def _invoke_client_procedure(self, procedure: str, token: str, *arguments: Any) -> Any:
         entry = client_procedure(procedure)
         bound = bind_client_arguments(entry, arguments)
@@ -531,7 +560,7 @@ class Client:
                 raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone workflow result is unavailable or changed")
             self._cleanup_clone_transfer(workflows, workflow_id, journal, identity)
             from ._paging import CloneResult
-            return CloneResult(journal, record["clone_action_key"], outcome)
+            return self._result_view(token, outcome, CloneResult, action_key=record["clone_action_key"])
         if record["state"] == "SOURCE_REQUIRED":
             raise DepositError("CLONE_SOURCE_REQUIRED", "Supply a complete package to resume the interrupted freeze")
         if record["state"] == "FAILED":
@@ -662,7 +691,7 @@ class Client:
         self._cleanup_clone_transfer(workflows, workflow_id, journal,
                                      DeploymentIdentity.from_dict(workflows.get(workflow_id)["identity"]))
         self._recovery_journals.update({item["public_id"]: journal for item in journal.records_all()})
-        return CloneResult(journal, clone_key, outcome)
+        return self._result_view(token, outcome, CloneResult, action_key=clone_key)
 
     @staticmethod
     def _cleanup_clone_transfer(workflows, workflow_id, journal, identity):
@@ -823,26 +852,13 @@ class Client:
                 if not isinstance(outcome, dict):
                     raise DepositError("INVALID_RESPONSE", "Prepared server action returned no saved result")
                 if result_format == RESULT_FORMAT_CLONE:
-                    from ._recovery.journal import valid_import_result_envelope
-                    if (not valid_import_result_envelope(outcome) or outcome.get("kind") != "clone"
+                    from ._paging import valid_import_result_envelope
+                    outcome = {k: v for k, v in outcome.items() if k not in {"leaseId", "leaseExpiresAt"}}
+                    if (not valid_import_result_envelope(outcome, leased=False) or outcome.get("kind") != "clone"
                             or outcome.get("operationId") != operation_id):
                         raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone result does not match its committed action")
-                    if current["state"] != "COMMITTED_RESULT_PENDING":
-                        journal.update(identity, key, state="COMMITTED_RESULT_PENDING", outcome=outcome,
-                                       operation_id=operation_id)
-                    try:
-                        journal.persist_import_result(
-                            identity, key, outcome,
-                            lambda collection, cursor, limit: self._invoke_coordinated_server_procedure(
-                                "deposit.get.cloneResultPage", token, outcome["resultId"], collection, cursor, limit
-                            ),
-                        )
-                    except BaseException as exc:
-                        raise DepositError("COMMITTED_RESULT_PENDING", "Clone committed, but its receipt-bound mappings are not fully saved") from exc
-                    journal.update(identity, key, state="outcome_saved")
-                else:
-                    journal.update(identity, key, state="outcome_saved", outcome=outcome,
-                                   operation_id=operation_id)
+                journal.update(identity, key, state="outcome_saved", outcome=outcome,
+                               operation_id=operation_id)
             # Release detaches whichever action is currently on this session.
             # A lost release reply may have left a different key attached since
             # this journal entered release_sent, so bind this key every time.
@@ -1257,7 +1273,7 @@ class Client:
             if envelope is not None and name in {"analysis", "apply"}:
                 result = target._import_result(key, envelope)
                 try:
-                    if name == "analysis" and result["kind"] != "diagnostic":
+                    if name == "analysis" and result.state != "IMPORT_CONFLICT":
                         workflows.update(workflow_id, plan_id=result.plan_id, result_action_key=key,
                                          plan_expires_at=(workflows.get(workflow_id)["plan_expires_at"]
                                              if workflows.get(workflow_id)["plan_expires_at"] is not None else result["expiresAt"]))
@@ -1503,7 +1519,8 @@ class Client:
             return recovered_operation(released, journal=journal)
 
     def _recover_server_clone(self, journal, identity, record, token):
-        from ._recovery.journal import RESULT_FORMAT_CLONE, valid_import_result_envelope
+        from ._recovery.journal import RESULT_FORMAT_CLONE
+        from ._paging import valid_import_result_envelope
         self.require_clone_capabilities()
         with journal.action_lock(record["key"]):
             current = journal.load(identity, record["key"])
@@ -1537,20 +1554,14 @@ class Client:
                 envelope = self._invoke_coordinated_server_procedure(current["procedure"], token, *current["arguments"])
             else:
                 raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Release-sent clone result has no protected outcome")
-            if (not valid_import_result_envelope(envelope) or envelope.get("kind") != "clone"
+            if isinstance(envelope, dict):
+                envelope = {k: v for k, v in envelope.items() if k not in {"leaseId", "leaseExpiresAt"}}
+            if (not valid_import_result_envelope(envelope, leased=False) or envelope.get("kind") != "clone"
                     or envelope.get("operationId") != operation_id):
                 raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone result does not match its committed action")
-            if current["state"] not in {"outcome_saved", "release_sent", "COMMITTED_RESULT_PENDING"}:
-                current = journal.update(identity, current["key"], state="COMMITTED_RESULT_PENDING", outcome=envelope,
-                                        operation_id=operation_id)
-            journal.persist_import_result(
-                identity, current["key"], envelope,
-                lambda collection, cursor, limit: self._invoke_coordinated_server_procedure(
-                    "deposit.get.cloneResultPage", token, envelope["resultId"], collection, cursor, limit
-                ),
-            )
             if current["state"] != "outcome_saved":
-                current = journal.update(identity, current["key"], state="outcome_saved")
+                journal.update(identity, current["key"], state="outcome_saved", outcome=envelope,
+                               operation_id=operation_id)
             self._recovery_control("deposit.action.resume", current["key"], token)
             current = journal.update(identity, current["key"], state="release_sent")
             release = self._single("CYPHER 25 CALL deposit.action.release($token) YIELD value RETURN value",
