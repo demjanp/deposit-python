@@ -53,7 +53,7 @@ def upload_resource(endpoint, resource):
                 for block in chunks:
                     next_offset = offset + len(block)
                     acknowledgement = execution.run("deposit.resource.uploadChunk", upload_id, offset,
-                                                    b64encode(block).decode("ascii"), sha256(block).hexdigest())
+                                                    b64encode(block).decode("ascii"))
                     if acknowledgement.get("nextOffset") != next_offset:
                         raise TransferError("Server did not confirm the resource chunk")
                     offset = next_offset

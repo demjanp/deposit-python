@@ -78,7 +78,8 @@ For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/depo
 ## Resource and import workflows
 
 Use an open Store to upload a local file or a caller-owned binary stream. The
-Server verifies the complete size and checksum before publishing it. A borrowed
+Server verifies the complete size and SHA-256 before publishing it. Upload
+chunks carry an offset and bytes. A borrowed
 stream is read from its current position into a protected temporary buffer
 that is removed when the attempt ends.
 

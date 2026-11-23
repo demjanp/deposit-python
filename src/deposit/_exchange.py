@@ -329,8 +329,7 @@ def _upload(execution, upload, member, blocks):
 
 
 def _chunk(execution, upload, member, offset, block):
-    result = execution.run("deposit.exchange.uploadChunk", upload, member, offset,
-                           b64encode(block).decode("ascii"), sha256(block).hexdigest())
+    result = execution.run("deposit.exchange.uploadChunk", upload, member, offset, b64encode(block).decode("ascii"))
     if (result.get("uploadId"), result.get("member"), result.get("nextOffset")) != (upload, member, offset + len(block)):
         raise _invalid("Exchange upload acknowledgement differs")
 
