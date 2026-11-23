@@ -23,6 +23,7 @@ import sys
 import uuid
 import zlib
 
+from ._exchange import ExchangeBundle
 from ._imports import MANIFEST_FIELDS
 from ._recovery.storage import ExchangeStagingOwner, ProtectedStore
 
@@ -595,7 +596,7 @@ class _ExchangeContentReader:
         self.close()
 
 
-class ExchangeBundle:
+class _LegacyExchangeBundle:
     """Lazy validated frozen archive; Stores and caller input streams are borrowed."""
 
     def __init__(self, source_store, export_result, *, workflow_id=None):

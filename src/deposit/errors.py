@@ -39,3 +39,30 @@ class CompatibilityError(DepositError):
 
 class TransportError(Exception):
     """A Neo4j driver or transport failure, kept distinct from server errors."""
+
+
+class DepositCancelled(DepositError):
+    """The Server established cancelled rollback."""
+
+    def __init__(self, operation_id: str, scope: str):
+        self.operation_id = operation_id
+        self.scope = scope
+        super().__init__("CANCELLED_ROLLED_BACK", "The operation was cancelled and rolled back")
+
+
+class OperationCommittedAfterCancel(DepositError):
+    """The Server recorded completion before cancellation took effect."""
+
+    def __init__(self, operation_id: str, scope: str, status: dict):
+        self.operation_id = operation_id
+        self.scope = scope
+        super().__init__("OPERATION_COMMITTED", "The operation completed before cancellation", status)
+
+
+class OutcomeUnknown(DepositError):
+    """The original attempt requires further inspection."""
+
+    def __init__(self, operation_id: str, scope: str):
+        self.operation_id = operation_id
+        self.scope = scope
+        super().__init__("OUTCOME_UNKNOWN", "Inspect the original operation before starting a new attempt")

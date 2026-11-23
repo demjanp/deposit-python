@@ -233,13 +233,18 @@ class Client:
             raise DepositError("INVALID_RESPONSE", f"{procedure} returned no {column} result")
         return record[column]
 
+    @staticmethod
+    def new_operation_id() -> str:
+        """Create a fresh public operation identity."""
+        return str(uuid.uuid7())
+
     def get_operation(self, token: str, operation_id: str, *, scope: str = "server") -> Any:
-        """Inspect a server operation without changing session selection."""
-        if not isinstance(scope, str) or scope not in {"server", "namespace"}:
-            raise ValueError("scope must be 'server' or 'namespace'")
-        if not isinstance(operation_id, str) or not operation_id:
-            raise ValueError("operation_id must be a nonempty string")
+        """Inspect an operation under its original explicit scope."""
         return self._invoke_recovery_read("deposit.get.operation", token, operation_id, scope)
+
+    def cancel_operation(self, token: str, operation_id: str, *, scope: str = "server") -> Any:
+        """Request cancellation and return the Server's authoritative state."""
+        return self._invoke_client_procedure("deposit.action.cancel", token, operation_id, scope)
 
     def get_last_operation(self, token: str) -> Any:
         """Return the last operation observed by this authenticated session."""
@@ -1010,7 +1015,7 @@ class Client:
     def resume_import(self, workflow, *, target_store, source_store=None):
         """Resume exact frozen work; PLAN_READY remains an explicit apply barrier."""
         from ._import_workflows import ImportWorkflow, ImportWorkflowStore
-        from .exchange import ExchangeBundle
+        from .exchange import _LegacyExchangeBundle
         if not isinstance(workflow, ImportWorkflow):
             raise TypeError("workflow must be an ImportWorkflow reference")
         if getattr(target_store, "_client", None) is not self:
@@ -1035,7 +1040,7 @@ class Client:
                     return workflows.status(workflow.id, result=result)
                 if state in {"TARGET_PACKAGE_READY", "ANALYSIS_REQUESTED"}:
                     if record["routing_decision"] == "same_server_actor_grant" and source_store is not None:
-                        with ExchangeBundle(source_store, record["source_export_result"], workflow_id=workflow.id) as bundle:
+                        with _LegacyExchangeBundle(source_store, record["source_export_result"], workflow_id=workflow.id) as bundle:
                             bundle._stage_id = record["source_stage_id"] or bundle._stage_id
                             result = target_store._analyze_import_bundle(bundle, record["frozen_rules"], workflows,
                                                                        workflows.reference(record))
@@ -1077,7 +1082,7 @@ class Client:
                                                                      record["source_export_arguments"])
                         workflows.update(workflow.id, state="SOURCE_REFERENCE_READY", phase="source_reference_ready",
                                          source_export_result=export_result)
-                    with ExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
+                    with _LegacyExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
                         bundle._stage_id = record["source_stage_id"] or bundle._stage_id
                         result = target_store._import_exchange_workflow(bundle, record["frozen_rules"], workflows,
                                                                        workflows.reference(record))

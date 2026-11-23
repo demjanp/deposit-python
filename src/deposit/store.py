@@ -952,25 +952,40 @@ class Store:
             rules=rules, require_subgraph=False,
         )
 
-    def export_exchange(self, *, roots=None, max_hops=None, root_class_boundary=True):
-        """Prepare a checked Exchange export and return its owning bundle."""
+    def export_exchange(self, *, roots=None, max_hops=None, root_class_boundary=True,
+                        operation_id=None):
+        """Export a canonical Server package and return its owning bundle."""
         from .exchange import ExchangeBundle
-        selection = {}
+        from ._exchange_transport import ExchangeEndpoint
+
+        self._assert_not_collecting_batch()
+        selection = None
         if roots is not None:
             if not isinstance(roots, (list, tuple)):
-                raise TypeError("roots must be a list or tuple of Object selectors")
-            selection["rootIds"] = [_portable_input(root) for root in roots]
-        if type(root_class_boundary) is not bool:
-            raise TypeError("root_class_boundary must be a bool")
-        options = {"rootClassBoundary": bool(root_class_boundary)}
+                raise TypeError("roots must be a list or tuple of Object UUIDs")
+            if len(roots) > (1_048_576 - 1024) // 39:
+                raise DepositError("LIMIT_EXCEEDED", "Explicit export selector exceeds request budget")
+            selection = []
+            for root in roots:
+                if isinstance(root, DObject):
+                    self._validate_handle(root, "Object")
+                    root = root.id
+                root = _stable_id(root)
+                if len(root) != 36 or str(uuid.UUID(root)) != root.lower():
+                    raise ValueError("Explicit export roots must be Object UUIDs")
+                selection.append(root)
+        options = {"rootClassBoundary": root_class_boundary}
         if max_hops is not None:
-            if type(max_hops) is not int or max_hops < 0:
-                raise ValueError("max_hops must be a nonnegative integer or None")
             options["maxHops"] = max_hops
-        self._client.require_paged_import_results()
-        key = str(uuid.uuid4())
-        result = self._run_action("deposit.save.data", [selection, options], _recovery_key=key)
-        return ExchangeBundle(self, result)
+        with self._serialized():
+            endpoint = ExchangeEndpoint(self._client, self._token, self._namespace_id)
+            try:
+                with endpoint.execution() as execution:
+                    result = execution.run("deposit.exchange.export", selection, options, operation_id=operation_id)
+                return ExchangeBundle(endpoint, result)
+            except BaseException:
+                endpoint.close()
+                raise
 
     def import_exchange(self, source, *, rules=None):
         """Freeze an Exchange input, analyze it, and retain durable workflow ownership."""
@@ -987,10 +1002,10 @@ class Store:
             return self._import_exchange_workflow(source, frozen_rules, workflows, workflow)
 
     def _import_exchange_workflow(self, source, rules, workflows, workflow):
-        from .exchange import ExchangeBundle, DurableExchangeFile, validate_exchange_archive
+        from .exchange import _LegacyExchangeBundle, DurableExchangeFile, validate_exchange_archive
         from ._imports import prepared_import_package
         try:
-            if isinstance(source, ExchangeBundle):
+            if isinstance(source, _LegacyExchangeBundle):
                 source.pin(workflow.id)
                 record = workflows.get(workflow.id)
                 if source._stage is None:
@@ -1373,7 +1388,7 @@ class Store:
                     root_class_boundary=True, rules=None):
         """Import one immutable export using independently authenticated Stores."""
         from ._import_workflows import ImportWorkflowStore
-        from .exchange import ExchangeBundle
+        from .exchange import _LegacyExchangeBundle
         if not isinstance(source_store, Store):
             raise TypeError("source_store must be an authenticated Store")
         if rules is not None and not isinstance(rules, Mapping):
@@ -1402,7 +1417,7 @@ class Store:
                 export_result = source_store._workflow_action(export_key, "deposit.save.data", export_args)
                 workflows.update(workflow.id, state="SOURCE_REFERENCE_READY", phase="source_reference_ready",
                                  source_export_result=export_result)
-                with ExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
+                with _LegacyExchangeBundle(source_store, export_result, workflow_id=workflow.id) as bundle:
                     return self._import_exchange_workflow(bundle, frozen_rules, workflows, workflow)
             except Exception as exc:
                 self._import_workflow_failure(workflows, workflow.id, exc)
@@ -1731,7 +1746,11 @@ class Store:
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("operation_id must be a nonempty string")
         with self._serialized():
-            return self._client.get_operation(self._token, operation_id, scope="namespace")
+            return self._client.get_operation(self._token, operation_id, scope=self._namespace_id)
+
+    def cancel_operation(self, operation_id: str) -> Any:
+        """Request cancellation from the Store's independent control connection."""
+        return self._client.cancel_operation(self._token, operation_id, scope=self._namespace_id)
 
     def get_last_operation(self) -> Any:
         """Return the last operation observed by this Store session."""

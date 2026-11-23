@@ -22,6 +22,7 @@ _MANIFEST: dict[str, Any] | None = None
 
 _CLIENT_GATEWAY_PROCEDURES = frozenset(
     {
+        "deposit.action.cancel",
         "deposit.get.activeNamespace",
         "deposit.set.activeNamespace",
         "deposit.get.administrativeMode",

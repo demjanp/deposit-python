@@ -2759,7 +2759,7 @@
       "args": [
         {
           "name": "source",
-          "type": "Object",
+          "type": "Map<String,Object>",
           "binding": "source"
         },
         {
@@ -3611,6 +3611,361 @@
       "scope": "discovery",
       "requires_token": false,
       "token_index": null,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.export",
+      "args": [
+        {
+          "name": "rootIds",
+          "type": "List<String>",
+          "binding": "rootIds"
+        },
+        {
+          "name": "options",
+          "type": "Map<String,Object>",
+          "binding": "options"
+        },
+        {
+          "name": "operationId",
+          "type": "String"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "operational",
+      "requires_token": true,
+      "token_index": 3,
+      "action": true,
+      "tracked": "always",
+      "cancellable": true,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Store"
+    },
+    {
+      "name": "deposit.exchange.beginUpload",
+      "args": [
+        {
+          "name": "scope",
+          "type": "String",
+          "binding": "scope"
+        },
+        {
+          "name": "inputKind",
+          "type": "String",
+          "binding": "inputKind"
+        },
+        {
+          "name": "metadata",
+          "type": "Map<String,Object>",
+          "binding": "metadata"
+        },
+        {
+          "name": "operationId",
+          "type": "String"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "exchangeUpload",
+      "requires_token": true,
+      "token_index": 4,
+      "action": true,
+      "tracked": "always",
+      "cancellable": true,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.uploadChunk",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        },
+        {
+          "name": "member",
+          "type": "String",
+          "binding": "member"
+        },
+        {
+          "name": "offset",
+          "type": "Long",
+          "binding": "offset"
+        },
+        {
+          "name": "bytesBase64",
+          "type": "String",
+          "binding": "bytesBase64"
+        },
+        {
+          "name": "chunkSha256",
+          "type": "String",
+          "binding": "chunkSha256"
+        },
+        {
+          "name": "operationId",
+          "type": "String"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "exchangeUpload",
+      "requires_token": true,
+      "token_index": 6,
+      "action": true,
+      "tracked": "always",
+      "cancellable": true,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.finishUpload",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        },
+        {
+          "name": "operationId",
+          "type": "String"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "exchangeUpload",
+      "requires_token": true,
+      "token_index": 2,
+      "action": true,
+      "tracked": "always",
+      "cancellable": true,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.abortUpload",
+      "args": [
+        {
+          "name": "uploadId",
+          "type": "String",
+          "binding": "uploadId"
+        },
+        {
+          "name": "operationId",
+          "type": "String"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "exchangeUpload",
+      "requires_token": true,
+      "token_index": 2,
+      "action": true,
+      "tracked": "always",
+      "cancellable": true,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.inspect",
+      "args": [
+        {
+          "name": "packageId",
+          "type": "String",
+          "binding": "packageId"
+        },
+        {
+          "name": "grant",
+          "type": "String",
+          "binding": "grant"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "token_index": 2,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.memberPage",
+      "args": [
+        {
+          "name": "packageId",
+          "type": "String",
+          "binding": "packageId"
+        },
+        {
+          "name": "grant",
+          "type": "String",
+          "binding": "grant"
+        },
+        {
+          "name": "leaseId",
+          "type": "String",
+          "binding": "leaseId"
+        },
+        {
+          "name": "cursor",
+          "type": "Map<String,Object>",
+          "binding": "cursor"
+        },
+        {
+          "name": "limit",
+          "type": "Long",
+          "binding": "limit"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "token_index": 5,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.graphPage",
+      "args": [
+        {
+          "name": "packageId",
+          "type": "String",
+          "binding": "packageId"
+        },
+        {
+          "name": "grant",
+          "type": "String",
+          "binding": "grant"
+        },
+        {
+          "name": "leaseId",
+          "type": "String",
+          "binding": "leaseId"
+        },
+        {
+          "name": "collection",
+          "type": "String",
+          "binding": "collection"
+        },
+        {
+          "name": "cursor",
+          "type": "Map<String,Object>",
+          "binding": "cursor"
+        },
+        {
+          "name": "limit",
+          "type": "Long",
+          "binding": "limit"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "token_index": 6,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.readChunk",
+      "args": [
+        {
+          "name": "packageId",
+          "type": "String",
+          "binding": "packageId"
+        },
+        {
+          "name": "grant",
+          "type": "String",
+          "binding": "grant"
+        },
+        {
+          "name": "leaseId",
+          "type": "String",
+          "binding": "leaseId"
+        },
+        {
+          "name": "member",
+          "type": "String",
+          "binding": "member"
+        },
+        {
+          "name": "offset",
+          "type": "Long",
+          "binding": "offset"
+        },
+        {
+          "name": "length",
+          "type": "Long",
+          "binding": "length"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "READ",
+      "scope": "server",
+      "requires_token": true,
+      "token_index": 6,
+      "action": false,
+      "admin": false,
+      "batch_eligible": false,
+      "invocation_owner": "Client"
+    },
+    {
+      "name": "deposit.exchange.discard",
+      "args": [
+        {
+          "name": "packageId",
+          "type": "String",
+          "binding": "packageId"
+        },
+        {
+          "name": "grant",
+          "type": "String",
+          "binding": "grant"
+        }
+      ],
+      "columns": [
+        "data"
+      ],
+      "mode": "WRITE",
+      "scope": "server",
+      "requires_token": true,
+      "token_index": 2,
       "action": false,
       "admin": false,
       "batch_eligible": false,
