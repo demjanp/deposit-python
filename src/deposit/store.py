@@ -1324,8 +1324,7 @@ class Store:
                                   expected_revision=expected_revision)
 
     def classes(self, name: str | None = None, *, page_size=200):
-        selection = None if name is None else {"name": name}
-        return self._entity_page("deposit.get.classPage", selection, page_size=page_size,
+        return self._entity_page("deposit.get.classPage", name, page_size=page_size,
                                  transform=lambda item, revision: self._entity_handle_at_revision(
                                      "Class", _item_id(item), revision))
 
