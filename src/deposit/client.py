@@ -27,6 +27,20 @@ from .errors import CompatibilityError, DepositError, TransportError
 from .recovery import PendingOperation, RecoveredOperation
 
 
+def _abandon_local_absent_state(action):
+    """True when a Server NOT_FOUND can be trusted for this local receipt.
+
+    Only a local intent, or the durable CANCELLED cancellation written for a
+    prepare that never reached the Server, proves no remote effect exists.
+    A receipt bound to an operation ID, or a different saved failure, keeps
+    the remote outcome unknown and is not terminal.
+    """
+    if action["state"] in {"intent", "prepare_sent"}:
+        return True
+    return (action["state"] == "failure_saved" and action["operation_id"] is None
+            and (action.get("failure") or {}).get("code") == "CANCELLED")
+
+
 def _manifest() -> dict[str, Any]:
     return json.loads(files("deposit").joinpath("_procedure_manifest.json").read_text(encoding="utf-8"))
 
@@ -544,6 +558,9 @@ class Client:
         if (transfer["identity"] != identity.to_dict() or transfer["sha256"] != record["sha256"]
                 or transfer["bytes"] != record["total_bytes"]):
             raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Clone transfer does not match its protected workflow")
+        # Verify every protected chunk before the first durable begin transition, spool
+        # update or upload action so a damaged frozen source is rejected locally.
+        spool.verify_content(transfer)
 
         if record["upload_id"] is None or record["state"] == "FROZEN":
             key = (record["outstanding_action_key"] or str(uuid.uuid4()))
@@ -821,8 +838,11 @@ class Client:
                 else:
                     journal.update(identity, key, state="outcome_saved", outcome=outcome,
                                    operation_id=operation_id)
+            # Release detaches whichever action is currently on this session.
+            # A lost release reply may have left a different key attached since
+            # this journal entered release_sent, so bind this key every time.
+            self._recovery_control("deposit.action.resume", key, token)
             if current["state"] != "release_sent":
-                self._recovery_control("deposit.action.resume", key, token)
                 journal.update(identity, key, state="release_sent")
             release = self._single("CYPHER 25 CALL deposit.action.release($token) YIELD value RETURN value",
                                    {"token": token})
@@ -1106,7 +1126,16 @@ class Client:
         from ._recovery.identity import DeploymentIdentity
         from ._recovery.transfers import ProtectedTransferSpool
         record = workflows.get(workflow_id)
+        if record["state"] == "OUTCOME_UNCERTAIN":
+            # An earlier authorization-hidden observation cannot be upgraded
+            # to abandonment merely because a stale local deadline elapsed.
+            # Re-enter the abandoned branch so an authoritative observation or
+            # a later unavailable response may resolve/retry this same owner.
+            workflows.update(workflow_id, state=record["resume_state"], phase="abandon_pending",
+                             resume_state=None)
+            record = workflows.get(workflow_id)
         unresolved = False
+        applied_key = None
         actions = dict(record["action_keys"])
         spool = ProtectedTransferSpool(target._journal, target._identity)
         manifest = None
@@ -1124,23 +1153,47 @@ class Client:
             store = source if name == "export" else target
             identity = (DeploymentIdentity.from_dict(record["source_identity"]) if name == "export" else target._identity)
             journal = store._journal if store is not None else target._journal
-            action = journal.load_if_present(identity, key)
-            if action is None:
-                # Source journals can live in a different protected root.
-                unresolved |= store is None
+            envelope = None
+            if store is None:
+                # An absent receipt in the receiving root does not establish
+                # source ownership. A shared root may contain a durable failed
+                # receipt (no execution effect remains) or an executing receipt
+                # (whose committed result cannot be retrieved without a Store).
+                # Preserve the latter pending until source authentication is
+                # supplied; never infer absence from an uninspected source root.
+                with target._serialized(), journal.action_lock(key):
+                    action = journal.load_if_present(identity, key)
+                    if name == "export":
+                        unresolved |= action is None or action["state"] not in {
+                            "released", "failed", "conflicted"
+                        }
+                        continue
+                    unresolved |= action is not None
                 continue
-            if action["state"] in {"failed", "conflicted"}:
-                continue
-            envelope = action.get("outcome") if action["state"] == "released" else None
-            if envelope is None:
-                if store is None:
+            with store._serialized(), journal.action_lock(key):
+                # The lookup, action status and every possible local failure
+                # write must share recovery's exact per-action lock.
+                action = journal.load_if_present(identity, key)
+                if action is None:
+                                # Never infer that a genuine absent action from a different
+                    # recovery root proves the workflow was uninitiated. NOT_FOUND
+                    # is also the server's authorization-hidden response for a
+                    # real receiving action; preserve the unresolved ownership
+                    # for authorized resume rather than complete a false abandon.
                     unresolved = True
+                    if record["state"] in {"SOURCE_EXPORT_REQUESTED", "SOURCE_REFERENCE_READY",
+                            "CREATED", "TARGET_PACKAGE_READY", "ANALYSIS_REQUESTED", "APPLYING"}:
+                        continue
                     continue
-                with store._serialized():
+                if action["state"] in {"failed", "conflicted"}:
+                    continue
+                if action["state"] == "released":
+                    envelope = action.get("outcome")
+                else:
                     try:
                         status = store._control("deposit.action.status", key)
                     except DepositError as exc:
-                        if exc.code != "NOT_FOUND" or action["state"] not in {"intent", "prepare_sent"}:
+                        if exc.code != "NOT_FOUND" or not _abandon_local_absent_state(action):
                             raise
                         status = {"state": "absent"}
                     if status.get("state") == "committed":
@@ -1149,9 +1202,46 @@ class Client:
                         failure = {"code": "CANCELLED", "message": "Import action ownership was abandoned",
                                    "details": {}, "request_id": None, "retryable": False}
                         if status["state"] == "absent":
-                            store._journal.update(identity, key, state="failed", failure=failure)
+                            # NOT_FOUND is terminal only for a local action that
+                            # never reached the Server: a bare intent whose
+                            # prepare reply was never delivered, or the durable
+                            # CANCELLED cancellation already saved for such an
+                            # intent (retry after an interrupted abandonment).
+                            # A delivered prepare (prepare_sent) or a saved
+                            # cancellation bound to an operation stays pending.
+                            if action["state"] == "prepare_sent":
+                                unresolved = True
+                                continue
+                            if action["state"] == "failure_saved" and action["operation_id"] is not None:
+                                unresolved = True
+                                continue
+                            if action["state"] == "failure_saved":
+                                journal.update(identity, key, state="failed")
+                            else:
+                                journal.update(identity, key, state="failure_saved", failure=failure)
+                                journal.update(identity, key, state="failed")
                         else:
-                            failed = store._journal.update(identity, key, state="failure_saved", failure=failure)
+                            # Reconcile an acknowledged prepare whose reply was
+                            # lost before running the normal execution boundary.
+                            # Keep immutable replay arguments and bind every
+                            # durable resume/resume/recovery observation to the
+                            # identity proved by the authoritative status.
+                            current = action
+                            original_operation_id = current.get("operation_id")
+                            if original_operation_id is not None and status.get("operationId") != original_operation_id:
+                                unresolved = True
+                                continue
+                            if original_operation_id is None and status.get("operationId") is None:
+                                unresolved = True
+                                continue
+                            if current["state"] in {"intent", "prepare_sent"}:
+                                if original_operation_id is None and status.get("operationId") is not None:
+                                    current = journal.update(identity, key, state="prepared",
+                                                             operation_id=status.get("operationId"))
+                                current = journal.update(identity, key, state="executing")
+                            if current["state"] == "prepared":
+                                current = journal.update(identity, key, state="executing")
+                            failed = journal.update(identity, key, state="failure_saved", failure=failure)
                             try:
                                 envelope = store._finish_failed_action(failed, status=status)
                             except DepositError as exc:
@@ -1167,19 +1257,21 @@ class Client:
                                          plan_expires_at=(workflows.get(workflow_id)["plan_expires_at"]
                                              if workflows.get(workflow_id)["plan_expires_at"] is not None else result["expiresAt"]))
                     elif name == "apply":
-                        workflows.update(workflow_id, state="APPLIED", phase="applied", result_action_key=key)
+                        applied_key = key
                 finally:
                     result.close()
         record = workflows.get(workflow_id)
-        if record["state"] == "APPLIED":
+        if applied_key is not None and not unresolved:
+            workflows.update(workflow_id, state="APPLIED", phase="applied", result_action_key=applied_key,
+                             resume_state=None, failure=None)
             target._cleanup_import_workflow(workflows, workflow_id, source_store=source)
             return workflows.status(workflow_id)
-        if record["plan_id"]:
+        if record["plan_id"] and not unresolved:
             observation = target._observe_import_plan(workflows, workflow_id, abandoning=True)
-            if observation in {"ready", "unavailable"}:
-                unresolved = True
-            elif observation == "applied":
-                workflows.update(workflow_id, state="APPLIED", phase="applied")
+            if observation == "ready":
+                return workflows.status(workflow_id)
+            if observation == "applied":
+                workflows.update(workflow_id, state="APPLIED", phase="applied", resume_state=None, failure=None)
         if manifest is not None and manifest["begin_action_key"] is not None and not unresolved:
             begin = target._journal.load_if_present(target._identity, manifest["begin_action_key"])
             upload_id = manifest["upload_id"] or ((begin.get("outcome") or {}).get("uploadId") if begin else None)
@@ -1194,13 +1286,15 @@ class Client:
                 # This established action releases the upload lease. No new
                 # Server cancellation route or Namespace import effect occurs.
         current = workflows.get(workflow_id)
-        if current["state"] != "APPLIED":
-            workflows.update(workflow_id, state="ABANDON_PENDING" if unresolved else "ABANDONED",
-                             phase="abandon_pending" if unresolved else "abandoned")
-        if not unresolved:
-            target._cleanup_import_workflow(workflows, workflow_id, source_store=source)
+        if unresolved:
+            # An unresolved action can outlast a plan observation. Preserve an
+            # existing lease wait so resolving the action cannot renew it early.
+            phase = current["phase"] if current["state"] == "ABANDON_PENDING" else "abandon_pending"
+            workflows.update(workflow_id, state="ABANDON_PENDING", phase=phase, cleanup_status="pending")
         else:
-            workflows.update(workflow_id, cleanup_status="pending")
+            if current["state"] != "APPLIED":
+                workflows.update(workflow_id, state="ABANDONED", phase="abandoned")
+            target._cleanup_import_workflow(workflows, workflow_id, source_store=source)
         return workflows.status(workflow_id)
 
     def recover(self, operation: PendingOperation, *, username: str, password: str) -> RecoveredOperation:

@@ -7,7 +7,7 @@ import json
 import re
 import uuid
 from contextlib import nullcontext
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from .identity import DeploymentIdentity
 from .journal import JournalError, MAX_RECORD_BYTES, ProtectedJournal, _is_uuid, _valid_failure, _strict_json_loads
@@ -164,8 +164,8 @@ class ProtectedTransferSpool:
                           sort_keys=True, separators=(",", ":")).encode("utf-8")
         self._storage.write(meta_name, meta)
         actual = self._storage.record_size(data_name) + self._storage.record_size(meta_name)
-        admission.materialized(reservation, self._storage.root, actual)
-        admission.release(reservation, {str(self._storage.root): estimate - actual})
+        admission.materialized_release(reservation, self._storage.root, actual,
+                                        {str(self._storage.root): estimate - actual})
         digest.update(block)
         manifest.update(bytes=manifest["bytes"] + len(block), sha256=digest.hexdigest(),
                         chunk_count=index + 1, staging_pending_length=0,
@@ -235,7 +235,8 @@ class ProtectedTransferSpool:
             raise TransferError("Protected upload chunk metadata is invalid")
         return {"name": self._chunk_name(manifest["transfer_id"], index), **metadata}
 
-    def verify_content(self, manifest: dict[str, Any]) -> None:
+    def verify_content(self, manifest: dict[str, Any], *,
+                       on_verified: Callable[[int, int], None] | None = None) -> None:
         """Verify every protected chunk against the immutable whole-file digest."""
         digest = hashlib.sha256()
         total = 0
@@ -243,8 +244,12 @@ class ProtectedTransferSpool:
             block = self.read_chunk(manifest["transfer_id"], index)
             digest.update(block)
             total += len(block)
+            if on_verified is not None and (index + 1) % 64 == 0 and index + 1 < self.chunk_count(manifest):
+                on_verified(total, index + 1)
         if total != manifest["bytes"] or digest.hexdigest() != manifest["sha256"]:
             raise TransferError("Protected upload spool failed its whole-file checksum")
+        if on_verified is not None and self.chunk_count(manifest):
+            on_verified(total, self.chunk_count(manifest))
 
     def ensure_action_capacity(self, manifest: dict[str, Any]) -> None:
         """Check only per-action representability; disk admission is incremental."""

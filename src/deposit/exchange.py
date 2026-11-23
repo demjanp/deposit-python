@@ -294,6 +294,10 @@ class DurableExchangeFile:
         self.prefix = f"import-stage-{owner_id}"
         self.manifest_name = self.prefix + "-manifest"
         self.position, self.closed = 0, False
+        # A completed stage is immutable, so retain at most one authenticated
+        # chunk while ZIP validation performs smaller sequential reads.
+        self._read_index = None
+        self._read_data = b""
         if create and not storage.has_record(self.manifest_name):
             self.manifest = {"owner_id": owner_id, "identity": identity, "bytes": 0,
                              "chunk_count": 0, "complete": False}
@@ -334,20 +338,44 @@ class DurableExchangeFile:
         # before publishing a larger checkpoint leaves the old tail intact.
         return f"{self.prefix}-chunk-{index:08x}-{length:08x}"
 
-    def _meta_name(self, index, *, length=None):
-        return self._chunk_name(index, length=length).replace("-chunk-", "-meta-")
-
     def _verify_chunks(self):
+        self._read_index = None
+        self._read_data = b""
         for index in range(self.manifest["chunk_count"]):
-            expected = min(self.CHUNK_SIZE, self.manifest["bytes"] - index * self.CHUNK_SIZE)
-            try:
-                data = self.storage.read(self._chunk_name(index))
-                meta = json.loads(self.storage.read(self._meta_name(index)))
-            except Exception as exc:
-                raise OSError("A committed Exchange chunk is missing") from exc
-            if (meta != {"index": index, "bytes": expected, "sha256": hashlib.sha256(data).hexdigest()}
-                    or len(data) != expected):
-                raise OSError("A committed Exchange chunk failed checkpoint verification")
+            self._read_chunk(index)
+
+    def _read_chunk(self, index):
+        if self.manifest["complete"] and self._read_index == index:
+            return self._read_data
+        expected = min(self.CHUNK_SIZE, self.manifest["bytes"] - index * self.CHUNK_SIZE)
+        if not 0 <= index < self.manifest["chunk_count"] or not 0 < expected <= self.CHUNK_SIZE:
+            raise OSError("A committed Exchange chunk failed checkpoint verification")
+        try:
+            frame = self.storage.read(self._chunk_name(index, length=expected))
+        except Exception as exc:
+            raise OSError("A committed Exchange chunk is missing") from exc
+        if len(frame) > expected + 257:
+            raise OSError("A committed Exchange chunk failed checkpoint verification")
+        header, separator, body = frame.partition(b"\n")
+        if not separator or len(header) > 256:
+            raise OSError("A committed Exchange chunk failed checkpoint verification")
+        try:
+            meta = json.loads(header.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise OSError("A committed Exchange chunk failed checkpoint verification") from exc
+        if (not isinstance(meta, dict) or set(meta) != {"index", "bytes", "sha256"}
+                or type(meta["index"]) is not int or meta["index"] != index
+                or type(meta["bytes"]) is not int or meta["bytes"] != expected
+                or type(meta["sha256"]) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", meta["sha256"])
+                or header != json.dumps(meta, sort_keys=True, separators=(",", ":"),
+                                        allow_nan=False).encode("utf-8")
+                or len(body) != expected or hashlib.sha256(body).hexdigest() != meta["sha256"]):
+            raise OSError("A committed Exchange chunk failed checkpoint verification")
+        if self.manifest["complete"]:
+            self._read_data = body
+            self._read_index = index
+        return body
 
     def write(self, data):
         self._check()
@@ -360,14 +388,14 @@ class DurableExchangeFile:
         while consumed < len(view):
             index, inner = divmod(self.position, self.CHUNK_SIZE)
             previous = self._chunk_name(index) if inner else None
-            prior = self.storage.read(previous) if inner else b""
+            prior = self._read_chunk(index) if inner else b""
             count = min(self.CHUNK_SIZE - inner, len(view) - consumed)
             piece = prior + bytes(view[consumed:consumed + count])
             name = self._chunk_name(index, length=len(piece))
-            meta = self._meta_name(index, length=len(piece))
-            self._write(name, piece)
-            self._write(meta, json.dumps({"index": index, "bytes": len(piece),
-                        "sha256": hashlib.sha256(piece).hexdigest()}, separators=(",", ":")).encode())
+            header = json.dumps({"index": index, "bytes": len(piece),
+                        "sha256": hashlib.sha256(piece).hexdigest()}, sort_keys=True,
+                        separators=(",", ":"), allow_nan=False).encode("utf-8")
+            self._write(name, header + b"\n" + piece)
             old_manifest = dict(self.manifest)
             self.manifest["bytes"] += count
             self.manifest["chunk_count"] = index + 1
@@ -380,7 +408,9 @@ class DurableExchangeFile:
             consumed += count
             if previous:
                 self.storage.delete(previous)
-                self.storage.delete(previous.replace("-chunk-", "-meta-"))
+                old_meta = previous.replace("-chunk-", "-meta-")
+                if self.storage.has_record(old_meta):
+                    self.storage.delete(old_meta)
         return consumed
 
     def read(self, size=-1):
@@ -390,7 +420,7 @@ class DurableExchangeFile:
         result = bytearray()
         while len(result) < wanted:
             index, inner = divmod(self.position, self.CHUNK_SIZE)
-            data = self.storage.read(self._chunk_name(index))
+            data = self._read_chunk(index)
             count = min(wanted - len(result), len(data) - inner)
             if count <= 0:
                 raise OSError("Durable Exchange chunk is truncated")
@@ -421,6 +451,8 @@ class DurableExchangeFile:
 
     def close(self):
         self.closed = True
+        self._read_index = None
+        self._read_data = b""
 
     @classmethod
     def release_owned(cls, storage, owner_id, *, workflow_id=None):

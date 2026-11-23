@@ -207,7 +207,9 @@ def bind_client_arguments(entry: dict[str, Any], supplied: tuple[Any, ...]) -> t
     while len(values) < len(specs):
         spec = specs[len(values)]
         binding = spec["binding"]
-        if binding.startswith(("?", "~")):
+        if "default" in spec:
+            values.append(spec["default"])
+        elif binding.startswith(("?", "~")):
             values.append(None)
         elif binding == "+":
             values.append({})
@@ -228,7 +230,9 @@ def bind_arguments(
     while len(values) < len(specs):
         spec = specs[len(values)]
         binding = spec["binding"]
-        if binding.startswith(("?", "~")):
+        if "default" in spec:
+            values.append(spec["default"])
+        elif binding.startswith(("?", "~")):
             values.append(None)
         elif binding == "+":
             values.append({})

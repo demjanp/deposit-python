@@ -17,7 +17,7 @@ from typing import Any
 
 from ..errors import DepositError
 from .identity import DeploymentIdentity
-from .storage import ProtectedStorageError, ProtectedStore, StorageAdmissionCoordinator
+from .storage import InsufficientStorageError, ProtectedStorageError, ProtectedStore, StorageAdmissionCoordinator
 
 
 RESULT_FORMAT_NAMED_ROWS = "named_rows"
@@ -31,6 +31,8 @@ _SERVER_SCOPED_OPERATIONS = frozenset({
 MAX_UNRESOLVED = 1024
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 OPERATION_CHUNK_BYTES = 1024 * 1024
+_PAYLOAD_ADMISSION_BATCH_RECORDS = 4
+_PROTECTED_WRITE_ALLOWANCE = 65536
 RESULT_RETENTION = timedelta(days=30)
 IMPORT_RESULT_PAGE_LIMIT = 128
 _MAX_SAFE_INTEGER = (1 << 53) - 1
@@ -39,7 +41,7 @@ UNRESOLVED_STATES = frozenset({"intent", "prepare_sent", "prepared", "executing"
                                "conflicted", "failure_saved"})
 PENDING_STATES = UNRESOLVED_STATES | {"failed"}
 _TRANSITIONS = {
-    "intent": {"prepare_sent", "prepared", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted"},
+    "intent": {"prepare_sent", "prepared", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted", "failure_saved"},
     "prepare_sent": {"prepared", "executing", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted"},
     "prepared": {"executing", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted"},
     "executing": {"prepared", "outcome_saved", "COMMITTED_RESULT_PENDING", "conflicted", "failure_saved"},
@@ -202,7 +204,15 @@ class ProtectedJournal:
             return self._load_locked(identity, key)
 
     def update(self, identity: DeploymentIdentity, key: str, **changes: Any) -> dict[str, Any]:
-        record = self.load(identity, key)
+        before = self.load(identity, key)
+        record = self._validated_update(before, changes, identity=identity)
+        # Carry this exact transition through serialized publication. _write()
+        # rechecks current content/lifecycle after acquiring journal-index.
+        return self._write(record, expected=before, changes=changes)
+
+    def _validated_update(self, before: dict[str, Any], changes: dict[str, Any], *,
+                          identity: DeploymentIdentity) -> dict[str, Any]:
+        record = dict(before)
         if set(changes) - (set(record) | {"failure"}):
             raise JournalError("Recovery journal update contains unsupported fields")
         if "failure" in record and changes.get("failure", record["failure"]) not in (record["failure"], None):
@@ -216,8 +226,7 @@ class ProtectedJournal:
         record["updated_at"] = _utc_now()
         if next_state in {"released", "failed"} and record["resolved_at"] is None:
             record["resolved_at"] = record["updated_at"]
-        self._validate(record, identity, key)
-        self._write(record)
+        self._validate(record, identity, record["key"])
         return record
 
     def persist_import_result(self, identity: DeploymentIdentity, key: str, envelope: dict[str, Any], fetch_page):
@@ -631,33 +640,50 @@ class ProtectedJournal:
             self._write_protected(name, payload)
 
     def _write_protected(self, name: str, payload: bytes) -> None:
-        """Admit the additional protected temporary copy before each write.
+        self._write_admitted_records(name, "journal-record", {name: payload})
+
+    def _write_admitted_records(self, owner: str, purpose: str, records: dict[str, bytes], *,
+                                optional_batch: bool = False, operation: dict | None = None) -> bool:
+        """Admit every protected temporary copy before writing any file in the batch.
 
         Existing files already reduce measured free space, including the old
         copy during replacement. Failed writes retain their reservation until
         its writer/artifacts can be reconciled without guessing.
         """
-        if len(payload) > MAX_RECORD_BYTES:
+        if any(len(payload) > MAX_RECORD_BYTES for payload in records.values()):
             raise ProtectedStorageError("Journal segment exceeds the 16 MiB protected-record limit")
         coordinator = StorageAdmissionCoordinator(self.storage)
-        estimate = len(payload) + 65536
+        volume = str(self.storage.root)
+        estimates = {name: len(payload) + _PROTECTED_WRITE_ALLOWANCE for name, payload in records.items()}
+        estimate = sum(estimates.values())
         # No reconciler can observe a new reservation before its writer owns
         # the lifetime lock. Quota locks are reentrant; journal-index is always
         # acquired before the quota lock, never from inside admission code.
         with self.storage.user_quota_lock():
-            reservation = coordinator.acquire(name, "journal-record", {str(self.storage.root): estimate})
+            try:
+                if operation is None:
+                    reservation = coordinator.acquire(owner, purpose, {volume: estimate})
+                else:
+                    reservation = coordinator.acquire(owner, purpose, {volume: estimate}, operation=operation)
+            except InsufficientStorageError:
+                if optional_batch:
+                    return False
+                raise
             writer = coordinator.writer(reservation)
             writer.acquire()
         try:
-            self.storage.write(name, payload)
-            actual = self.storage.record_size(name)
-            coordinator.materialized(reservation, self.storage.root, actual)
-            coordinator.release(reservation, {str(self.storage.root): estimate - actual})
-            coordinator.close(reservation)
+            actual = 0
+            for name, payload in records.items():
+                self.storage.write(name, payload)
+                size = self.storage.record_size(name)
+                if size > estimates[name]:
+                    raise ProtectedStorageError("Journal record exceeded its admitted commitment")
+                actual += size
+            coordinator.materialized_release(reservation, volume, actual, {volume: estimate - actual})
+            coordinator.close(reservation, retire=True)
         finally:
             writer.release()
-        self.storage.delete(f"admission-{reservation['id']}")
-
+        return True
 
     def records(self, identity: DeploymentIdentity) -> list[dict[str, Any]]:
         with self.storage.lock("journal-index"):
@@ -730,56 +756,147 @@ class ProtectedJournal:
             removed += self._prune_local_import_results_locked(cutoff)
         return removed
 
-    def _write(self, record: dict[str, Any], *, creating: bool = False) -> None:
+    def _write(self, record: dict[str, Any], *, creating: bool = False,
+               expected: dict[str, Any] | None = None,
+               changes: dict[str, Any] | None = None) -> None:
         identity = DeploymentIdentity.from_dict(record["identity"])
         self._validate(record, identity, record["key"])
         name = _record_name(identity, record["key"])
+        # Snapshot immutable content before rebasing a stale lifecycle update.
+        # Otherwise the comparison would prove only that current matches itself.
+        immutable = {field: value for field, value in expected.items()
+                     if field not in {"updated_at", "resolved_at", "state"}} if expected is not None else None
         # The user quota coordinator makes the unresolved-count check global to
         # all registered recovery roots. The per-root index lock still serializes
         # updates/pruning in this journal; storage.write is reentrant under the
         # same per-user coordinator and includes the encrypted temporary copy.
+        initial_upload = creating and record["procedure"] == "deposit.resource.beginUpload"
         with self.storage.lock("journal-index"):
-            self._prune_expired_locked(identity)
+            if expected is not None:
+                current = self._load_locked(identity, record["key"])
+                if current != expected:
+                    if any(current[field] != value for field, value in immutable.items()):
+                        raise JournalError("Recovery operation immutable content changed before update")
+                    # Identical-content successors may advance lifecycle state,
+                    # but validate every requested change from the actual state.
+                    record = self._validated_update(current, dict(changes or {}), identity=identity)
+            if immutable is None:
+                immutable = {field: value for field, value in record.items()
+                             if field not in {"updated_at", "resolved_at", "state"}}
+            lifecycle_fields = {"state", "updated_at", "resolved_at"}
+            if (record["procedure"] == "deposit.resource.uploadChunk"
+                    and record["operation_id"] == immutable["operation_id"]):
+                # A resume that confirms the same ID only advances lifecycle.
+                # Keep the exact authenticated argument generation in that case.
+                lifecycle_fields.add("operation_id")
+            reuse_generation = (not creating and changes is not None and
+                                set(changes) <= lifecycle_fields)
+            if not initial_upload and not reuse_generation:
+                self._prune_expired_locked(identity)
             quota_lock = getattr(self.storage, "user_quota_lock", None)
             with quota_lock() if quota_lock is not None else nullcontext():
                 current_unresolved = self._unresolved_count_all_roots_locked()
-                current_names = [n for n in self.storage.list_records() if n.startswith("op-")]
+                current_names = self.storage.list_records()
                 exists = name in current_names
                 if creating and exists:
                     raise JournalError("Recovery key collision")
                 if creating and current_unresolved >= MAX_UNRESOLVED:
                     raise ProtectedStorageError("The 1,024 unresolved recovery operation limit is reached")
-                descriptor = self._write_segmented_payload(name, "operation", record)
+                coordinator = StorageAdmissionCoordinator(self.storage)
+                admissions = tuple(coordinator.journal_root_admissions(name, current_names))
+                pending = [entry for entry in admissions if entry["purpose"] == "journal-initial-operation"]
+                if pending and (len(pending) != 1 or not (exists or initial_upload)
+                                or not coordinator.reconcile_initial_operation(pending[0], published=exists)):
+                    raise ProtectedStorageError("Initial upload admission requires reconciliation")
+                if exists:
+                    for entry in admissions:
+                        if entry["purpose"] == "journal-record" and not coordinator.reconcile_journal_root(entry):
+                            raise ProtectedStorageError("Previous journal root admission requires reconciliation")
+                pending_records = {} if initial_upload else None
+                if reuse_generation:
+                    # The current record was authenticated above under this same
+                    # journal-index lock. Reuse that verified snapshot instead of
+                    # decoding its potentially large immutable payload again.
+                    if expected is None:
+                        current = self._load_locked(identity, record["key"])
+                    if any(current[field] != value for field, value in immutable.items()):
+                        raise JournalError("Recovery operation immutable content changed before payload reuse")
+                    current_root = self._decode_operation_root(self.storage.read(name), name)
+                    descriptor = current_root["payload"]
+                else:
+                    descriptor = self._write_segmented_payload(name, "operation", record, pending=pending_records)
                 root = {"key": record["key"], "identity": record["identity"], "state": record["state"],
+                        "updatedAt": record["updated_at"], "resolvedAt": record["resolved_at"],
                         "payload": descriptor}
                 payload = _json_bytes(root)
                 try:
-                    self._write_protected(name, payload)
+                    if pending_records is None:
+                        self._write_protected(name, payload)
+                    else:
+                        # Immutable bytes first. The authoritative root becomes
+                        # visible only after the entire generation is durable.
+                        pending_records[name] = payload
+                        operation = {"payload": descriptor, "rootSha256": hashlib.sha256(payload).hexdigest()}
+                        self._write_admitted_records(name, "journal-initial-operation", pending_records,
+                                                     operation=operation)
                 except Exception:
                     # Replacement may have completed before an interrupted
-                    # acknowledgement/bookkeeping step. Authenticate and compare
-                    # the exact intended root before treating it as published.
+                    # acknowledgement/bookkeeping step; trust exact bytes only.
                     try:
                         published = self.storage.read(name) == payload
                     except Exception:
                         published = False
                     if not published:
                         raise
-                self._cleanup_operation_payloads_locked()
+                if initial_upload:
+                    try:
+                        self._prune_expired_locked(identity)
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning("Post-publication journal pruning deferred: %s", exc)
+                elif not reuse_generation:
+                    self._cleanup_operation_payloads_locked()
+            return record
 
-    def _write_segmented_payload(self, owner: str, role: str, value: Any) -> dict[str, Any]:
-        """Persist owned immutable admitted segments before their root is published."""
+    def _write_segmented_payload(self, owner: str, role: str, value: Any, *,
+                                 pending: dict[str, bytes] | None = None) -> dict[str, Any]:
+        """Persist immutable content apart from the root's lifecycle state.
+
+        Argument/result state changes still create a new sealed generation.
+        Merely advancing prepared/resume/lifecycle state reuses this exact
+        immutable record, with root fields carrying their authoritative dates.
+        """
+        immutable = dict(value) if role == "operation" else value
+        if role == "operation":
+            for field in ("state", "updated_at", "resolved_at"):
+                immutable.pop(field, None)
         generation = uuid.uuid4().hex
         prefix = _segmented_payload_prefix(owner, role, generation)
-        self._write_protected(prefix + "owner", _json_bytes(_payload_owner(owner, role, generation)))
+        marker = prefix + "owner"
+        batch = {marker: _json_bytes(_payload_owner(owner, role, generation))}
         checksum = hashlib.sha256()
         length = count = 0
-        for count, chunk in enumerate(_operation_json_chunks(value), 1):
-            self._write_protected(f"{prefix}{count - 1}", chunk)
+        for count, chunk in enumerate(_operation_json_chunks(value if role != "operation" else immutable), 1):
+            batch[f"{prefix}{count - 1}"] = chunk
             checksum.update(chunk)
             length += len(chunk)
+            if pending is None and len(batch) == _PAYLOAD_ADMISSION_BATCH_RECORDS:
+                self._write_payload_batch(marker, batch)
+                batch.clear()
+        if pending is not None:
+            pending.update(batch)
+        elif batch:
+            self._write_payload_batch(marker, batch)
         return {"role": role, "generation": generation, "chunkCount": count,
                 "bytes": length, "sha256": checksum.hexdigest()}
+
+
+    def _write_payload_batch(self, marker: str, batch: dict[str, bytes]) -> None:
+        if len(batch) > 1 and self._write_admitted_records(marker, "journal-payload", batch, optional_batch=True):
+            return
+        # Per-file admission can fit when only the combined encryption
+        # headroom is too large. Keep the identical write order in that case.
+        for name, payload in batch.items():
+            self._write_protected(name, payload)
 
     def _read_segmented_payload(self, owner: str, descriptor: dict[str, Any]):
         _validate_payload_descriptor(descriptor, descriptor.get("role"))
@@ -811,34 +928,46 @@ class ProtectedJournal:
         pattern = (r"action-payload-(op-[0-9a-f]{16}-[0-9a-f-]{36})-([0-9a-f]{32})-owner"
                    if role == "operation" else r"workflow-payload-(import-workflow-[0-9a-f]{32})-([0-9a-f]{32})-owner")
         try:
-            owners = self.storage.list_records()
+            # Filename discovery already replaces list_records and sorts the whole
+            # directory per obsolete owner. Validate candidate names before
+            # decrypting them, and enumerate the record names exactly once.
+            owners = tuple(filter(re.compile(pattern).fullmatch, self.storage.list_records()))
         except Exception as exc:
             logging.getLogger(__name__).warning("Payload cleanup enumeration deferred: %s", exc)
             return
         for name in owners:
             match = re.fullmatch(pattern, name)
-            if match is None:
-                continue
             owner, generation = match.groups()
             try:
                 if _strict_json_loads(self.storage.read(name)) != _payload_owner(owner, role, generation):
                     raise ValueError("Invalid payload ownership")
-                names = self.storage.list_records()
-                if owner in names:
+                prefix = _segmented_payload_prefix(owner, role, generation)
+                # The current action urn may have many obsolete generations, while
+                # its chunks in the active history belong to a different prefix.
+                # Classifying genealogy by prefix does not require a full directory
+                # scan per owner; only a genuinely stale generation is enumerated.
+                if self.storage.has_record(owner):
                     root = decode_root(self.storage.read(owner), owner)
                     if root["payload"]["generation"] == generation:
                         continue
-                prefix = _segmented_payload_prefix(owner, role, generation)
-                owned = [candidate for candidate in names if candidate.startswith(prefix) and candidate != name]
+                owned = tuple(candidate for candidate in self.storage.iter_records()
+                              if candidate.startswith(prefix) and candidate != name)
                 if any(re.fullmatch(r"[0-9]+", candidate[len(prefix):]) is None for candidate in owned):
                     raise ValueError("Invalid owned payload name")
             except Exception as exc:
                 logging.getLogger(__name__).warning("Payload cleanup ownership deferred (%s): %s", owner, exc)
                 continue
             try:
-                for candidate in owned:
-                    self.storage.delete(candidate)
-                self.storage.delete(name)
+                quota_lock = self.storage.user_quota_lock if role == "operation" else nullcontext
+                with quota_lock():
+                    if role == "operation" and any(
+                            pending["owner_id"] == owner and pending["operation"]["payload"]["generation"] == generation
+                            for pending in StorageAdmissionCoordinator(self.storage).initial_operations(
+                                self.storage.iter_records())):
+                        continue
+                    for candidate in owned:
+                        self.storage.delete(candidate)
+                    self.storage.delete(name)
             except Exception as exc:
                 # The authoritative root remains published. Retain the owner
                 # until every obsolete segment is removed; cleanup is retryable.
@@ -1012,13 +1141,16 @@ class ProtectedJournal:
     @staticmethod
     def _decode_operation_root(payload: bytes, name: str) -> dict[str, Any]:
         root = _strict_json_loads(payload)
-        if not isinstance(root, dict) or set(root) != {"key", "identity", "state", "payload"}:
+        required = {"key", "identity", "state", "payload", "updatedAt", "resolvedAt"}
+        if not isinstance(root, dict) or set(root) != required:
             raise JournalError("Recovery operation root has an unsupported format")
         try:
             identity = DeploymentIdentity.from_dict(root["identity"])
             expected = _record_name(identity, root["key"])
             if (not _is_uuid(root["key"]) or name not in {expected, f"{expected}.dpapi"}
-                    or not isinstance(root["state"], str) or root["state"] not in _TRANSITIONS):
+                    or not isinstance(root["state"], str) or root["state"] not in _TRANSITIONS
+                    or _aware_datetime(root["updatedAt"]) is None
+                    or (root["resolvedAt"] is not None and not isinstance(root["resolvedAt"], str))):
                 raise ValueError("Invalid operation root binding")
             _validate_payload_descriptor(root["payload"], "operation")
         except (ValueError, TypeError, KeyError) as exc:
@@ -1036,7 +1168,11 @@ class ProtectedJournal:
         root = self._decode_operation_root(payload, name)
         try:
             raw = self._read_segmented_payload(name.removesuffix(".dpapi"), root["payload"])
-            if any(raw[field] != root[field] for field in ("identity", "key", "state")):
+            raw.update(state=root["state"], updated_at=root["updatedAt"], resolved_at=root["resolvedAt"])
+
+            if root["resolvedAt"] is not None and root["state"] not in {"released", "failed"}:
+                raise ValueError("Unreleased root lifecycle timestamp is invalid")
+            if any(raw[field] != root[field] for field in ("identity", "key")):
                 raise ValueError("Operation root and payload disagree")
         except Exception as exc:
             raise JournalError("Recovery operation payload is corrupt or unavailable") from exc
@@ -1394,6 +1530,8 @@ def valid_import_result_envelope(value: Any) -> bool:
             or type(value["expiresAt"]) is not int or not 0 <= value["expiresAt"] <= _MAX_SAFE_INTEGER
             or not isinstance(value["collections"], dict)):
         return False
+    if value["kind"] == "apply" and value["state"] != "APPLIED":
+        return False
     if value["kind"] == "clone" and value["operationId"] is None:
         return False
     if value["kind"] == "clone" and (
@@ -1428,8 +1566,7 @@ def _valid_plan_observation(value: Any, envelope: dict[str, Any] | None = None) 
         return False
     return (envelope is None or (value["planId"] == envelope["planId"]
                                  and value["namespaceId"] == envelope["namespaceId"]
-                                 and value["targetRevision"] == envelope["revision"]
-                                 and value["expiresAt"] == envelope["expiresAt"]))
+                                 and value["targetRevision"] == envelope["revision"]))
 
 
 def valid_import_plan_wrapper(value: Any, *, plan_id: str | None = None,
@@ -1440,8 +1577,7 @@ def valid_import_plan_wrapper(value: Any, *, plan_id: str | None = None,
         return False
     envelope, plan = value["analysisResult"], value["plan"]
     if (envelope["kind"] != "analysis" or envelope["state"] != "PLAN_READY"
-            or envelope["revision"] != plan["targetRevision"]
-            or envelope["expiresAt"] != plan["expiresAt"]):
+            or envelope["revision"] != plan["targetRevision"]):
         return False
     if plan_id is not None and plan["planId"] != plan_id:
         return False

@@ -1,4 +1,4 @@
-﻿"""Optional, lossless NetworkX adapter for Deposit Exchange graph snapshots."""
+"""Optional, lossless NetworkX adapter for Deposit Exchange graph snapshots."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -42,6 +42,8 @@ def to_networkx(snapshot: Mapping[str, Any]):
         resources=deepcopy(records["resources"]),
         geometries=deepcopy(records["geometries"]),
         userTools=deepcopy(records["userTools"]),
+        scope=manifest["scope"],
+        rootIds=deepcopy(manifest["rootIds"]),
     )
 
     classes = {record["id"]: record for record in records["classes"]}
@@ -236,6 +238,7 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
             raise ValueError("Graph contains duplicate node keys")
         by_key[tuple(key)] = attrs
         record = {name: deepcopy(value) for name, value in attrs.items() if name != "kind"}
+        record["kind"] = kind
         if kind == "Class":
             record_lists["classes"].append(record)
         else:
@@ -264,6 +267,7 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
         if (source[1], target[1]) != expected_kinds:
             raise ValueError(f"{kind} has invalid endpoint kinds")
         record = {name: deepcopy(value) for name, value in attrs.items() if name != "kind"}
+        record["kind"] = kind
         if kind == "Membership":
             if record.get("objectId", source[2]) != source[2] or record.get("classId", target[2]) != target[2]:
                 raise ValueError("Membership attributes contradict graph endpoints")
@@ -306,12 +310,23 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
     version = metadata.get("depositVersion")
     if version is not None and (not isinstance(version, str) or not version):
         raise ValueError("Graph depositVersion must be a Server version String or null")
+    scope = metadata.get("scope", "namespace")
+    if scope not in ("namespace", "subgraph"):
+        raise ValueError("Graph scope must be namespace or subgraph")
+    root_ids = metadata.get("rootIds", sorted(object_by_id) if scope == "subgraph" else [])
+    if (not isinstance(root_ids, list)
+            or any(not isinstance(root_id, str) or not root_id for root_id in root_ids)
+            or len(set(root_ids)) != len(root_ids)
+            or (scope == "subgraph" and not root_ids)
+            or (scope == "namespace" and root_ids)):
+        raise ValueError("Graph rootIds must agree with its namespace/subgraph scope")
     manifest = {
         "packageId": str(uuid.uuid4()), "sourceNamespaceId": namespace_id,
         "name": "NetworkX graph", "description": "", "depositVersion": version,
         "historyMode": "disabled", "exportedRevision": revision,
         "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "rootIds": sorted(object_by_id), "scope": "subgraph", "includeHistory": False,
+        "rootIds": deepcopy(root_ids),
+        "scope": scope, "includeHistory": False,
         "files": {},
     }
     return {"manifest": manifest, "graph": record_lists}

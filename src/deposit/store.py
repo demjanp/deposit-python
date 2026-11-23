@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from contextlib import contextmanager, nullcontext
 import base64
 import hashlib
@@ -51,6 +52,8 @@ _ENTITY_QUERY = {
     "deposit.apply.batch": ("data",),
 }
 _STORE_FACTORY_TOKEN = object()
+_IMPORT_PLAN_LEASE_MS = 24 * 60 * 60 * 1000
+_verified_local_progress = ContextVar("deposit_verified_local_progress", default=None)
 _DOMAIN_VALUE_TYPES = {
     "String", "Integer", "Float", "Boolean", "Date", "Time", "LocalTime", "DateTime",
     "LocalDateTime", "Duration", "Point", "List", "DDict", "DGeometry", "DResource",
@@ -1229,9 +1232,10 @@ class Store:
                     "PLAN_EXPIRED": "EXPIRED", "EXPIRED": "EXPIRED",
                     "FORBIDDEN": "FAILED", "UNAUTHENTICATED": "FAILED", "NOT_FOUND": "FAILED"}
         state = terminal.get(code)
-        if (code == "NOT_FOUND" and record["apply_requested"] and record["plan_expires_at"] is not None
-                and record["plan_expires_at"] <= int(time.time() * 1000)):
-            state = "EXPIRED"
+        if record["plan_id"] and code in {"NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED"}:
+            # The action may have failed definitively while the plan still
+            # exists. An authorization-hidden response cannot release it.
+            state = None
         # A response code during receipt lookup is not evidence of rollback.
         # Only finalized local action failures authorize terminal classification.
         active_key = record["action_keys"].get("apply" if record["apply_requested"] else "analysis")
@@ -1239,38 +1243,84 @@ class Store:
             action = self._journal.load_if_present(self._identity, active_key)
             if action is not None and action["state"] not in {"failed", "conflicted"}:
                 state = None
-        if state is None and not record["action_keys"] and not record["source_namespace_id"]:
+        # Only an unstarted local caller input is proven unusable. Protected
+        # storage failures cannot discard an authenticated frozen input.
+        if (state is None and not record["action_keys"] and not record["source_namespace_id"]
+                and record["state"] in {"CREATED", "SOURCE_EXPORT_REQUESTED", "SOURCE_STAGING"} and code != "SESSION_EXPIRED"):
             state = "FAILED"
         if state:
             workflows.update(workflow_id, state=state, phase=state.lower(), failure=code or type(exc).__name__)
             self._cleanup_import_workflow(workflows, workflow_id)
         else:
             previous = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
+            failure = code or type(exc).__name__
+            if (record["state"] == "OUTCOME_UNCERTAIN" and record["resume_state"] == previous
+                    and record["failure"] == failure):
+                return
             workflows.update(workflow_id, state="OUTCOME_UNCERTAIN", resume_state=previous,
-                             failure=code or type(exc).__name__)
+                             failure=failure)
 
     def _observe_import_plan(self, workflows, workflow_id, *, abandoning=False):
         record = workflows.get(workflow_id)
         if not record["plan_id"]:
             return None
+        if abandoning:
+            now = int(time.time() * 1000)
+            if record["phase"] == "abandon_waiting_for_plan_lease":
+                if record["plan_expires_at"] > now:
+                    return "ready"
+                # Recheck without renewing at the saved lease deadline. The
+                # Server distinguishes an authorized expired plan from hidden
+                # authorization responses.
+                pass
+            if (record["phase"] == "abandon_pending" and record["plan_expires_at"] is not None
+                    and record["plan_expires_at"] > now):
+                return "ready"
+            # Keep inputs protected across a lost response. Abandonment uses a
+            # nonrenewing observation; record the actual Server expiry below.
+            workflows.update(workflow_id, state="ABANDON_PENDING", phase="abandon_waiting_for_plan_lease",
+                             plan_expires_at=now + _IMPORT_PLAN_LEASE_MS, cleanup_status="pending")
         try:
-            wrapper = self._call_one("deposit.get.importPlan", record["plan_id"])
+            wrapper = self._call_one("deposit.get.importPlan", record["plan_id"], not abandoning)
         except DepositError as exc:
+            if abandoning and exc.code == "PLAN_EXPIRED":
+                return "expired"
             if exc.code not in {"NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED"}:
                 raise
-            # NOT_FOUND intentionally hides authorization as well as expiry;
-            # retain that distinction rather than inventing an expiry reason.
-            expired = record["plan_expires_at"] is not None and record["plan_expires_at"] <= int(time.time() * 1000)
-            if not abandoning:
-                workflows.update(workflow_id, state="EXPIRED" if expired else "FAILED",
-                                 phase="expired" if expired else "plan_unavailable", failure=exc.code)
-                self._cleanup_import_workflow(workflows, workflow_id)
-            return "expired" if expired else "unavailable"
+            # Authorization can be hidden behind any of these observations.
+            # A saved local deadline is not authoritative proof that a renewed
+            # Server plan is gone: fail closed until a later observation/retry.
+            if abandoning:
+                workflows.update(workflow_id, state="OUTCOME_UNCERTAIN",
+                                 resume_state="ABANDON_PENDING", phase="abandon_pending",
+                                 failure="RECOVERY_PENDING", cleanup_status="pending",
+                                 plan_expires_at=record["plan_expires_at"])
+                raise DepositError("RECOVERY_PENDING",
+                                   "Import plan availability is unconfirmed; protected inputs remain owned") from exc
+            # Ordinary resume must preserve the same protected ownership.
+            # Neither local expiry arithmetic nor an authorization-hidden read
+            # is an authoritative expiry/absence response. Keep the apply
+            # barrier and allow a later reauthenticated observation to continue.
+            previous = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
+            workflows.update(workflow_id, state="OUTCOME_UNCERTAIN", resume_state=previous,
+                             phase="plan_unavailable", failure=exc.code, cleanup_status="pending")
+            return "unavailable"
         if not valid_import_plan_wrapper(wrapper, plan_id=record["plan_id"], namespace_id=self.namespace_id):
             raise DepositError("INVALID_RESPONSE", "Import plan observation returned an invalid wrapper")
         state = wrapper["plan"]["state"]
-        if state == "applied" and not record["apply_requested"]:
-            workflows.update(workflow_id, state="APPLIED", phase="applied")
+        if state == "ready":
+            deadline = wrapper["plan"]["expiresAt"]
+            if abandoning:
+                workflows.update(workflow_id, plan_expires_at=deadline, resume_state=None, failure=None)
+            else:
+                workflows.update(workflow_id, state="PLAN_READY", phase="plan_ready",
+                                 plan_expires_at=deadline, resume_state=None, failure=None)
+        if state == "applied" and not abandoning and not record["apply_requested"]:
+            # A caller may have applied this exact plan through another
+            # authorization owner; recover that terminal boundary idempotently
+            # rather than treating its plan receipt as unknown.
+            workflows.update(workflow_id, state="APPLIED", phase="applied",
+                             resume_state=None, failure=None)
             self._cleanup_import_workflow(workflows, workflow_id)
         return state
 
@@ -1455,7 +1505,10 @@ class Store:
             record = workflows.get(workflow_id)
             if record["target_identity"] != self._identity.to_dict() or record["target_namespace_id"] != self.namespace_id:
                 raise DepositError("IDENTITY_MISMATCH", "Import workflow target binding changed before apply")
-            if record["state"] not in {"PLAN_READY", "APPLY_REQUESTED", "APPLYING", "OUTCOME_UNCERTAIN", "APPLIED"}:
+            state = record["resume_state"] if record["state"] == "OUTCOME_UNCERTAIN" else record["state"]
+            if state in {"ABANDON_REQUESTED", "ABANDON_PENDING"} or record["state"] not in {
+                "PLAN_READY", "APPLY_REQUESTED", "APPLYING", "OUTCOME_UNCERTAIN", "APPLIED",
+            }:
                 raise DepositError("IMPORT_WORKFLOW_BUSY", "Import workflow cannot accept apply intent")
             if record["state"] == "PLAN_READY":
                 key = str(uuid.uuid4())
@@ -1491,7 +1544,7 @@ class Store:
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("plan_id must be a nonempty string")
         self._client.require_paged_import_results()
-        wrapper = self._call_one("deposit.get.importPlan", plan_id)
+        wrapper = self._call_one("deposit.get.importPlan", plan_id, True)
         if not valid_import_plan_wrapper(wrapper, plan_id=plan_id, namespace_id=self._namespace_id):
             raise DepositError("INVALID_RESPONSE", "Import plan inspection returned an invalid wrapper")
         plan_observation = wrapper["plan"]
@@ -2119,9 +2172,14 @@ class Store:
                 raise DepositError("SCOPE_MISMATCH", "Entity belongs to another Namespace")
             return data
 
-    def _call_one(self, procedure: str, *arguments: Any) -> Any:
+    def _call_one(self, procedure: str, *arguments: Any, _already_serialized: bool = False) -> Any:
         entry = store_procedure(procedure)
-        with self.call(procedure, *arguments) as result:
+        if _already_serialized:
+            bound = bind_arguments(entry, arguments, namespace_id=self._namespace_id)
+            result = self._open_result(entry, bound, _already_serialized=True)
+        else:
+            result = self.call(procedure, *arguments)
+        with result:
             row = next(result, None)
             if row is None:
                 raise DepositError("INVALID_RESPONSE", f"{procedure} returned no row")
@@ -2177,14 +2235,20 @@ class Store:
                     handle._mark_stale()
             raise
 
-    def _open_result(self, entry: dict[str, Any], arguments: tuple[Any, ...]) -> StoreResult:
-        guard = self._serialized()
+    def _open_result(self, entry: dict[str, Any], arguments: tuple[Any, ...], *, _already_serialized: bool = False) -> StoreResult:
+        # Recovery and action completion already hold the operation lock.  A
+        # result page fetched there must share it instead of reacquiring it.
+        guard = nullcontext() if _already_serialized else self._serialized()
         guard.__enter__()
         session = None
         transaction = None
         store_result = None
         closing_error = False
         try:
+            with self._state_lock:
+                if self._closed or (self._closing and not _already_serialized):
+                    closing_error = True
+                    raise RuntimeError("Store is closed")
             session = self._client._session()
             transaction = session.begin_transaction()
             query, parameters = build_query(entry, arguments, self._token)
@@ -2209,7 +2273,7 @@ class Store:
                 token=self._token,
             )
             with self._state_lock:
-                closing_error = self._closed or self._closing
+                closing_error = self._closed or (self._closing and not _already_serialized)
                 if not closing_error:
                     self._active_result = store_result
             if closing_error:
@@ -2322,14 +2386,13 @@ class Store:
                 matches &= manifest["upload_id"] is not None and arguments == [manifest["upload_id"]]
             else:
                 try:
-                    index = self._upload_chunk_index(manifest, manifest["pending_offset"])
-                    chunk = spool.chunk_metadata(manifest, index)
                     block = base64.b64decode(arguments[2], validate=True)
                     matches &= (len(arguments) == 4 and arguments[0] == manifest["upload_id"]
                                 and arguments[1] == manifest["pending_offset"]
-                                and arguments[3] == chunk["sha256"]
-                                and len(block) == manifest["pending_length"] == chunk["bytes"]
-                                and hashlib.sha256(block).hexdigest() == chunk["sha256"])
+                                and block == self._upload_block(spool, manifest,
+                                                                manifest["pending_offset"],
+                                                                manifest["pending_length"])
+                                and arguments[3] == hashlib.sha256(block).hexdigest())
                 except (IndexError, TypeError, ValueError, TransferError):
                     matches = False
             if not matches:
@@ -2370,7 +2433,7 @@ class Store:
                 spool.cleanup_resolved(transfer_id, _locked=True)
                 return result
 
-            spool.verify_content(manifest)
+            spool.verify_content(manifest, on_verified=_verified_local_progress.get())
             if manifest["begin_action_key"] is None:
                 spool.ensure_action_capacity(manifest)
 
@@ -2404,10 +2467,7 @@ class Store:
                 if offset not in {pending_offset, pending_offset + pending_length}:
                     raise TransferError("Server upload offset does not match the protected pending chunk")
                 if offset == pending_offset:
-                    index = self._upload_chunk_index(manifest, pending_offset)
-                    block = spool.read_chunk(transfer_id, index)
-                    if len(block) != pending_length:
-                        raise TransferError("Pending upload chunk length changed")
+                    block = self._upload_block(spool, manifest, pending_offset, pending_length)
                     arguments = [begin["uploadId"], pending_offset, base64.b64encode(block).decode("ascii"), hashlib.sha256(block).hexdigest()]
                     result = self._run_transfer_step_locked(spool, manifest, "deposit.resource.uploadChunk", arguments, pending_key)
                     if not isinstance(result, dict) or result.get("nextOffset") != pending_offset + pending_length:
@@ -2427,8 +2487,8 @@ class Store:
                 manifest = spool.update(transfer_id, _locked=True, offset=offset)
 
             while offset < manifest["bytes"]:
-                index = self._upload_chunk_index(manifest, offset)
-                block = spool.read_chunk(transfer_id, index)
+                remaining_action_bytes = min(manifest["bytes"] - offset, 4 * TRANSFER_CHUNK_BYTES)
+                block = self._upload_block(spool, manifest, offset, remaining_action_bytes)
                 action_key = str(uuid.uuid4())
                 manifest = spool.update(
                     transfer_id,
@@ -2477,6 +2537,19 @@ class Store:
             spool.update(transfer_id, _locked=True, state="finished", offset=manifest["bytes"])
             spool.cleanup_resolved(transfer_id, _locked=True)
             return result
+
+    def _upload_block(self, spool, manifest: dict[str, Any], offset: int, length: int) -> bytes:
+        """Join the exact frozen protected-chunk range for one upload action."""
+        if type(length) is not int or length < 1 or offset + length > manifest["bytes"]:
+            raise TransferError("Upload action range is outside the frozen input")
+        blocks = []
+        while sum(map(len, blocks)) < length:
+            index = self._upload_chunk_index(manifest, offset + sum(map(len, blocks)))
+            block = spool.read_chunk(manifest["transfer_id"], index)
+            if sum(map(len, blocks)) + len(block) > length:
+                raise TransferError("Upload action does not end at a frozen chunk boundary")
+            blocks.append(block)
+        return b"".join(blocks)
 
     @staticmethod
     def _upload_chunk_index(manifest: dict[str, Any], offset: int) -> int:
@@ -2550,16 +2623,30 @@ class Store:
             return self._save_and_release(record, status)
 
         if state in {"intent", "prepare_sent"}:
-            self._journal.update(self._identity, key, state="prepare_sent")
-            try:
-                status = self._control("deposit.action.status", key)
-            except DepositError as exc:
-                if exc.code != "NOT_FOUND":
-                    raise
+            # Keep the freshly durable intent itself through the uncertain first
+            # remote call. A prepare_sent checkpoint is needed only when a prior
+            # interrupted request is being reconciled: no later local transition
+            # has yet bound the acknowledged operation to this action. The new
+            # intent is already sufficient for recovery to query the exact key.
+            if state == "prepare_sent":
+                self._journal.update(self._identity, key, state="prepare_sent")
+            if state == "intent" and allow_new_prepare:
+                # This newly created intent has not been prepared remotely here.
+                # Skip one status RPC; the encrypted intent remains durable first.
+                # Recovered `prepare_sent` itself still checks the authoritative
+                # Server receipt before any call can be considered resolved.
                 self._assert_preconditions_unchanged(record, allow_new_prepare)
                 prepared = self._control("deposit.action.prepare", key, record["procedure"], record["arguments"])
             else:
-                prepared = status
+                try:
+                    status = self._control("deposit.action.status", key)
+                except DepositError as exc:
+                    if exc.code != "NOT_FOUND":
+                        raise
+                    self._assert_preconditions_unchanged(record, allow_new_prepare)
+                    prepared = self._control("deposit.action.prepare", key, record["procedure"], record["arguments"])
+                else:
+                    prepared = status
             if prepared.get("state") == "committed":
                 return self._save_and_release(record, prepared)
             self._journal.update(self._identity, key, state="prepared", operation_id=prepared.get("operationId"))
@@ -2572,6 +2659,10 @@ class Store:
             resumed = self._control("deposit.action.resume", key)
             if resumed.get("state") == "committed":
                 return self._save_and_release(record, resumed)
+            # Reconciled execution is a distinct permitted transition. It may
+            # return a Server operation identity (including one chosen by the
+            # implementation), distinct from preparation; preserve it before
+            # actual remote work rather than assuming the initial ID is reused.
             self._journal.update(self._identity, key, state="executing", operation_id=resumed.get("operationId"))
             try:
                 result = self._execute_entity_action(record)
@@ -2603,9 +2694,11 @@ class Store:
 
         if state in {"outcome_saved", "release_sent"}:
             status = self._control("deposit.action.status", key)
+            self._assert_bound_operation_id(current, status)
             if status.get("state") not in {"prepared", "committed"}:
                 raise DepositError("RECOVERY_PENDING", "Prepared action is unavailable; the saved outcome remains protected")
-            self._control("deposit.action.resume", key)
+            resumed = self._control("deposit.action.resume", key)
+            self._assert_bound_operation_id(self._journal.load(self._identity, key), resumed)
             self._journal.update(self._identity, key, state="release_sent")
             self._control("deposit.action.release")
             saved = self._journal.update(self._identity, key, state="released")
@@ -2621,11 +2714,13 @@ class Store:
         """Reconcile and detach a known rollback without executing it again."""
         key = record["key"]
         status = status if status is not None else self._control("deposit.action.status", key)
+        self._assert_bound_operation_id(self._journal.load(self._identity, record["key"]), status)
         if status.get("state") == "committed":
             return self._save_and_release(record, status)
         if status.get("state") != "prepared":
             raise DepositError("RECOVERY_PENDING", "Failed action release remains unconfirmed")
         resumed = self._control("deposit.action.resume", key)
+        self._assert_bound_operation_id(self._journal.load(self._identity, key), resumed)
         if resumed.get("state") == "committed":
             return self._save_and_release(record, resumed)
         if resumed.get("state") != "prepared":
@@ -2633,6 +2728,22 @@ class Store:
         self._control("deposit.action.release")
         saved = self._journal.update(self._identity, key, state="failed")
         raise _saved_failure_error(saved["failure"])
+
+    def _assert_bound_operation_id(self, record: dict[str, Any], observation: dict[str, Any]) -> None:
+        """Refuse to release under a contradictory Server operation identity.
+
+        A receipt that never bound an identity adopts the one proved by the
+        authoritative observation. A receipt that already bound one must see it
+        confirmed exactly: a different or withheld identity leaves the durable
+        failure untouched and pending instead of finalizing it.
+        """
+        bound = record.get("operation_id")
+        if bound is None or bound == "":
+            return
+        observed = observation.get("operationId")
+        if observed == bound:
+            return
+        raise DepositError("RECOVERY_PENDING", "Recovery observation contradicts the bound operation identity")
 
     def _assert_preconditions_unchanged(self, record: dict[str, Any], allowed: bool) -> None:
         if not allowed:
@@ -2761,8 +2872,15 @@ class Store:
         else:
             outcome = _portable_input(outcome)
         key = record["key"]
+        # Status belongs to the actual durable recovery root, not necessarily
+        # the unbound intent passed by resume of an older caller.
         current = self._journal.load(self._identity, key)
+        self._assert_bound_operation_id(current, status)
         if record.get("result_format") == RESULT_FORMAT_IMPORT:
+            bound_operation_id = current.get("operation_id")
+            if bound_operation_id is not None and status.get("operationId") is not None:
+                if bound_operation_id != status.get("operationId"):
+                    raise DepositError("RECOVERY_PENDING", "Committed import identity differs from the durable receipt")
             if current["state"] in {"outcome_saved", "release_sent", "released"}:
                 if current["outcome"] != outcome:
                     raise DepositError("RECOVERY_IDENTITY_MISMATCH", "Saved import result changed during recovery")
@@ -2781,7 +2899,8 @@ class Store:
 
                 def fetch_page(collection, cursor, limit):
                     return self._call_one("deposit.get.importResultPage",
-                                          outcome["resultId"], collection, cursor, limit)
+                                          outcome["resultId"], collection, cursor, limit,
+                                          _already_serialized=True)
 
                 try:
                     self._journal.persist_import_result(self._identity, key, outcome, fetch_page)
@@ -2804,17 +2923,40 @@ class Store:
                 operation_id=status.get("operationId"),
                 **failure_changes,
             )
+        # The caller may supply the originally unbound initial intent, while
+        # the authoritative protected root already contains its first prepared
+        # ID. Compare against the persisted record before any value overwrite.
+        persisted_operation_id = current.get("operation_id")
+        if persisted_operation_id is not None and status.get("operationId") is not None:
+            if status["operationId"] != persisted_operation_id:
+                raise DepositError("RECOVERY_PENDING", "Server committed identity differs from the durable receipt")
         if current["state"] == "released":
+            if (current.get("operation_id") is not None and status.get("operationId") is not None
+                    and status["operationId"] != current["operation_id"]):
+                raise DepositError("RECOVERY_PENDING", "Server committed identity differs from the durable receipt")
             return current["outcome"]
-        # A resumed Store has a new token/session, so even a committed receipt
-        # must be attached to that session before action.release can confirm it.
-        self._control("deposit.action.resume", key)
+        # A resumed Store must preserve the original bound operation identity,
+        # including the committed branch covered by ordinary result replay.
+        resumed = self._control("deposit.action.resume", key)
+        self._assert_bound_operation_id(current, resumed)
         self._journal.update(self._identity, key, state="release_sent")
         self._control("deposit.action.release")
         saved = self._journal.update(self._identity, key, state="released")
         self._update_observed_revision()
         self._invalidate_handles()
         return saved["outcome"]
+
+    def _validated_release_signal(self, record, status):
+        """Reject a mismatched actor-qualified result before write/release any more.
+
+        Root status for a prepared rollback and committed success must carry the
+        durable action identity. Ordinary supplied records are unbound intent;
+        existing protected snapshots carry the actual prepared operation.
+        """
+        bound = record.get("operation_id")
+        observed = status.get("operationId") if isinstance(status, dict) else None
+        if bound is not None and observed != bound:
+            raise DepositError("RECOVERY_PENDING", "Recovery observation contradicts the bound operation identity")
 
     def _release_conflict(self, record: dict[str, Any]) -> None:
         self._control("deposit.action.release")

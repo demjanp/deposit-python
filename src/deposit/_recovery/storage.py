@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ctypes
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from functools import lru_cache
 import hashlib
 import json
@@ -19,8 +19,19 @@ from typing import BinaryIO
 import shutil
 
 
+_RECORD_TEMPORARY = re.compile(r"\.([0-9a-f]{64})\.[0-9a-f]{32}\.tmp")
+
+
+def _record_name_digest(name: str) -> str:
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+
+
 class ProtectedStorageError(RuntimeError):
     """Protected persistence is unavailable or a record cannot be read safely."""
+
+
+class InsufficientStorageError(ProtectedStorageError):
+    """The requested commitment exceeds available space after existing commitments."""
 
 
 _quota_lock_state = threading.local()
@@ -632,7 +643,8 @@ class ProtectedStore:
             raise ProtectedStorageError("Recovery record exceeds the 16 MiB limit")
         path = self._path(name)
         payload = self._MAGIC + _crypt(plaintext, protect=True)
-        temporary = self.root / f".{secrets.token_hex(16)}.tmp"
+        # Bind an interrupted rename to its destination without another file write.
+        temporary = self.root / f".{_record_name_digest(name)}.{secrets.token_hex(16)}.tmp"
         if len(payload) > self.MAX_PROTECTED_BYTES:
             raise ProtectedStorageError("Protected recovery record exceeds the 16 MiB limit")
         # Serialize writes across registered roots while replacing the root
@@ -657,19 +669,23 @@ class ProtectedStore:
         return path
 
     def read(self, name: str) -> bytes:
-        path = self._path(name)
+        return self._read_protected_path(self._path(name))
+
+    @classmethod
+    def _read_protected_path(cls, path: Path) -> bytes:
+        """Authenticate a named record or an interrupted protected write."""
         try:
             size = path.stat().st_size
         except OSError as exc:
             raise ProtectedStorageError("Recovery record is unavailable") from exc
-        if size > self.MAX_PROTECTED_BYTES:
+        if size > cls.MAX_PROTECTED_BYTES:
             raise ProtectedStorageError("Recovery record exceeds the 16 MiB limit")
         _secure_acl(path, directory=False)
         with _private_file(path, create=False) as source:
             payload = source.read()
-        if not payload.startswith(self._MAGIC):
+        if not payload.startswith(cls._MAGIC):
             raise ProtectedStorageError("Recovery record format is invalid")
-        return _crypt(payload[len(self._MAGIC):], protect=False)
+        return _crypt(payload[len(cls._MAGIC):], protect=False)
 
     def record_size(self, name: str) -> int:
         """Return the physical size of one existing protected record."""
@@ -831,7 +847,7 @@ class StorageAdmissionCoordinator:
             raise ProtectedStorageError("Storage volume cannot be identified") from exc
 
     def acquire(self, owner_id: str, purpose: str,
-                commitments_by_volume: dict[str, int]) -> dict:
+                commitments_by_volume: dict[str, int], *, operation: dict | None = None) -> dict:
         if not isinstance(owner_id, str) or not owner_id or not isinstance(purpose, str) or not purpose:
             raise ValueError("Admission owner and purpose are required")
         volumes, locations = self._normalize(commitments_by_volume)
@@ -839,7 +855,19 @@ class StorageAdmissionCoordinator:
         record = {"id": reservation_id, "owner_id": owner_id,
                   "purpose": purpose, "writer_pid": os.getpid(), "commitments": volumes,
                   "locations": locations, "materialized": {}, "ownership_resolved": False}
+        if operation is not None:
+            record["operation"] = operation
+        self._validate_reservation(record)
         with self.store.user_quota_lock():
+            # A stop before the first ledger rename leaves neither a public
+            # manifest nor an admission to select. Scan at every new admission
+            # so Store startup and initial-journal same-key retries reach the
+            # same reconciliation before writing more records.
+            for root in self.store.registered_roots():
+                owner_store = (self.store if root == self.store.root
+                               else object.__new__(ProtectedStore))
+                owner_store.root = root
+                StorageAdmissionCoordinator(owner_store)._reconcile_uncommitted_ledger_temporaries()
             self._check_capacity(volumes, locations)
             self._save(record, creating=True)
         return record
@@ -873,6 +901,32 @@ class StorageAdmissionCoordinator:
         reservation.update(record)
         return record
 
+    def materialized_release(self, reservation: dict, volume: str | Path, actual_bytes: int,
+                             unused_commitments: dict[str, int]) -> dict:
+        """Atomically account an admitted write and release its unused estimate.
+
+        A single protected save is correct for this final, coherent pair of
+        commit transitions; no recovery observation spans the quota lock.
+        """
+        if type(actual_bytes) is not int or actual_bytes < 0:
+            raise ValueError("Materialized byte count must be a nonnegative integer")
+        volume_id, _, _, _ = self._volume(volume)
+        with self.store.user_quota_lock():
+            record = self._load(reservation)
+            committed = record["commitments"].get(volume_id, 0)
+            if actual_bytes > committed:
+                raise ProtectedStorageError("Materialized storage exceeded its admitted commitment")
+            record["commitments"][volume_id] = committed - actual_bytes
+            record["materialized"][volume_id] = record["materialized"].get(volume_id, 0) + actual_bytes
+            unused, _ = self._normalize(unused_commitments)
+            for volume, amount in unused.items():
+                if amount > record["commitments"].get(volume, 0):
+                    raise ProtectedStorageError("Cannot release more than the unused commitment")
+                record["commitments"][volume] -= amount
+            self._save(record)
+        reservation.update(record)
+        return record
+
     def release(self, reservation: dict, unused_commitments: dict[str, int]) -> dict:
         with self.store.user_quota_lock():
             record = self._load(reservation)
@@ -885,12 +939,25 @@ class StorageAdmissionCoordinator:
         reservation.update(record)
         return record
 
-    def close(self, reservation: dict) -> None:
+    def close(self, reservation: dict, *, retire: bool = False) -> None:
+        """Resolve a completed reservation under the existing quota lock.
+
+        The default always writes a durable resolved marker because owners
+        without their own close evidence, such as exchange staging, must
+        survive a restart. ``retire=True`` intentionally reclaims the complete
+        record instead of a durable resolved marker: only a caller that already
+        retains its own durable close marker may use it, which spares a
+        successful journal record a second encrypted/fsync rewrite. Load and
+        outstanding-commitment checks always fail closed without deleting.
+        """
         with self.store.user_quota_lock():
             record = self._load(reservation)
             if any(record["commitments"].values()):
                 raise ProtectedStorageError("Unused commitments must be reconciled before closing")
             record["ownership_resolved"] = True
+            if retire:
+                self.store.delete(f"admission-{record['id']}")
+                return
             self._save(record)
 
     def reconcile(self) -> tuple[dict, ...]:
@@ -901,12 +968,12 @@ class StorageAdmissionCoordinator:
                 owner_store = self.store if root == self.store.root else object.__new__(ProtectedStore)
                 owner_store.root = root
                 coordinator = self if owner_store is self.store else StorageAdmissionCoordinator(owner_store)
-                for name in owner_store.iter_records():
+                coordinator._reconcile_uncommitted_ledger_temporaries()
+                for name in tuple(owner_store.iter_records()):
                     if not name.startswith("admission-"):
                         continue
                     try:
-                        record = json.loads(owner_store.read(name))
-                        self._validate_reservation(record)
+                        record = coordinator._read_reservation(name)
                     except Exception as exc:
                         raise ProtectedStorageError("Admission ownership cannot be reconciled safely") from exc
                     if record.get("ownership_resolved") and record.get("purpose") != "exchange-staging":
@@ -939,6 +1006,13 @@ class StorageAdmissionCoordinator:
                                                    artifacts={"state": "cleanup_pending", "resolved": False})
         return tuple(observed)
 
+    def retire(self, reservation: dict, *, storage: ProtectedStore) -> None:
+        """Reclaim a fully reconciled record; see ``close(retire=True)``."""
+        if storage is not self.store:
+            raise ProtectedStorageError("Retirement requires the coordinating protected store")
+        self.close(reservation, retire=True)
+
+
     def _normalize(self, values: dict[str, int]) -> tuple[dict[str, int], dict[str, dict[str, str | None]]]:
         if not isinstance(values, dict):
             raise TypeError("Commitments must be a mapping of paths to bytes")
@@ -963,8 +1037,7 @@ class StorageAdmissionCoordinator:
                 if not name.startswith("admission-") or name == f"admission-{excluding}":
                     continue
                 try:
-                    record = json.loads(probe_store.read(name))
-                    self._validate_reservation(record)
+                    record = StorageAdmissionCoordinator(probe_store)._read_reservation(name)
                 except Exception as exc:
                     raise ProtectedStorageError("Existing storage commitments cannot be assessed") from exc
                 if record.get("ownership_resolved"):
@@ -978,7 +1051,7 @@ class StorageAdmissionCoordinator:
             except OSError as exc:
                 raise ProtectedStorageError("Available storage cannot be assessed") from exc
             if committed.get(volume, 0) + amount > free:
-                raise ProtectedStorageError("Insufficient available storage for the requested commitment")
+                raise InsufficientStorageError("Insufficient available storage for the requested commitment")
 
     def _save(self, record: dict, *, creating=False) -> None:
         self.store.write(f"admission-{record['id']}", json.dumps(
@@ -988,18 +1061,25 @@ class StorageAdmissionCoordinator:
         if not isinstance(reservation, dict) or not isinstance(reservation.get("id"), str):
             raise ValueError("Admission reservation is invalid")
         try:
-            record = json.loads(self.store.read(f"admission-{reservation['id']}"))
+            return self._read_reservation(f"admission-{reservation['id']}")
         except Exception as exc:
             raise ProtectedStorageError("Admission reservation is unavailable") from exc
+
+    def _read_reservation(self, name: str) -> dict:
+        from .journal import _strict_json_loads
+
+        record = _strict_json_loads(self.store.read(name))
         self._validate_reservation(record)
-        if record["id"] != reservation["id"]:
-            raise ProtectedStorageError("Admission reservation is corrupt")
+        if name != f"admission-{record['id']}":
+            raise ProtectedStorageError("Admission reservation filename does not match its ID")
         return record
 
     @staticmethod
     def _validate_reservation(record: dict) -> None:
         required = {"id", "owner_id", "purpose", "writer_pid", "commitments",
                     "locations", "materialized", "ownership_resolved"}
+        if isinstance(record, dict) and record.get("purpose") == "journal-initial-operation":
+            required.add("operation")
         if (not isinstance(record, dict) or set(record) != required
                 or not isinstance(record.get("id"), str) or not re.fullmatch(r"[0-9a-f]{32}", record["id"])
                 or not isinstance(record.get("owner_id"), str) or not record["owner_id"]
@@ -1022,6 +1102,51 @@ class StorageAdmissionCoordinator:
                     or (location["guid"] is not None and not isinstance(location["guid"], str))
                     or not isinstance(location.get("nt"), str)):
                 raise ProtectedStorageError("Admission reservation volume locator is corrupt")
+        if record["purpose"] == "journal-initial-operation":
+            from .journal import _is_uuid, _validate_payload_descriptor
+
+            operation = record["operation"]
+            owner = re.fullmatch(r"op-[0-9a-f]{16}-(.+)", record["owner_id"])
+            if (owner is None or not _is_uuid(owner[1])
+                    or not isinstance(operation, dict) or set(operation) != {"payload", "rootSha256"}
+                    or not isinstance(operation["rootSha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", operation["rootSha256"]) is None
+                    or record["ownership_resolved"] or len(record["commitments"]) != 1
+                    or set(record["commitments"]) != set(record["locations"])
+                    or not set(record["materialized"]) <= set(record["commitments"])):
+                raise ProtectedStorageError("Initial journal operation reservation is corrupt")
+            try:
+                _validate_payload_descriptor(operation["payload"], "operation")
+            except ValueError as exc:
+                raise ProtectedStorageError("Initial journal operation reservation is corrupt") from exc
+
+    def _reservations(self, names):
+        for name in names:
+            if name.startswith("admission-"):
+                yield self._read_reservation(name)
+
+    def initial_operations(self, names):
+        """Yield authenticated initial operation ownership under the quota lock."""
+        for record in self._reservations(names):
+            if record["purpose"] == "journal-initial-operation":
+                yield record
+
+    def journal_root_admissions(self, owner: str, names):
+        """Yield unresolved admissions for this operation root under the quota lock."""
+        for record in self._reservations(names):
+            if (record["owner_id"] == owner and not record["ownership_resolved"]
+                    and record["purpose"] in {"journal-record", "journal-initial-operation"}):
+                yield record
+
+    def reconcile_initial_operation(self, record: dict, *, published: bool) -> bool:
+        """Settle one authenticated reservation under the caller's index and quota locks."""
+        with self.writer(record):
+            return self._reconcile_initial_operation(record, expected_published=published).get("resolved", False)
+
+    def reconcile_journal_root(self, record: dict) -> bool:
+        """Settle a previous root write under the caller's index and quota locks."""
+        with self.writer(record):
+            return self._reconcile_owner(record).get("resolved", False)
 
     def writer(self, reservation: dict):
         """Return a process-lifetime lock retained while an owner writes files."""
@@ -1030,23 +1155,29 @@ class StorageAdmissionCoordinator:
     def _reconcile_owner(self, record: dict) -> dict:
         if record.get("purpose") == "exchange-staging":
             return ExchangeStagingOwner.reconcile(self, record)
-        if record.get("purpose") == "journal-record":
+        if record.get("purpose") == "journal-initial-operation":
+            return self._reconcile_initial_operation(record)
+        if record.get("purpose") in {"journal-record", "journal-payload"}:
             name = record.get("owner_id")
             if not isinstance(name, str) or Path(name).name != name or not name:
                 return {"state": "unknown", "reason": "invalid journal record owner"}
             try:
                 if self._has_temporary_files():
+                    if (record["purpose"] == "journal-record" and name.startswith("op-")
+                            and self._discard_interrupted_root_replacement(record)):
+                        return {"state": "materialized", "resolved": True}
                     return {"state": "uncertain", "reason": "protected write temporary files remain"}
-                if self.store.has_record(name):
-                    self.store.read(name)  # authenticate and validate the completed segment
-                    segment_state = "materialized"
+                if record["purpose"] == "journal-payload":
+                    present = self._authenticate_journal_payload(name)
                 else:
-                    segment_state = "not_written"
+                    present = self.store.has_record(name)
+                    if present:
+                        self.store.read(name)
                 for volume in tuple(record["commitments"]):
                     record["commitments"][volume] = 0
                 record["ownership_resolved"] = True
                 self._save(record)
-                return {"state": segment_state, "resolved": True}
+                return {"state": "materialized" if present else "not_written", "resolved": True}
             except Exception:
                 return {"state": "uncertain", "reason": "journal record artifacts are uncertain"}
         owner = record.get("owner_id")
@@ -1086,6 +1217,145 @@ class StorageAdmissionCoordinator:
         except Exception:
             return {"state": "uncertain", "reason": "owned artifacts could not be verified"}
 
+    def _discard_interrupted_root_replacement(self, record: dict) -> bool:
+        from .journal import _PROTECTED_WRITE_ALLOWANCE, ProtectedJournal
+
+        owner = record["owner_id"]
+        with closing(self._temporary_files()) as paths:
+            temporary = next(paths, None)
+            if temporary is None or next(paths, None) is not None:
+                return False
+        match = _RECORD_TEMPORARY.fullmatch(temporary.name)
+        if match is None or match[1] != _record_name_digest(owner) or not self.store.has_record(owner):
+            return False
+
+        # An older ledger and another writer's temporary must not be paired
+        # solely because they share a destination.
+        admission = f"admission-{record['id']}"
+        if any(other["id"] != record["id"]
+               for other in self.journal_root_admissions(owner, self.store.iter_records())):
+            return False
+
+        pending = ProtectedStore._read_protected_path(temporary)
+        volume, _, _, _ = self._volume(self.store.root)
+        if (record["materialized"] or set(record["locations"]) != {volume}
+                or record["commitments"] != {volume: len(pending) + _PROTECTED_WRITE_ALLOWANCE}):
+            return False
+
+        journal = ProtectedJournal(store=self.store)
+        published = self.store.read(owner)
+        current_root = journal._decode_operation_root(published, owner)
+        pending_root = journal._decode_operation_root(pending, owner)
+        if current_root["payload"] != pending_root["payload"]:
+            return False
+        # Validate both lifecycle records and the shared, authenticated payload
+        # before rolling back the unpublished replacement. The published root
+        # remains the durable record of what survived the crash.
+        journal._decode_record(published, owner)
+        journal._decode_record(pending, owner)
+        temporary.unlink()
+        self.store.delete(admission)
+        return True
+
+    def _reconcile_initial_operation(self, record: dict, *, expected_published: bool | None = None) -> dict:
+        """Retire a verified root or remove an authenticated unpublished prefix."""
+        from .journal import (
+            OPERATION_CHUNK_BYTES, ProtectedJournal, _payload_owner, _segmented_payload_prefix,
+            _strict_json_loads,
+        )
+
+        owner = record["owner_id"]
+        operation = record["operation"]
+        descriptor = operation["payload"]
+        generation = descriptor["generation"]
+        prefix = _segmented_payload_prefix(owner, "operation", generation)
+        marker = prefix + "owner"
+        admission = f"admission-{record['id']}"
+        try:
+            published = self.store.has_record(owner)
+            if expected_published is not None and published != expected_published:
+                raise ProtectedStorageError("Initial journal root presence changed")
+            chunks = sorted((name for name in self.store.iter_records()
+                             if name.startswith(prefix) and name != marker), key=lambda name: (len(name), name))
+            count = descriptor["chunkCount"]
+            if len(chunks) > count or any(name != f"{prefix}{index}" for index, name in enumerate(chunks)):
+                raise ProtectedStorageError("Initial journal payload has unexpected chunks")
+            has_marker = self.store.has_record(marker)
+            if has_marker and _strict_json_loads(self.store.read(marker)) != _payload_owner(
+                    owner, "operation", generation):
+                raise ProtectedStorageError("Initial journal payload ownership is invalid")
+            if not has_marker and (chunks or published):
+                raise ProtectedStorageError("Initial journal payload ownership is missing")
+            # Renames are ordered, so a dead writer can leave one temporary
+            # for the next rename, including ledger replacement after publication.
+            if published:
+                next_name = admission
+            elif not has_marker:
+                next_name = marker
+            elif len(chunks) < count:
+                next_name = f"{prefix}{len(chunks)}"
+            else:
+                next_name = owner
+            temporary = self._initial_operation_temporary(next_name, (owner, marker, admission, *chunks))
+            if published:
+                root = self.store.read(owner)
+                journal = ProtectedJournal(store=self.store)
+                if (hashlib.sha256(root).hexdigest() != operation["rootSha256"]
+                        or journal._decode_operation_root(root, owner)["payload"] != descriptor
+                        or len(chunks) != count):
+                    raise ProtectedStorageError("Initial journal root does not match its reservation")
+                action = journal._decode_record(root, owner)
+                if action["procedure"] != "deposit.resource.beginUpload" or action["state"] != "intent":
+                    raise ProtectedStorageError("Initial journal root is not an upload intent")
+            else:
+                checksum = hashlib.sha256()
+                for index, name in enumerate(chunks):
+                    chunk = self.store.read(name)
+                    if len(chunk) != min(OPERATION_CHUNK_BYTES, descriptor["bytes"] - index * OPERATION_CHUNK_BYTES):
+                        raise ProtectedStorageError("Initial journal payload chunk length is invalid")
+                    checksum.update(chunk)
+                if len(chunks) == count and checksum.hexdigest() != descriptor["sha256"]:
+                    raise ProtectedStorageError("Initial journal payload checksum is invalid")
+            if temporary is not None:
+                temporary.unlink()
+            if not published:
+                # Delete from the end so another interrupted reconciliation
+                # still leaves an authenticated, contiguous prefix.
+                for name in reversed(chunks):
+                    self.store.delete(name)
+                if has_marker:
+                    self.store.delete(marker)
+            self.store.delete(admission)
+            return {"state": "materialized" if published else "not_written", "resolved": True}
+        except Exception:
+            return {"state": "uncertain", "reason": "Initial journal operation artifacts are uncertain"}
+
+    def _authenticate_journal_payload(self, marker: str) -> bool:
+        from .journal import _is_uuid, _payload_owner, _segmented_payload_prefix, _strict_json_loads
+
+        match = re.fullmatch(
+            r"(?:action-payload-(op-[0-9a-f]{16}-[0-9a-f-]{36})"
+            r"|workflow-payload-(import-workflow-[0-9a-f]{32}))-([0-9a-f]{32})-owner",
+            marker,
+        )
+        if match is None:
+            raise ProtectedStorageError("Invalid journal payload reservation owner")
+        operation, workflow, generation = match.groups()
+        if operation is not None and not _is_uuid(operation.split("-", 2)[2]):
+            raise ProtectedStorageError("Invalid journal payload reservation owner")
+        owner, role = (operation, "operation") if operation is not None else (workflow, "workflow")
+        prefix = _segmented_payload_prefix(owner, role, generation)
+        present = self.store.has_record(marker)
+        if present and _strict_json_loads(self.store.read(marker)) != _payload_owner(owner, role, generation):
+            raise ProtectedStorageError("Invalid journal payload ownership")
+        chunks = sorted((name for name in self.store.iter_records()
+                         if name.startswith(prefix) and name != marker), key=lambda name: (len(name), name))
+        if (chunks and not present) or any(name != f"{prefix}{index}" for index, name in enumerate(chunks)):
+            raise ProtectedStorageError("Invalid owned journal payload segment")
+        for name in chunks:
+            self.store.read(name)
+        return present
+
     def _verify_chunk(self, owner: str, index: int, expected_length: int, expected_hash=None) -> None:
         data_name = f"transfer-{owner}-chunk-{index:08d}"
         meta_name = f"transfer-{owner}-meta-{index:08d}"
@@ -1096,7 +1366,70 @@ class StorageAdmissionCoordinator:
                 "sha256": checksum} or (expected_hash is not None and checksum != expected_hash)):
             raise ProtectedStorageError("Owned transfer artifacts failed reconciliation")
 
+    def _initial_operation_temporary(self, next_name: str, owned_names: tuple[str, ...]) -> Path | None:
+        expected = _record_name_digest(next_name)
+        owned = {_record_name_digest(name) for name in owned_names}
+        temporary = None
+        with closing(self._temporary_files()) as paths:
+            for path in paths:
+                match = _RECORD_TEMPORARY.fullmatch(path.name)
+                if match is None:
+                    raise ProtectedStorageError("Unattributed protected write temporary remains")
+                digest = match[1]
+                if digest == expected and temporary is None:
+                    temporary = path
+                elif digest == expected or digest in owned:
+                    raise ProtectedStorageError("Unexpected initial operation temporary remains")
+        return temporary
+
     def _has_temporary_files(self) -> bool:
+        with closing(self._temporary_files()) as paths:
+            return next(paths, None) is not None
+
+    def _reconcile_uncommitted_ledger_temporaries(self) -> None:
+        """Reclaim only an authenticated reservation whose rename was interrupted.
+
+        A first admission write has no destination ledger to identify its
+        ownership. The DPAPI-protected record supplies it. Its id, the temp
+        filename hash of that exact destination and the admission owner lock
+        must all agree. Anonymous/unreadable artifacts stay fail-closed; a
+        held writer lock also retains the temporary. This is only provisional
+        cleanup because reservation preparation never had side effects yet.
+        It does not establish or infer a public action/root and writes no
+        completed-admission state.
+        """
+        from .journal import _strict_json_loads
+
+        for path in tuple(self.store.root.glob(".*.tmp")):
+            match = _RECORD_TEMPORARY.fullmatch(path.name)
+            if match is None or path.is_symlink() or not path.is_file():
+                continue  # The ordinary temporary guard retains unknown entries.
+            try:
+                # Temporaries use the same on-disk format and ACL checks as
+                # published ProtectedStore records.
+                record = _strict_json_loads(ProtectedStore._read_protected_path(path).decode("utf-8"))
+                self._validate_reservation(record)
+                ledger = f"admission-{record['id']}"
+                if match[1] != _record_name_digest(ledger):
+                    continue
+                lock = self.writer(record)
+                try:
+                    lock.acquire()
+                except ProtectedStorageError:
+                    continue
+                try:
+                    if self.store.has_record(ledger):
+                        # A created ledger is now authoritative; reconcile it ordinarily.
+                        continue
+                    path.unlink(missing_ok=True)
+                finally:
+                    lock.release()
+            except (ProtectedStorageError, OSError, ValueError, TypeError, KeyError):
+                # Anonymous/corrupt/reservation bodies can conceal arbitrary
+                # evidence and remain for the normal guard to retain.
+                continue
+
+    def _temporary_files(self):
         try:
             with os.scandir(self.store.root) as entries:
                 for entry in entries:
@@ -1104,8 +1437,7 @@ class StorageAdmissionCoordinator:
                         continue
                     if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
                         raise ProtectedStorageError("Unexpected temporary file in recovery storage")
-                    return True
-            return False
+                    yield Path(entry.path)
         except ProtectedStorageError:
             raise
         except OSError as exc:

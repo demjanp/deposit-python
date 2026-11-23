@@ -2557,12 +2557,18 @@
           "name": "planId",
           "type": "String",
           "binding": "planId"
+        },
+        {
+          "name": "renewLease",
+          "type": "Boolean",
+          "binding": "renewLease",
+          "default": true
         }
       ],
       "columns": [
         "data"
       ],
-      "mode": "READ",
+      "mode": "WRITE",
       "scope": "namespace",
       "requires_token": true,
       "action": false,
