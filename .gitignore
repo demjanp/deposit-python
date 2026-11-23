@@ -12,6 +12,7 @@ __pycache__/
 .codex/
 .agents/
 .abcroute/
+.stage-route/
 
 # Distribution / packaging
 .Python
