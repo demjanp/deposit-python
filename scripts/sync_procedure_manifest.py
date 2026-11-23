@@ -36,6 +36,8 @@ def project(server_manifest: Path) -> dict:
             "requires_token": token_index is not None,
             "token_index": token_index,
             "action": procedure["action"],
+            **({"tracked": procedure["tracked"], "cancellable": procedure["cancellable"]}
+               if "tracked" in procedure else {}),
             "admin": procedure.get("admin", False),
             "batch_eligible": procedure["batchEligible"],
             "invocation_owner": procedure["invocationOwner"],
