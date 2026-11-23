@@ -35,8 +35,8 @@ It serves as a backend for the following applications:
 
 ## Installation <a name="installation"></a>
 
-Deposit 2.x has not been published to PyPI. After publication, install the
-client with:
+Install a locally built alpha wheel with `python -m pip install <wheel-path>`.
+After publication to PyPI, choose a 2.x release with:
 
 ```
 pip install "deposit>=2,<3"
@@ -76,8 +76,6 @@ from PyPI publication.
 For the GUI installer see [Deposit GUI releases](https://github.com/demjanp/deposit_gui/releases/latest)
 
 ## Resource and import workflows
-
-The examples below describe the current checkout.
 
 Use an open Store to upload a local file or a caller-owned binary stream. The
 Server verifies the complete size and checksum before publishing it. A borrowed
@@ -137,11 +135,9 @@ Clone preserves the source name, retained history and resources. A name
 collision returns `DUPLICATE`.
 
 CSV/XLSX/GeoPackage load/save, table paging, history, undo/redo and confirmed
-restore use `store.call(...)` with the exact public Server arguments. Returned
-browser download URLs use independent browser authentication; never append a
-Store token. See the [shared Python contract](https://github.com/demjanp/deposit-hub/blob/main/deposit-python.md)
-for method signatures. The project acceptance map is maintained in the adjacent
-`test_harness/deposit-python/config/acceptance_map.json` checkout.
+restore use `store.call(...)` with the exact public Server arguments in the
+[Server procedure contract](https://github.com/demjanp/deposit-server/blob/main/runtime/public-api.json).
+Returned browser download URLs use independent browser authentication.
 
 Within `store.transaction()`, commands run in the order they are collected.
 Use `TypedValue` or a `DType` when a descriptor write needs an explicit type,
@@ -193,15 +189,22 @@ promise API compatibility. There is no automatic 1.x-to-2.x migration; use
 separate environments when both generations are needed and migrate application
 code against the Deposit 2 client and Server contract.
 
+Deposit 2 alpha removes restart journals, transfer continuation, saved local
+import results and Python Exchange ZIP parsing. Pass ZIPs directly to
+`store.import_exchange(...)`, use `ExchangeBundle` to inspect or save an
+export, and consume result mappings from the Server while their lease is valid.
+Keep a public operation ID if your application needs to inspect its outcome
+after a process restart.
+
 For cancellable workflows, pass a fresh `operation_id=Client.new_operation_id()`
 to identify the final Server action. Use `get_operation(operation_id)` and
 `cancel_operation(operation_id)` on the Store, or the token-taking Client
 methods for server-scoped actions. `DepositCancelled` indicates verified
 rollback. `OperationCommittedAfterCancel` carries the completed outcome and
-`OutcomeUnknown` identifies the original attempt to inspect. Once the original
-attempt is settled, a deliberate replacement starts from the original source
-with fresh operation and staging IDs. Close results, bundles, Stores and
-Clients when finished.
+`OutcomeUnknown` identifies the original attempt to inspect. After verified
+rollback, a deliberate replacement starts from the original source with fresh
+operation and staging IDs. Close results, bundles, Stores and Clients when
+finished.
 
 ## Contact: <a name="contact"></a>
 Peter Demján (peter.demjan@gmail.com)

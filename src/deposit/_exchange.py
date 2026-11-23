@@ -492,7 +492,9 @@ def package_for_target(bundle, endpoint):
         same_actor_and_server = False
     if same_actor_and_server:
         try:
-            next(bundle._pages("files"), None)
+            inspection = endpoint.call("deposit.exchange.inspect", *bundle.source.values())
+            if not isinstance(inspection, dict) or not isinstance(inspection.get("leaseId"), str):
+                raise _invalid("Invalid Exchange grant inspection response")
         except (DepositError, TransportError):
             # No destination action has been submitted. Relay still requires
             # every byte to be authorized by the independent source endpoint.
