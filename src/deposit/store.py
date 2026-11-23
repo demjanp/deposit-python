@@ -772,7 +772,7 @@ class Store:
         if rules is not None and not isinstance(rules, Mapping):
             raise TypeError("Pattern rules must be a mapping")
         return self._analyze("deposit.import.dataByPattern", [
-            _pattern_id_selector(pattern), _portable_input(dict(values)), _import_rules(rules),
+            _portable_input(dict(pattern)), _portable_input(dict(values)), _import_rules(rules),
         ], operation_id=operation_id)
 
     def get_layout(
@@ -853,10 +853,6 @@ class Store:
 
     def import_subtree(self, subtree, *, resources=None, resource_source=None, rules=None, operation_id=None):
         """Analyze a public subgraph with optional resource content."""
-        if not isinstance(subtree, Mapping) or not isinstance(subtree.get("manifest"), Mapping):
-            raise TypeError("Import snapshot requires a manifest mapping")
-        if subtree["manifest"].get("scope") != "subgraph":
-            raise ValueError("import_subtree requires a subgraph snapshot")
         return self.from_dict(subtree, resources=resources, resource_source=resource_source,
                               rules=rules, operation_id=operation_id)
 
@@ -1909,22 +1905,13 @@ def _freeze_import_rows(rows: Any) -> list[dict[str, Any]]:
     if not isinstance(rows, (list, tuple)):
         raise TypeError("rows must be a list or tuple of row records")
     frozen = []
-    seen = set()
     for row in rows:
-        if not isinstance(row, Mapping) or set(row) != {"id", "values"}:
-            raise TypeError("each row must contain exactly an id and values mapping")
-        row_id = row["id"]
-        if not isinstance(row_id, str) or not row_id:
-            raise ValueError("row IDs must be nonempty strings")
-        if "/" in row_id:
-            raise ValueError("row IDs cannot contain a slash")
-        if row_id in seen:
-            raise ValueError("row IDs must be unique within one submission")
-        values = row["values"]
-        if not isinstance(values, Mapping) or any(not isinstance(name, str) for name in values):
-            raise TypeError("each row values field must be a string-keyed values mapping")
-        seen.add(row_id)
-        frozen.append({"id": row_id, "values": dict(values)})
+        if not isinstance(row, Mapping):
+            raise TypeError("rows must contain mapping records")
+        record = dict(row)
+        if isinstance(record.get("values"), Mapping):
+            record["values"] = dict(record["values"])
+        frozen.append(record)
     return frozen
 
 

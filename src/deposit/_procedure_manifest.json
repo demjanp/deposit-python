@@ -2366,7 +2366,7 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "RecoveryCoordinator"
+      "invocation_owner": "SessionControl"
     },
     {
       "name": "deposit.get.lastOperation",
@@ -2381,7 +2381,7 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "RecoveryCoordinator"
+      "invocation_owner": "SessionControl"
     },
     {
       "name": "deposit.get.requests",
@@ -2396,7 +2396,7 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "RecoveryCoordinator"
+      "invocation_owner": "SessionControl"
     },
     {
       "name": "deposit.utils.cancel",
@@ -2411,7 +2411,7 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "RecoveryCoordinator"
+      "invocation_owner": "SessionControl"
     },
     {
       "name": "deposit.utils.cancelRequest",
@@ -2432,7 +2432,7 @@
       "action": false,
       "admin": false,
       "batch_eligible": false,
-      "invocation_owner": "RecoveryCoordinator"
+      "invocation_owner": "SessionControl"
     },
     {
       "name": "deposit.action.begin",
@@ -2728,27 +2728,6 @@
       "scope": "namespace",
       "requires_token": true,
       "token_index": 2,
-      "action": false,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Store"
-    },
-    {
-      "name": "deposit.load.data",
-      "args": [
-        {
-          "name": "resourceId",
-          "type": "String",
-          "binding": "resourceId"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "READ",
-      "scope": "namespace",
-      "requires_token": true,
-      "token_index": 1,
       "action": false,
       "admin": false,
       "batch_eligible": false,
@@ -3336,38 +3315,6 @@
       "invocation_owner": "Store"
     },
     {
-      "name": "deposit.save.data",
-      "args": [
-        {
-          "name": "selection",
-          "type": "Map<String,Object>",
-          "binding": "selection"
-        },
-        {
-          "name": "options",
-          "type": "Map<String,Object>",
-          "binding": "+"
-        },
-        {
-          "name": "operationId",
-          "type": "String"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "WRITE",
-      "scope": "operational",
-      "requires_token": true,
-      "token_index": 3,
-      "action": true,
-      "tracked": "always",
-      "cancellable": true,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Store"
-    },
-    {
       "name": "deposit.set.pattern",
       "args": [
         {
@@ -3400,145 +3347,12 @@
       "invocation_owner": "Store"
     },
     {
-      "name": "deposit.import.abortCloneUpload",
-      "args": [
-        {
-          "name": "uploadId",
-          "type": "String",
-          "binding": "uploadId"
-        },
-        {
-          "name": "operationId",
-          "type": "String"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "WRITE",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 2,
-      "action": true,
-      "tracked": "always",
-      "cancellable": true,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
-      "name": "deposit.import.beginCloneUpload",
-      "args": [
-        {
-          "name": "filename",
-          "type": "String",
-          "binding": "filename"
-        },
-        {
-          "name": "bytes",
-          "type": "Long",
-          "binding": "bytes"
-        },
-        {
-          "name": "sha256",
-          "type": "String",
-          "binding": "sha256"
-        },
-        {
-          "name": "operationId",
-          "type": "String"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "WRITE",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 4,
-      "action": true,
-      "tracked": "always",
-      "cancellable": true,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
       "name": "deposit.import.cloneNamespace",
       "args": [
         {
           "name": "source",
           "type": "Map<String,Object>",
           "binding": "source"
-        },
-        {
-          "name": "operationId",
-          "type": "String"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "WRITE",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 2,
-      "action": true,
-      "tracked": "always",
-      "cancellable": true,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
-      "name": "deposit.import.cloneUploadChunk",
-      "args": [
-        {
-          "name": "uploadId",
-          "type": "String",
-          "binding": "uploadId"
-        },
-        {
-          "name": "offset",
-          "type": "Long",
-          "binding": "offset"
-        },
-        {
-          "name": "bytesBase64",
-          "type": "String",
-          "binding": "bytesBase64"
-        },
-        {
-          "name": "chunkSha256",
-          "type": "String",
-          "binding": "chunkSha256"
-        },
-        {
-          "name": "operationId",
-          "type": "String"
-        }
-      ],
-      "columns": [
-        "data"
-      ],
-      "mode": "WRITE",
-      "scope": "server",
-      "requires_token": true,
-      "token_index": 5,
-      "action": true,
-      "tracked": "always",
-      "cancellable": true,
-      "admin": false,
-      "batch_eligible": false,
-      "invocation_owner": "Client"
-    },
-    {
-      "name": "deposit.import.finishCloneUpload",
-      "args": [
-        {
-          "name": "uploadId",
-          "type": "String",
-          "binding": "uploadId"
         },
         {
           "name": "operationId",

@@ -143,6 +143,11 @@ Store token. See the [shared Python contract](https://github.com/demjanp/deposit
 for method signatures. The project acceptance map is maintained in the adjacent
 `test_harness/deposit-python/config/acceptance_map.json` checkout.
 
+Within `store.transaction()`, commands run in the order they are collected.
+Use `TypedValue` or a `DType` when a descriptor write needs an explicit type,
+including writes that create a declaration. The Server checks the declaration
+in effect at that command and rolls back the batch if any command fails.
+
 ## NetworkX graph conversion <a name="networkx-graph-conversion"></a>
 
 Install `deposit[networkx]` to use `Store.to_networkx(...)` or

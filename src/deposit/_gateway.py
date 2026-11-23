@@ -42,10 +42,10 @@ _CLIENT_GATEWAY_PROCEDURES = frozenset(
 )
 
 _STORE_CONTROL_PROCEDURES = {
-    "deposit.get.requests": "RecoveryCoordinator",
-    "deposit.get.lastOperation": "RecoveryCoordinator",
-    "deposit.utils.cancel": "RecoveryCoordinator",
-    "deposit.utils.cancelRequest": "RecoveryCoordinator",
+    "deposit.get.requests": "SessionControl",
+    "deposit.get.lastOperation": "SessionControl",
+    "deposit.utils.cancel": "SessionControl",
+    "deposit.utils.cancelRequest": "SessionControl",
 }
 
 def _manifest() -> dict[str, Any]:

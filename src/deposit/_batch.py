@@ -8,14 +8,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from ._gateway import domain_arguments, store_procedure
-from .store import _descriptor_payload, _encode_object_properties, _portable_input
-from .values import DType, TypedValue, _infer_type, encode_value
+from .store import _portable_input
+from .values import DType, TypedValue, encode_value
 
 
 MAX_COMMANDS = 1_000
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _SERVER_IDENTITY_BINDINGS = {"id", "objectId", "classId", "sourceId", "targetId"}
-_SCHEMA_MUTATIONS = {"deposit.create.classDescriptor", "deposit.delete.classDescriptor", "deposit.set.membership"}
 
 
 class BatchReference:
@@ -38,12 +37,7 @@ class Batch:
         self._resource_encoder = getattr(store, "_resource_write_value", None)
         self._commands: list[dict[str, Any]] = []
         self._keys: dict[BatchReference, str] = {}
-        self._class_schemas: dict[BatchReference, dict[str, str]] = {}
-        self._object_schemas: dict[BatchReference, dict[str, str] | None] = {}
-        self._object_classes: dict[BatchReference, BatchReference | None] = {}
-        self._handle_schemas: dict[int, dict[str, str]] = {}
         self._pinned_revision: int | None = None
-        self._schema_mutated = False
         self._results: dict[str, Any] | None = None
         self._entered = False
         self._closed = False
@@ -82,48 +76,19 @@ class Batch:
         key = f"c{index}_{uuid.uuid4().hex}"
         args = [self._encode_argument(entry, i, value) for i, value in enumerate(arguments)]
         command = {"key": key, "procedure": procedure, "arguments": args}
+        descriptor_types = self._encode_descriptors(procedure, arguments, args)
+        if descriptor_types:
+            command["descriptorTypes"] = descriptor_types
         # Freeze before storing. Caller-owned dictionaries/lists can change
         # immediately after this method returns.
         candidate = self._freeze_commands([*self._commands, command])
         reference = BatchReference(self, key)
         self._commands = candidate
         self._keys[reference] = key
-        if procedure in _SCHEMA_MUTATIONS:
-            self._schema_mutated = True
-        if (procedure == "deposit.set.classDescriptor" and len(arguments) > 1
-                and isinstance(arguments[1], Mapping)
-                and ({"name", "type"} & arguments[1].keys())):
-            # A descriptor rename/type conversion changes the decode contract.
-            # The descriptor selector does not reliably reveal its owning class,
-            # so invalidate every schema snapshot already collected in the batch.
-            self._schema_mutated = True
-            self._class_schemas.clear()
-            for object_ref in tuple(self._object_schemas):
-                self._object_schemas[object_ref] = None
-        if procedure == "deposit.set.membership" and isinstance(arguments[0], BatchReference):
-            self._object_schemas[arguments[0]] = None
-        elif procedure == "deposit.create.classDescriptor" and isinstance(arguments[0], BatchReference):
-            schema = self._class_schemas.get(arguments[0])
-            if schema is not None and isinstance(arguments[1], str) and isinstance(arguments[2], str):
-                schema[arguments[1]] = arguments[2]
-                for object_ref, class_ref in self._object_classes.items():
-                    if class_ref is arguments[0] and self._object_schemas.get(object_ref) is not None:
-                        self._object_schemas[object_ref][arguments[1]] = arguments[2]
-        elif procedure == "deposit.delete.classDescriptor":
-            # The Class owning a descriptor reference is not available from the
-            # public procedure arguments; later helper encoding must not guess.
-            for object_ref in tuple(self._object_schemas):
-                self._object_schemas[object_ref] = None
         return reference
 
     def create_class(self, name: str, properties: dict[str, Any] | None = None) -> BatchReference:
-        properties = {} if properties is None else properties
-        reference = self.call("deposit.create.class", name, _wire_values(
-            properties, geometry_encoder=self._geometry_encoder,
-            resource_encoder=self._resource_encoder,
-        ))
-        self._class_schemas[reference] = _schema_from_class_properties(properties)
-        return reference
+        return self.call("deposit.create.class", name, {} if properties is None else properties)
 
     def set_class(self, selector: Any, patch: dict[str, Any]) -> BatchReference:
         if _is_entity_handle(selector, "Class"):
@@ -138,57 +103,13 @@ class Batch:
         return self.call("deposit.delete.class", selector)
 
     def create_object(self, class_selector: Any, properties: dict[str, Any] | None = None) -> BatchReference:
-        schema = None
         if _is_entity_handle(class_selector, "Class"):
             self._pin_handle(class_selector, "Class")
-            if self._schema_mutated:
-                raise ValueError("A prior batch schema or membership change makes this handle schema ambiguous")
-            schema = dict(self._handle_schema(class_selector))
             class_selector = {"id": class_selector.id}
-        elif isinstance(class_selector, BatchReference):
-            self._reference_key(class_selector)
-            schema = self._class_schemas.get(class_selector)
-            if schema is None:
-                raise ValueError("This batch reference has no known Class schema; use Batch.call with explicit wire values")
-        properties = {} if properties is None else properties
-        encoded = (_encode_object_properties(
-            properties, schema, geometry_encoder=self._geometry_encoder,
-            resource_encoder=self._resource_encoder,
-        ) if schema is not None
-                   else _wire_values(properties, geometry_encoder=self._geometry_encoder,
-                                     resource_encoder=self._resource_encoder))
-        reference = self.call("deposit.create.object", class_selector, encoded)
-        if schema is not None:
-            self._object_schemas[reference] = dict(schema)
-            self._object_classes[reference] = class_selector if isinstance(class_selector, BatchReference) else None
-        return reference
+        return self.call("deposit.create.object", class_selector, {} if properties is None else properties)
 
     def set_object(self, object_id: Any, patch: dict[str, Any]) -> BatchReference:
-        if _is_entity_handle(object_id, "Object"):
-            self._pin_handle(object_id, "Object")
-            schema = dict(object_id._schema)
-            if self._schema_mutated:
-                raise ValueError("A prior batch schema or membership change makes this handle schema ambiguous")
-            patch = _encode_object_properties(
-                patch, schema, geometry_encoder=self._geometry_encoder,
-                resource_encoder=self._resource_encoder,
-            )
-            object_id = object_id.id
-        elif isinstance(object_id, BatchReference):
-            self._reference_key(object_id)
-            schema = self._object_schemas.get(object_id)
-            if schema is not None:
-                patch = _encode_object_properties(
-                    patch, schema, geometry_encoder=self._geometry_encoder,
-                    resource_encoder=self._resource_encoder,
-                )
-            else:
-                patch = _wire_values(patch, geometry_encoder=self._geometry_encoder,
-                                     resource_encoder=self._resource_encoder)
-        else:
-            patch = _wire_values(patch, geometry_encoder=self._geometry_encoder,
-                                 resource_encoder=self._resource_encoder)
-        return self.call("deposit.set.object", object_id, patch)
+        return self.call("deposit.set.object", self._object_id(object_id), patch)
 
     def delete_object(self, object_id: Any) -> BatchReference:
         if _is_entity_handle(object_id, "Object"):
@@ -197,37 +118,17 @@ class Batch:
         return self.call("deposit.delete.object", object_id)
 
     def create_class_descriptor(self, selector: Any, name: str, type_name: str, properties=None) -> BatchReference:
-        schema = None
         if _is_entity_handle(selector, "Class"):
             self._pin_handle(selector, "Class")
-            if self._schema_mutated:
-                raise ValueError("A prior batch schema or membership change makes this handle schema ambiguous")
-            schema = self._handle_schema(selector)
             selector = {"id": selector.id}
-        elif isinstance(selector, BatchReference):
-            self._reference_key(selector)
-            schema = self._class_schemas.get(selector)
-        reference = self.call("deposit.create.classDescriptor", selector, name, type_name,
-                              {} if properties is None else properties)
-        if schema is not None:
-            schema[name] = type_name
-        return reference
+        return self.call("deposit.create.classDescriptor", selector, name, type_name,
+                         {} if properties is None else properties)
 
     def create_descriptor(self, object_id: Any, name: str, value: Any) -> BatchReference:
-        selector, schema = self._descriptor_context(object_id)
-        payload, inferred = self._encode_descriptor_value(name, value, schema)
-        reference = self.call("deposit.create.descriptor", selector, name, payload)
-        if schema is not None and inferred is not None:
-            schema[name] = inferred
-        return reference
+        return self.call("deposit.create.descriptor", self._object_id(object_id), name, value)
 
     def set_descriptor(self, object_id: Any, name: str, value: Any) -> BatchReference:
-        selector, schema = self._descriptor_context(object_id)
-        payload, inferred = self._encode_descriptor_value(name, value, schema)
-        reference = self.call("deposit.set.descriptor", selector, name, payload)
-        if schema is not None and inferred is not None:
-            schema[name] = inferred
-        return reference
+        return self.call("deposit.set.descriptor", self._object_id(object_id), name, value)
 
     def result(self, reference: BatchReference) -> Any:
         if self._results is None:
@@ -242,41 +143,45 @@ class Batch:
     def commands(self) -> tuple[dict[str, Any], ...]:
         return tuple(self._freeze_commands(self._commands))
 
-    def _descriptor_context(self, object_id: Any):
-        if _is_entity_handle(object_id, "Object"):
-            self._pin_handle(object_id, "Object")
-            if self._schema_mutated:
-                raise ValueError("A prior batch schema or membership change makes this handle schema ambiguous")
-            return object_id.id, self._handle_schema(object_id)
-        if isinstance(object_id, BatchReference):
-            self._reference_key(object_id)
-            schema = self._object_schemas.get(object_id)
-            if schema is None:
-                raise ValueError("This batch reference has no known Object schema; use Batch.call with an explicit wire value")
-            return object_id, schema
-        raise TypeError("Descriptor convenience methods require a same-Store Object handle or earlier Object reference; use Batch.call for raw IDs")
+    def _object_id(self, selector):
+        if _is_entity_handle(selector, "Object"):
+            self._pin_handle(selector, "Object")
+            return selector.id
+        return selector
 
-    def _encode_descriptor_value(self, name: str, value: Any, schema: Mapping[str, str]):
-        declared = schema.get(name)
-        payload = _descriptor_payload(
-            value, declared, geometry_encoder=self._geometry_encoder,
-            resource_encoder=self._resource_encoder,
-        )
-        return (payload, None) if declared is not None else (payload, payload["type"])
+    def _encode_descriptors(self, procedure, arguments, encoded):
+        # Carry explicit types separately so a scientific dictionary containing
+        # "type" and "value" keys is still an ordinary descriptor value.
+        def is_typed(value):
+            return isinstance(value, (TypedValue, DType))
+
+        if procedure in {"deposit.create.descriptor", "deposit.set.descriptor"} and is_typed(arguments[2]):
+            typed = encoded[2]
+            encoded[2] = typed["value"]
+            return {arguments[1]: typed["type"]}
+        if procedure in {"deposit.create.object", "deposit.set.object"} and isinstance(arguments[1], Mapping):
+            descriptors = arguments[1].get("descriptors")
+            if isinstance(descriptors, Mapping):
+                values = encoded[1]["descriptors"]
+                types = {}
+                for name, value in descriptors.items():
+                    if is_typed(value):
+                        typed = values[name]
+                        types[name] = typed["type"]
+                        values[name] = typed["value"]
+                return types
+        return {}
 
     def _pin_handle(self, handle, kind: str) -> None:
         self._store._validate_handle(handle, kind)
         if handle.stale:
-            raise ValueError("Stale entity handles cannot provide batch schema; refresh before collection")
+            raise ValueError("Stale entity handles cannot be used in a batch; refresh before collection")
         revision = handle._baseline_revision
         if type(revision) is not int or revision < 0:
             raise ValueError("Entity handle has no checked snapshot revision")
         if self._pinned_revision is not None and revision != self._pinned_revision:
             raise ValueError("Batch handles have conflicting checked snapshot revisions")
         self._pinned_revision = revision
-
-    def _handle_schema(self, handle) -> dict[str, str]:
-        return self._handle_schemas.setdefault(id(handle), dict(handle._schema))
 
     def _encode_argument(self, entry, index, value):
         spec = entry["args"][index]
@@ -292,7 +197,8 @@ class Batch:
         binding = spec["binding"]
         if (binding.startswith("@") or binding in _SERVER_IDENTITY_BINDINGS) and _contains_ref_marker(value):
             raise ValueError("Batch references must use an earlier command's opaque BatchReference")
-        return _wire_values(value)
+        return _wire_values(value, geometry_encoder=self._geometry_encoder,
+                            resource_encoder=self._resource_encoder)
 
     def _reference_key(self, reference: BatchReference) -> str:
         if not isinstance(reference, BatchReference) or reference._owner is not self:
@@ -303,7 +209,7 @@ class Batch:
         return key
 
     def _freeze_commands(self, commands):
-        # JSON round-tripping both validates that the exact durable command is
+        # JSON round-tripping both validates that the exact command is
         # portable and returns a detached copy immune to caller mutation.
         try:
             frozen = _portable_input(commands)
@@ -317,7 +223,9 @@ class Batch:
             raise ValueError(f"A batch may contain at most {MAX_COMMANDS} commands")
         prior_keys = set()
         for command in frozen:
-            if not isinstance(command, dict) or set(command) != {"key", "procedure", "arguments"}:
+            if (not isinstance(command, dict)
+                    or set(command) - {"key", "procedure", "arguments", "descriptorTypes"}
+                    or not {"key", "procedure", "arguments"} <= command.keys()):
                 raise ValueError("Batch command has an invalid shape")
             key, procedure, arguments = command["key"], command["procedure"], command["arguments"]
             if not isinstance(key, str) or not key or key in prior_keys:
@@ -347,17 +255,6 @@ class Batch:
 def _is_entity_handle(value: Any, kind: str) -> bool:
     from .entities import DNode
     return isinstance(value, DNode) and value.kind == kind
-
-
-def _schema_from_class_properties(properties: Mapping[str, Any]) -> dict[str, str]:
-    if not isinstance(properties, Mapping):
-        return {}
-    declarations = properties.get("descriptors", ())
-    if not isinstance(declarations, (list, tuple)):
-        return {}
-    return {item["name"]: item["type"] for item in declarations
-            if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-            and isinstance(item.get("type"), str)}
 
 
 def _wire_values(value: Any, *, geometry_encoder=None, resource_encoder=None) -> Any:

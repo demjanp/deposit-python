@@ -9,7 +9,10 @@ import uuid
 import math
 from typing import Any
 
-from ._imports import GRAPH_CATEGORIES, MANIFEST_FIELDS, _MANIFEST_ALLOWED
+GRAPH_CATEGORIES= (
+    "classes", "objects", "descriptors", "geometries", "memberships",
+    "relationships", "classRelationships", "patterns", "userTools", "resources",
+)
 
 _NODE_KINDS = {"Class", "Object"}
 _EDGE_KINDS = {"Membership", "Relationship", "ClassRelationship"}
@@ -47,6 +50,8 @@ def to_networkx(snapshot: Mapping[str, Any]):
 
     classes = {record["id"]: record for record in records["classes"]}
     objects = {record["id"]: record for record in records["objects"]}
+    if len(classes) != len(records["classes"]) or len(objects) != len(records["objects"]):
+        raise ValueError("Snapshot contains duplicate node identities")
     descriptor_values: dict[str, dict[str, Any]] = {}
     for descriptor in records["descriptors"]:
         owner = descriptor.get("objectId")
@@ -68,11 +73,12 @@ def to_networkx(snapshot: Mapping[str, Any]):
         node["descriptors"] = descriptor_values.get(record["id"], {})
         graph.add_node((namespace_id, "Object", record["id"]), **node)
 
+    edge_ids = set()
     for membership in records["memberships"]:
         object_id, class_id = membership.get("objectId"), membership.get("classId")
         if object_id not in objects or class_id not in classes:
             raise ValueError("Membership has a missing or invalid endpoint")
-        _add_edge(graph, namespace_id, "Membership", object_id, class_id, membership)
+        _add_edge(graph, namespace_id, "Membership", object_id, class_id, membership, edge_ids)
     for kind, category, endpoint_kind in (
         ("Relationship", "relationships", "Object"),
         ("ClassRelationship", "classRelationships", "Class"),
@@ -82,7 +88,7 @@ def to_networkx(snapshot: Mapping[str, Any]):
             source, target = record.get("sourceId"), record.get("targetId")
             if source not in known or target not in known:
                 raise ValueError(f"{kind} has a missing or invalid endpoint")
-            _add_edge(graph, namespace_id, kind, source, target, record)
+            _add_edge(graph, namespace_id, kind, source, target, record, edge_ids)
     return graph
 
 
@@ -113,14 +119,7 @@ def _portable_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     if "history" in snapshot:
         value["history"] = snapshot["history"]
     manifest, records = value["manifest"], value["graph"]
-    version = manifest.get("depositVersion")
-    if version is not None and (not isinstance(version, str) or not version):
-        raise ValueError("Deposit graph manifest depositVersion must be a Server version String or null")
-    if set(manifest) - _MANIFEST_ALLOWED:
-        raise ValueError("Deposit graph manifest contains an unknown field")
-    if any(name not in manifest for name in MANIFEST_FIELDS):
-        raise ValueError("Deposit graph snapshot manifest is incomplete")
-    if set(records) != set(GRAPH_CATEGORIES) or any(not isinstance(records[name], list) for name in GRAPH_CATEGORIES):
+    if any(not isinstance(records.get(name), list) for name in GRAPH_CATEGORIES):
         raise ValueError("Deposit graph snapshot categories are incomplete")
     source_ns = manifest.get("sourceNamespaceId")
     revision = manifest.get("exportedRevision")
@@ -184,12 +183,15 @@ def _node_record(record: dict[str, Any], namespace_id: str, kind: str) -> dict[s
     return attrs
 
 
-def _add_edge(graph, namespace_id: str, kind: str, source_id: str, target_id: str, record: dict[str, Any]):
+def _add_edge(graph, namespace_id: str, kind: str, source_id: str, target_id: str, record: dict[str, Any], edge_ids: set):
     identity = record.get("id")
     if not isinstance(identity, str) or not identity:
         raise ValueError(f"{kind} edge requires a stable id")
     if record.get("namespaceId", namespace_id) != namespace_id or record.get("kind", kind) != kind:
         raise ValueError(f"{kind} record metadata contradicts its containing graph category")
+    if identity in edge_ids:
+        raise ValueError("Snapshot contains duplicate edge identities")
+    edge_ids.add(identity)
     expected_endpoints = {
         "Membership": (record.get("objectId", source_id), record.get("classId", target_id)),
         "Relationship": (record.get("sourceId", source_id), record.get("targetId", target_id)),
@@ -219,6 +221,7 @@ def _freeze_graph(graph):
 
 
 def _json_freeze(value):
+    _ensure_json_portable(value)
     return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
 
 
@@ -231,8 +234,8 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
         ns, kind, identity = key
         if ns != namespace_id or kind not in _NODE_KINDS or not isinstance(identity, str) or not identity:
             raise ValueError("Node key has an invalid Namespace, kind or id")
-        if attrs.get("id") != identity or attrs.get("namespaceId") != namespace_id or attrs.get("kind") != kind:
-            raise ValueError("Node key and required id/namespaceId/kind attributes must agree")
+        if attrs.get("id") != identity or attrs.get("kind") != kind:
+            raise ValueError("Node key and required id/kind attributes must agree")
         if key in by_key:
             raise ValueError("Graph contains duplicate node keys")
         by_key[tuple(key)] = attrs
@@ -242,7 +245,6 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
             record_lists["classes"].append(record)
         else:
             record_lists["objects"].append(record)
-    object_by_id = {item["id"]: item for item in record_lists["objects"]}
     object_descriptor_values = {
         record["id"]: deepcopy(record.get("descriptors", {}))
         for record in record_lists["objects"]
@@ -271,9 +273,6 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
             if record.get("objectId", source[2]) != source[2] or record.get("classId", target[2]) != target[2]:
                 raise ValueError("Membership attributes contradict graph endpoints")
             record.update(objectId=source[2], classId=target[2])
-            object_record = object_by_id[source[2]]
-            if object_record.get("classId") != target[2]:
-                raise ValueError("Membership endpoint contradicts Object classId")
             record_lists["memberships"].append(record)
         else:
             if record.get("sourceId", source[2]) != source[2] or record.get("targetId", target[2]) != target[2]:
@@ -289,39 +288,32 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
         if not isinstance(values, list):
             raise TypeError(f"Graph {category} metadata must be a list")
         record_lists[category] = deepcopy(values)
+    descriptor_ids = set()
     for record in record_lists["objects"]:
         object_id = record["id"]
         values = object_descriptor_values.get(object_id, {})
         if not isinstance(values, dict):
             raise TypeError("Object descriptors must be a mapping")
         for name, value in values.items():
-            if _is_visible_descriptor_record(
-                    value, namespace_id=namespace_id, object_id=object_id, name=name):
+            if _is_visible_descriptor_record(value):
                 descriptor = deepcopy(dict(value))
             else:
                 # Accept direct value replacement as a convenient graph edit;
-                # new/legacy scalar values receive one identity at freeze time.
-                descriptor = {"id": str(uuid.uuid4()), "name": name, "value": deepcopy(value)}
+                # new scalar values receive one identity at freeze time.
+                descriptor = {"id": str(uuid.uuid4()), "name": name, "value": deepcopy(value),
+                              "kind": "Descriptor", "namespaceId": namespace_id, "objectId": object_id}
             if not isinstance(descriptor.get("id"), str) or not descriptor["id"]:
                 raise ValueError("Visible Descriptor records require a stable ID")
-            descriptor.update(namespaceId=namespace_id, objectId=object_id, name=name)
+            if descriptor["id"] in descriptor_ids:
+                raise ValueError("Graph contains duplicate Descriptor identities")
+            descriptor_ids.add(descriptor["id"])
+            descriptor["name"] = name
             record_lists["descriptors"].append(descriptor)
-    version = metadata.get("depositVersion")
-    if version is not None and (not isinstance(version, str) or not version):
-        raise ValueError("Graph depositVersion must be a Server version String or null")
     scope = metadata.get("scope", "namespace")
-    if scope not in ("namespace", "subgraph"):
-        raise ValueError("Graph scope must be namespace or subgraph")
-    root_ids = metadata.get("rootIds", sorted(object_by_id) if scope == "subgraph" else [])
-    if (not isinstance(root_ids, list)
-            or any(not isinstance(root_id, str) or not root_id for root_id in root_ids)
-            or len(set(root_ids)) != len(root_ids)
-            or (scope == "subgraph" and not root_ids)
-            or (scope == "namespace" and root_ids)):
-        raise ValueError("Graph rootIds must agree with its namespace/subgraph scope")
+    root_ids = metadata.get("rootIds", [])
     manifest = {
-        "packageId": str(uuid.uuid4()), "sourceNamespaceId": namespace_id,
-        "name": "NetworkX graph", "description": "", "depositVersion": version,
+        "sourceNamespaceId": namespace_id,
+        "name": "NetworkX graph", "description": "", "depositVersion": metadata.get("depositVersion"),
         "historyMode": "disabled", "exportedRevision": revision,
         "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "rootIds": deepcopy(root_ids),
@@ -331,7 +323,7 @@ def _snapshot_from_graph(nodes, edges, metadata, namespace_id, revision):
     return {"manifest": manifest, "graph": record_lists}
 
 
-def _is_visible_descriptor_record(value, *, namespace_id, object_id, name):
+def _is_visible_descriptor_record(value):
     """Recognize only the complete visible-record shape, not a scientific map."""
     return (
         isinstance(value, Mapping)
@@ -341,7 +333,4 @@ def _is_visible_descriptor_record(value, *, namespace_id, object_id, name):
         and isinstance(value.get("objectId"), str) and bool(value.get("objectId"))
         and isinstance(value.get("name"), str) and bool(value.get("name"))
         and "value" in value
-        and value.get("namespaceId") == namespace_id
-        and value.get("objectId") == object_id
-        and value.get("name") == name
     )
