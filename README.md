@@ -10,14 +10,15 @@ Deposit was created on 29. 4. 2013
 <details>
 <summary>Table of Contents</summary>
 
-1. [About Deposit](#about)
-2. [Installation](#installation)
-3. [Resource and import workflows](#resource-and-import-workflows)
-4. [NetworkX graph conversion](#networkx-graph-conversion)
-5. [Exchange results and operation cancellation](#exchange-results-and-operation-cancellation)
-6. [Contact](#contact)
-7. [Acknowledgements](#acknowledgements)
-8. [License](#license)
+- [Deposit Python](#deposit-python)
+  - [About Deposit ](#about-deposit-)
+  - [Installation ](#installation-)
+  - [Resource and import workflows](#resource-and-import-workflows)
+  - [NetworkX graph conversion ](#networkx-graph-conversion-)
+  - [Exchange results and operation cancellation](#exchange-results-and-operation-cancellation)
+  - [Contact: ](#contact-)
+  - [Acknowledgements ](#acknowledgements-)
+  - [License ](#license-)
 
 </details>
 
@@ -40,12 +41,6 @@ If installing from PyPI, use:
 pip install "deposit>=2,<3"
 ```
 
-NetworkX is optional. Install the graph extra only when using graph conversion:
-
-```
-pip install "deposit[networkx]>=2,<3"
-```
-
 The package version is derived at build time from `deposit-python` Git tags by
 `setuptools-scm`. The project release-tag convention is `vX.Y.Z`, optionally
 with a PEP 440 prerelease suffix such as `v2.4.0rc1`. Tag a release commit
@@ -62,12 +57,9 @@ hand-maintained; runtime version reporting uses installed distribution
 metadata. The Python package version is independent of the Deposit Server version recorded in the
 procedure manifest; it is not Exchange `depositVersion` provenance.
 
-Package metadata requires Python 3.14.x and Neo4j Python driver >=6.1,<7. The
-`networkx` extra supports NetworkX 3.x, starting at 3.4. Import operations
-require the final procedures and semantic capabilities; tested Server builds
-are recorded as verification evidence.
+Deposit requires Python 3.14.x.
 The declared release acceptance matrix targets Windows x64, Python 3.14.0 and
-3.14.10, Neo4j driver 6.1.0 and 6.4.1, NetworkX absent and versions 3.4 and
+3.14.10, Neo4j driver 6.1.0 and 6.4.1, NetworkX versions 3.4 and
 3.7. Release acceptance is separate
 from PyPI publication.
 
@@ -144,11 +136,6 @@ including writes that create a declaration. The Server checks the declaration
 in effect at that command and rolls back the batch if any command fails.
 
 ## NetworkX graph conversion <a name="networkx-graph-conversion"></a>
-
-Install `deposit[networkx]` to use `Store.to_networkx(...)` or
-`Store.from_networkx(...)`. The base package remains importable without
-NetworkX; calling either graph method without the extra raises an
-`ImportError` with the installation command.
 
 `to_networkx` returns a directed multigraph. Node keys are
 `(namespace_id, kind, id)` tuples, where `kind` is `Class` or `Object`. Edge

@@ -1,4 +1,4 @@
-"""Optional, lossless NetworkX adapter for Deposit Exchange graph snapshots."""
+"""Lossless NetworkX adapter for Deposit Exchange graph snapshots."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -9,6 +9,8 @@ import uuid
 import math
 from typing import Any
 
+import networkx as nx
+
 GRAPH_CATEGORIES= (
     "classes", "objects", "descriptors", "geometries", "memberships",
     "relationships", "classRelationships", "patterns", "userTools", "resources",
@@ -18,19 +20,7 @@ _NODE_KINDS = {"Class", "Object"}
 _EDGE_KINDS = {"Membership", "Relationship", "ClassRelationship"}
 
 
-def require_networkx():
-    """Load the optional dependency with an actionable installation message."""
-    try:
-        import networkx as nx
-    except ImportError as exc:
-        raise ImportError(
-            "NetworkX graph conversion requires the optional dependency; install deposit[networkx]."
-        ) from exc
-    return nx
-
-
 def to_networkx(snapshot: Mapping[str, Any]):
-    nx = require_networkx()
     value = _portable_snapshot(snapshot)
     manifest, records = value["manifest"], value["graph"]
     namespace_id = manifest["sourceNamespaceId"]
@@ -93,7 +83,6 @@ def to_networkx(snapshot: Mapping[str, Any]):
 
 
 def from_networkx(graph) -> dict[str, Any]:
-    nx = require_networkx()
     if not isinstance(graph, nx.MultiDiGraph):
         raise TypeError("from_networkx requires a networkx.MultiDiGraph")
     frozen_nodes, frozen_edges, metadata = _freeze_graph(graph)

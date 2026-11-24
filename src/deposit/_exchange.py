@@ -14,6 +14,7 @@ from threading import RLock
 from weakref import WeakSet
 
 from .errors import DepositError, OperationCommittedAfterCancel, OutcomeUnknown, TransportError
+from .networkx import from_networkx
 
 
 CHUNK_BYTES = 1024 * 1024
@@ -430,7 +431,6 @@ def _json_blocks(value):
 def stage_snapshot(endpoint, snapshot, *, resources=None, resource_source=None):
     """Encode structured input and send its resource providers without creating a ZIP."""
     if not isinstance(snapshot, Mapping):
-        from .networkx import from_networkx
         snapshot = from_networkx(snapshot)
     manifest, graph, history = snapshot["manifest"], snapshot["graph"], snapshot.get("history")
     if not isinstance(manifest, Mapping) or not isinstance(graph, Mapping):

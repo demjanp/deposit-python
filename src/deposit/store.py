@@ -28,6 +28,7 @@ from ._gateway import (
 )
 from .errors import DepositError, OperationCommittedAfterCancel, OutcomeUnknown, TransportError
 from .entities import DClass, DObject, DNode
+from .networkx import from_networkx, to_networkx
 from .values import DResource
 
 
@@ -828,16 +829,13 @@ class Store:
     def to_networkx(
         self, roots=None, *, max_hops: int | None = None, root_class_boundary: bool = True
     ):
-        """Export the selected snapshot as an optional NetworkX MultiDiGraph."""
-        from .networkx import require_networkx, to_networkx
-        require_networkx()
+        """Export the selected snapshot as a NetworkX MultiDiGraph."""
         return to_networkx(self.get_subtree(
             roots, max_hops=max_hops, root_class_boundary=root_class_boundary,
         ))
 
     def from_networkx(self, graph, *, resources=None, resource_source=None, rules=None, operation_id=None):
         """Analyze a Deposit MultiDiGraph using Server-owned intake."""
-        from .networkx import from_networkx
         return self.from_dict(from_networkx(graph), resources=resources, resource_source=resource_source,
                               rules=rules, operation_id=operation_id)
 
