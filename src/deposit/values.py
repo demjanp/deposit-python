@@ -385,6 +385,8 @@ def decode_value(type_name: str, value: Any) -> Any:
     if type_name in {"Date", "Time", "LocalTime", "DateTime", "LocalDateTime"}:
         if not isinstance(value, str): raise TypeError(f"invalid {type_name} payload")
         if type_name == "Date": return NeoDate.from_iso_format(value)
+        if type_name in {"Time", "DateTime"} and value.endswith("Z"):
+            value = value[:-1] + "+00:00"
         if type_name in {"Time", "LocalTime"}: return NeoTime.from_iso_format(value)
         parsed = NeoDateTime.from_iso_format(value)
         if type_name == "DateTime" and not _has_zone(parsed): raise TypeError("invalid DateTime offset")

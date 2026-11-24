@@ -479,6 +479,7 @@ class Store:
             if declaration is None:
                 raise KeyError(name)
             selector = {"id": declaration["id"]}
+            patch = {key: value for key, value in patch.items() if key != "name"}
         if owner is not None:
             self._validate_handle(owner, "Class")
             descriptor_id = selector.get("id") if isinstance(selector, Mapping) else None
@@ -1512,8 +1513,6 @@ class Store:
                 iterator.close()
 
     def get_user_tool(self, selection: str | dict[str, Any]):
-        if isinstance(selection, str):
-            selection = {"name": selection}
         return self._call_one("deposit.get.userTool", selection)
 
     def user_tools(self, name: str | None = None, *, page_size=200):
@@ -2086,11 +2085,11 @@ def _query_parameters(values: dict[str, Any]) -> dict[str, Any]:
     result = {}
     for key, value in values.items():
         if isinstance(value, (TypedValue, DType)):
-            result[key] = value.to_dict()
+            result[key] = value.to_dict()["value"]
         elif isinstance(value, dict):
             result[key] = _query_parameters(value)
         elif isinstance(value, list):
-            result[key] = [_query_parameters(item) if isinstance(item, dict) else item.to_dict()
+            result[key] = [_query_parameters(item) if isinstance(item, dict) else item.to_dict()["value"]
                            if isinstance(item, (TypedValue, DType)) else item for item in value]
         else:
             result[key] = value
