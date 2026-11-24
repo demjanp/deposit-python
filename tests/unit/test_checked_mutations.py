@@ -135,6 +135,8 @@ class Protocol:
             assert transaction._connection is self.execution.connection
             if route == "deposit.set.descriptor":
                 row = {"node": {"namespaceId": "namespace", "id": "descriptor", "value": parameters["a2"]}}
+            elif route == "deposit.delete.descriptor":
+                row = {"data": {"changed": True}}
             elif route == "deposit.create.object":
                 row = {"node": object_data()}
             elif route == "deposit.apply.batch":
@@ -152,6 +154,8 @@ class Protocol:
             assert self.finished[-1][0] == "commit"
             if "AS classPage" in query:
                 entity = object_data(9)
+                if self.registration["a2"] == "deposit.delete.descriptor":
+                    entity["descriptors"] = {}
                 if self.malformed_snapshot:
                     entity["id"] = "wrong"
                 rows = [{"entity": entity, "schema": class_data()}]
@@ -187,6 +191,27 @@ def test_warm_descriptor_write_keeps_one_checked_post_commit_refresh(monkeypatch
     assert begin[1]._connection is write[1]._connection
     assert sum(query.count("CALL deposit.") for _, _, query, _ in protocol.calls) == 8
     assert "deposit.utils.toData" in write[2] and checked[2].count("CALL deposit.get.revision") == 2
+
+
+def test_descriptor_delete_preserves_selector_refresh_and_stale_guards(monkeypatch):
+    protocol = Protocol()
+    store = protocol.make_store(monkeypatch)
+    obj = DObject(store, object_data(), {"Score": "Integer"}, snapshot_revision=4)
+    stale_class = DClass(store, class_data(), {"Score": "Integer"}, snapshot_revision=4)
+
+    assert store.delete_descriptor(obj, "Score") == {"changed": True}
+    assert protocol.registration["a3"] == [{"objectId": "object", "name": "Score"}]
+    assert obj["descriptors"] == {} and obj._baseline_revision == 5
+    assert protocol.routes == ["deposit.get.session", "deposit.action.begin", "deposit.delete.descriptor",
+                               "deposit.get.revision"]
+
+    obj._mark_stale()
+    protocol.calls.clear()
+    with pytest.raises(RuntimeError, match="snapshot is stale"):
+        store.delete_descriptor(obj, "Score")
+    with pytest.raises(RuntimeError, match="snapshot is stale"):
+        store.delete_class_descriptor(stale_class, "Score")
+    assert protocol.calls == []
 
 
 def test_stale_pin_and_unverified_endpoint_are_rejected_before_registration(monkeypatch):

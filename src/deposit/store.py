@@ -449,7 +449,6 @@ class Store:
         return {"resourceId": resource_id}
 
     def _delete_descriptor(self, owner: DNode, name: str) -> dict[str, Any]:
-        self._ensure_handle_current(owner)
         if owner.kind == "Object":
             procedure = "deposit.delete.descriptor"
             selector = {"objectId": owner.id, "name": name}
