@@ -235,28 +235,58 @@ class Store:
 
     def _checked_entity_snapshot(self, kind: str, selection, *, _already_serialized: bool = False,
                                  expected_revision: int | None = None):
-        self._assert_not_collecting_batch()
-        if kind not in {"Class", "Object"}:
-            raise ValueError("Only Class and Object snapshots are supported")
-        procedure = "deposit.get.class" if kind == "Class" else "deposit.get.object"
         if kind == "Class":
-            query = (
-                "CYPHER 25 CALL deposit.get.revision($token) YIELD data AS revision "
-                f"CALL {procedure}($selection, $token) YIELD node "
-                "CALL deposit.utils.toData(node, $token) YIELD data "
-                "RETURN revision, data AS entity, data AS schema"
+            calls = (
+                "CALL deposit.get.classPage($selection, {pageSize: 1}, $token) YIELD data AS page "
+                "WITH page.items[0] AS entity "
             )
-            parameters = {"selection": selection, "token": self._token}
+            projection = "{entity: entity, schema: entity}"
+        elif kind == "Object":
+            calls = (
+                "CALL deposit.get.objectPage($selection, {pageSize: 1}, $token) YIELD data AS page "
+                "WITH page.items[0] AS entity "
+                "CALL deposit.get.classPage({id: entity.classId}, {pageSize: 1}, $token) YIELD data AS classPage "
+            )
+            projection = "{entity: entity, schema: classPage.items[0]}"
         else:
-            query = (
-                "CYPHER 25 CALL deposit.get.revision($token) YIELD data AS revision "
-                "CALL deposit.get.object($selection, $token) YIELD node AS object "
-                "CALL deposit.utils.toData(object, $token) YIELD data AS entity "
-                "CALL deposit.get.class({id: entity.classId}, $token) YIELD node AS class "
-                "CALL deposit.utils.toData(class, $token) YIELD data AS schema "
-                "RETURN revision, entity, schema"
-            )
-            parameters = {"selection": selection, "token": self._token}
+            raise ValueError("Only Class and Object snapshots are supported")
+        rows, revision = self._checked_read(
+            calls, projection, {"selection": selection}, expected_revision=expected_revision,
+            _already_serialized=_already_serialized,
+        )
+        if len(rows) != 1 or not isinstance(rows[0], dict):
+            raise DepositError("INVALID_RESPONSE", "Checked entity snapshot returned no single record")
+        entity, schema = rows[0].get("entity"), rows[0].get("schema")
+        if not isinstance(entity, dict) or not isinstance(schema, dict):
+            raise DepositError("INVALID_RESPONSE", "Checked entity snapshot returned invalid data")
+        if entity.get("namespaceId") != self._namespace_id or schema.get("namespaceId") != self._namespace_id:
+            raise DepositError("SCOPE_MISMATCH", "Snapshot belongs to another Store Namespace")
+        if kind == "Class":
+            return entity, _schema_from_class_data(entity), revision
+        if schema.get("id") != entity.get("classId"):
+            raise DepositError("INVALID_RESPONSE", "Object snapshot returned another Class schema")
+        from .entities import decode_snapshot
+        decoded = decode_snapshot(entity, schema, self._namespace_id, self, snapshot_revision=revision)
+        return decoded._snapshot, decoded._schema, revision
+
+    @staticmethod
+    def _require_revision(revision: int, expected_revision: int | None) -> None:
+        if expected_revision is not None and revision != expected_revision:
+            raise DepositError("REVISION_CONFLICT", "Namespace changed during checked iteration or snapshot read")
+
+    def _checked_read(self, calls: str, projection: str, parameters, *, expected_revision=None,
+                      _already_serialized=False):
+        self._assert_not_collecting_batch()
+        # The ungrouped collect consumes all portable results before the end
+        # revision call and emits one row even when the subquery has no results.
+        query = (
+            "CYPHER 25 CALL deposit.get.revision($token) YIELD data AS start "
+            "CALL (start) { WITH start WHERE $expected IS NULL OR start.sequence = $expected "
+            f"{calls} RETURN collect({projection}) AS rows }} "
+            "CALL deposit.get.revision($token) YIELD data AS end "
+            "RETURN start, rows, end"
+        )
+        parameters = {**parameters, "token": self._token, "expected": expected_revision}
         with (nullcontext() if _already_serialized else self._serialized()):
             session = None
             transaction = None
@@ -264,32 +294,22 @@ class Store:
                 session = self._client._session()
                 transaction = session.begin_transaction()
                 result = transaction.run(query, parameters)
+                if tuple(result.keys()) != ("start", "rows", "end"):
+                    raise DepositError("INVALID_RESPONSE", "Checked read returned unexpected columns")
                 record = result.single(strict=True)
                 result.consume()
-                if record is None:
-                    raise DepositError("INVALID_RESPONSE", "Checked entity snapshot returned no record")
-                entity = record.get("entity")
-                schema = record.get("schema")
-                revision = record.get("revision")
-                if not isinstance(entity, dict) or not isinstance(schema, dict) or not isinstance(revision, dict):
-                    raise DepositError("INVALID_RESPONSE", "Checked entity snapshot returned invalid data")
-                if entity.get("namespaceId") != self._namespace_id:
-                    raise DepositError("SCOPE_MISMATCH", "Snapshot belongs to another Store Namespace")
-                tx_revision = revision.get("sequence")
-                if isinstance(tx_revision, bool) or not isinstance(tx_revision, int) or tx_revision < 0:
-                    raise DepositError("INVALID_RESPONSE", "Snapshot returned no checked Namespace revision")
-                self._require_revision(tx_revision, expected_revision)
-                # Procedure invocations can observe intervening commits even
-                # within one Neo4j transaction. Fence all materialized entity
-                # and declaration data before publishing a checked snapshot.
-                self._require_revision(self._read_namespace_revision(transaction), tx_revision)
+                if record is None or not isinstance(record.get("rows"), list):
+                    raise DepositError("INVALID_RESPONSE", "Checked read returned an invalid result")
+                start, end = record.get("start"), record.get("end")
+                first = start.get("sequence") if isinstance(start, dict) else None
+                last = end.get("sequence") if isinstance(end, dict) else None
+                if type(first) is not int or first < 0 or type(last) is not int or last < 0:
+                    raise DepositError("INVALID_RESPONSE", "Read returned no checked Namespace revision")
+                self._require_revision(first, expected_revision)
+                self._require_revision(last, first)
+                rows = _portable_input(record["rows"])
                 transaction.commit()
-                if kind == "Class":
-                    declarations = _schema_from_class_data(entity)
-                    return entity, declarations, tx_revision
-                from .entities import decode_snapshot
-                decoded = decode_snapshot(entity, schema, self._namespace_id, self, snapshot_revision=tx_revision)
-                return decoded._snapshot, decoded._schema, tx_revision
+                return rows, first
             except BaseException as exc:
                 if transaction is not None:
                     try: transaction.rollback()
@@ -302,68 +322,71 @@ class Store:
                     try: session.close()
                     except Exception: pass
 
-    @staticmethod
-    def _require_revision(revision: int, expected_revision: int | None) -> None:
-        if expected_revision is not None and revision != expected_revision:
-            raise DepositError("REVISION_CONFLICT", "Namespace changed during checked iteration or snapshot read")
-
-    def _read_namespace_revision(self, transaction) -> int:
-        result = transaction.run(
-            "CYPHER 25 CALL deposit.get.revision($token) YIELD data RETURN data", {"token": self._token}
-        )
-        record = result.single(strict=True)
-        result.consume()
-        data = record.get("data") if record is not None else None
-        revision = data.get("sequence") if isinstance(data, dict) else None
-        if type(revision) is not int or revision < 0:
-            raise DepositError("INVALID_RESPONSE", "Read returned no checked Namespace revision")
-        return revision
-
     def _checked_entity_page(self, procedure: str, selection, options, *, expected_revision=None):
-        """Fully detach a page between fresh, equal Namespace sequence reads."""
-        self._assert_not_collecting_batch()
         entry = store_procedure(procedure)
         if entry["action"] or tuple(entry["columns"]) != ("data",) or not procedure.endswith("Page"):
             raise ValueError("Checked pages require a read-only Domain Page procedure")
         bound = bind_arguments(entry, (selection, options), namespace_id=self._namespace_id)
         query, parameters = build_query(entry, bound, self._token)
-        with self._serialized():
-            session = None
-            transaction = None
-            try:
-                session = self._client._session()
-                transaction = session.begin_transaction()
-                revision = self._read_namespace_revision(transaction)
-                self._require_revision(revision, expected_revision)
-                result = transaction.run(query, parameters)
-                if tuple(result.keys()) != ("data",):
-                    raise DepositError("INVALID_RESPONSE", f"{procedure} returned unexpected columns")
-                record = result.single(strict=True)
-                result.consume()
-                if record is None:
-                    raise DepositError("INVALID_RESPONSE", f"{procedure} returned no page")
-                page = _portable_input(record.get("data"))
-                self._require_revision(self._read_namespace_revision(transaction), revision)
-                transaction.commit()
-                return page, revision
-            except BaseException as exc:
-                if transaction is not None:
-                    try: transaction.rollback()
-                    except Exception: pass
-                if isinstance(exc, DepositError) or not isinstance(exc, Exception):
-                    raise
-                raise map_driver_error(exc) from exc
-            finally:
-                if session is not None:
-                    try: session.close()
-                    except Exception: pass
+        call = query.removeprefix("CYPHER 25 ").removesuffix(" RETURN data")
+        rows, revision = self._checked_read(call, "data", parameters, expected_revision=expected_revision)
+        if len(rows) != 1:
+            raise DepositError("INVALID_RESPONSE", f"{procedure} returned no single page")
+        return rows[0], revision
 
-    def _entity_handle_at_revision(self, kind: str, identity: str, revision: int):
-        data, schema, checked_revision = self._checked_entity_snapshot(
-            kind, {"id": identity}, expected_revision=revision
+    def _checked_page_entities(self, kind: str, identities, revision: int):
+        if not identities:
+            return {}
+        procedure = "deposit.get.classPage" if kind == "Class" else "deposit.get.objectPage"
+        calls = (
+            "UNWIND $ids AS id "
+            f"CALL {procedure}({{id: id}}, {{pageSize: 1}}, $token) YIELD data AS page "
         )
-        handle_type = DClass if kind == "Class" else DObject
-        return handle_type(self, data, schema, snapshot_revision=checked_revision)
+        rows, _ = self._checked_read(calls, "page.items[0]", {"ids": list(identities)},
+                                     expected_revision=revision)
+        entities = {}
+        for row in rows:
+            if not isinstance(row, dict) or row.get("kind") != kind:
+                raise DepositError("INVALID_RESPONSE", f"Expected portable {kind} data")
+            if row.get("namespaceId") != self._namespace_id:
+                raise DepositError("SCOPE_MISMATCH", "Page entity belongs to another Store Namespace")
+            entities[_item_id(row)] = row
+        if len(rows) != len(identities) or entities.keys() != set(identities):
+            raise DepositError("INVALID_RESPONSE", "Checked read returned unexpected entity identities")
+        return entities
+
+    def _class_page_handles(self, items, revision):
+        handles = []
+        for item in items:
+            _item_id(item)
+            handles.append(DClass(self, item, _schema_from_class_data(item), snapshot_revision=revision))
+        return handles
+
+    def _object_page_handles(self, items, revision, schemas, known_class=None):
+        from .entities import decode_snapshot
+        class_ids = {}
+        for item in items:
+            _item_id(item)
+            class_id = item.get("classId")
+            if item.get("kind") != "Object" or not isinstance(class_id, str) or not class_id:
+                raise DepositError("INVALID_RESPONSE", "Object page omitted Class identity")
+            if item.get("namespaceId") != self._namespace_id:
+                raise DepositError("SCOPE_MISMATCH", "Page entity belongs to another Store Namespace")
+            class_ids[class_id] = None
+        if known_class is not None:
+            snapshot = known_class._snapshot
+            if (snapshot is not None and not known_class.stale and known_class._baseline_revision == revision
+                    and snapshot is known_class._snapshot):
+                schemas[known_class.id] = snapshot
+        missing = [class_id for class_id in class_ids if class_id not in schemas]
+        schemas.update(self._checked_page_entities("Class", missing, revision))
+        handles = [decode_snapshot(item, schemas[item["classId"]], self._namespace_id, self,
+                                   snapshot_revision=revision) for item in items]
+        # Only retain schemas used by the latest page. A single iterator pins its revision.
+        used = {class_id: schemas[class_id] for class_id in class_ids}
+        schemas.clear()
+        schemas.update(used)
+        return handles
 
     def set_descriptor(self, dobject: DObject, name: str, value: Any) -> dict[str, Any]:
         self._validate_handle(dobject, "Object")
@@ -1318,15 +1341,15 @@ class Store:
             querystr, parameters = item
             yield self.get_query_page(querystr, parameters=parameters)
 
-    def _entity_page(self, procedure: str, selection, *, page_size=200, transform=None, expected_revision=None):
+    def _entity_page(self, procedure: str, selection, *, page_size=200, transform=None, prepare=None,
+                     expected_revision=None):
         from ._paging import EntityPageIterator
         return EntityPageIterator(self, procedure, selection, page_size=page_size, transform=transform,
-                                  expected_revision=expected_revision)
+                                  prepare=prepare, expected_revision=expected_revision)
 
     def classes(self, name: str | None = None, *, page_size=200):
         return self._entity_page("deposit.get.classPage", name, page_size=page_size,
-                                 transform=lambda item, revision: self._entity_handle_at_revision(
-                                     "Class", _item_id(item), revision))
+                                 prepare=self._class_page_handles)
 
     def objects(self, *, class_name: str | None = None, descriptors: Mapping[str, Any] | None = None,
                 object_id: str | None = None, page_size=200):
@@ -1338,6 +1361,7 @@ class Store:
         selection = {}
         schema = None
         schema_revision = None
+        dclass = None
         if class_name is not None:
             dclass = self.get_class_handle(class_name)
             selection["classId"] = dclass.id
@@ -1361,17 +1385,18 @@ class Store:
                 else:
                     encoded[name] = value
             selection["descriptors"] = encoded
+        schemas = {}
         return self._entity_page("deposit.get.objectPage", selection or None, page_size=page_size,
                                  expected_revision=schema_revision,
-                                 transform=lambda item, revision: self._entity_handle_at_revision(
-                                     "Object", _item_id(item), revision))
+                                 prepare=lambda items, revision: self._object_page_handles(items, revision, schemas, dclass))
 
     def members(self, dclass: DClass | str | dict[str, Any], *, page_size=200):
         handle = dclass if isinstance(dclass, DClass) else self.get_class_handle(dclass)
         self._validate_handle(handle, "Class")
+        schemas = {}
         return self._entity_page(
             "deposit.get.classMembersPage", {"id": handle.id}, page_size=page_size,
-            transform=lambda item, revision: self._entity_handle_at_revision("Object", _item_id(item), revision),
+            prepare=lambda items, revision: self._object_page_handles(items, revision, schemas, handle),
         )
 
     def is_member(self, dobject: DObject, dclass: DClass | str | dict[str, Any]) -> bool:
@@ -1467,19 +1492,32 @@ class Store:
         if direction in {"incoming", "both"}:
             selections.append(("targetId", "sourceId"))
         revision = None
+        schemas = {}
         for filter_key, other_key in selections:
-            iterator = self._entity_page(procedure, {filter_key: source.id}, page_size=page_size,
-                                         expected_revision=revision)
-            try:
-                for relationship in iterator:
-                    identity = relationship.get("id")
-                    other_id = relationship.get(other_key)
+            def prepare(relationships, checked_revision):
+                selected = []
+                identities = {}
+                for relationship in relationships:
+                    identity, other_id = relationship.get("id"), relationship.get(other_key)
                     if not isinstance(identity, str) or not isinstance(other_id, str):
                         raise DepositError("INVALID_RESPONSE", "Relationship page omitted stable endpoint identity")
                     if identity in seen:
                         continue
                     seen.add(identity)
-                    yield self._entity_handle_at_revision(kind, other_id, iterator.revision), relationship
+                    selected.append((other_id, relationship))
+                    identities[other_id] = None
+                entities = self._checked_page_entities(kind, identities, checked_revision)
+                items = [entities[other_id] for other_id, _ in selected]
+                if kind == "Class":
+                    handles = self._class_page_handles(items, checked_revision)
+                else:
+                    handles = self._object_page_handles(items, checked_revision, schemas)
+                return [(handle, relationship) for handle, (_, relationship) in zip(handles, selected, strict=True)]
+
+            iterator = self._entity_page(procedure, {filter_key: source.id}, page_size=page_size,
+                                         expected_revision=revision, prepare=prepare)
+            try:
+                yield from iterator
             finally:
                 revision = iterator.revision
                 iterator.close()
@@ -1632,8 +1670,8 @@ class Store:
         self._assert_not_collecting_batch()
         with self._serialized():
             query = (
-                f"CYPHER 25 CALL {procedure}($selection, $token) YIELD node "
-                "CALL deposit.utils.toData(node, $token) YIELD data RETURN data"
+                f"CYPHER 25 CALL {procedure}Page($selection, {{pageSize: 1}}, $token) YIELD data "
+                "RETURN data.items[0] AS data"
             )
             row = self._client._single(query, {"selection": selection, "token": self._token})
             data = row.get("data")

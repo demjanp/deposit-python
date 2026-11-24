@@ -113,7 +113,7 @@ class QueryIterator:
 class EntityPageIterator:
     """Lazy consumer for one catalogued Domain *Page procedure."""
 
-    def __init__(self, store, procedure: str, selection, *, page_size: int = 200, transform=None,
+    def __init__(self, store, procedure: str, selection, *, page_size: int = 200, transform=None, prepare=None,
                  expected_revision: int | None = None):
         if type(page_size) is not int or not 1 <= page_size <= 1000:
             raise ValueError("page_size must be an integer from 1 through 1000")
@@ -122,6 +122,7 @@ class EntityPageIterator:
         self._selection = selection
         self._page_size = page_size
         self._transform = transform or (lambda value, revision: value)
+        self._prepare = prepare
         self._revision = expected_revision
         self._cursor = None
         self._seen_cursors = set()
@@ -157,12 +158,15 @@ class EntityPageIterator:
                     self._procedure, self._selection, options, expected_revision=self._revision
                 )
                 self._validate_page(page)
+                items = page["items"]
+                if items and self._prepare is not None:
+                    items = self._prepare(items, revision)
             except BaseException:
                 self.close()
                 raise
             self._first = False
             self._revision = revision
-            self._items = page["items"]
+            self._items = items
             self._index = 0
             self._cursor = page["nextCursor"]
             if self._cursor is not None:
