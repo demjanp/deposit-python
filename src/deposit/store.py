@@ -1879,7 +1879,7 @@ def _selector(value: str | dict[str, Any], kind: str) -> str | dict[str, Any]:
     if isinstance(value, DNode):
         if value.kind != kind:
             raise TypeError(f"{kind} selector has the wrong handle kind")
-        return {"id": value.id, "kind": value.kind, "namespaceId": value.namespace_id}
+        return {"id": value.id}
     if isinstance(value, str) and value:
         return value
     if isinstance(value, dict):
@@ -1898,7 +1898,7 @@ def _pattern_selector(value: str | Mapping[str, Any]) -> str | dict[str, Any]:
         if set(selector) == {"id"} and isinstance(selector["id"], str) and selector["id"]:
             return selector
         if set(selector) == {"name"} and isinstance(selector["name"], str) and selector["name"]:
-            return selector
+            return selector["name"]
     raise TypeError("Pattern selector must be a nonempty name or an {id: UUID} mapping")
 
 

@@ -2,11 +2,12 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from uuid import UUID
 from weakref import WeakValueDictionary
 
 import pytest
 
-from deposit.entities import DClass
+from deposit.entities import DClass, DObject
 from deposit.errors import DepositError
 from deposit.store import Store
 
@@ -74,6 +75,55 @@ def object_data(identity, class_id):
         "id": identity, "kind": "Object", "namespaceId": "namespace", "classId": class_id,
         "descriptors": {"Collected": "2026-11-24"},
     }
+
+
+@pytest.mark.parametrize("kind", ["Class", "Object"])
+def test_plain_handle_getter_wire_selector(kind):
+    store = make_store(Driver(lambda *_: pytest.fail("Unexpected checked read")))
+    foreign = make_store(Driver(lambda *_: pytest.fail("Unexpected foreign read")))
+    class_id, object_id = str(UUID(int=1)), str(UUID(int=2))
+    clazz, obj = class_data(class_id, "First"), object_data(object_id, class_id)
+    if kind == "Class":
+        getter, data, handle_type = store.get_class, clazz, DClass
+        plain = clazz["name"]
+        wrong = DObject(store, obj)
+    else:
+        getter, data, handle_type = store.get_object, obj, DObject
+        plain = object_id
+        wrong = DClass(store, clazz)
+    calls = []
+
+    def single(query, parameters):
+        assert f"CALL deposit.get.{kind.lower()}Page(" in query
+        calls.append(parameters["selection"])
+        return {"data": data}
+
+    store._client._single = single
+    identity = {"id": data["id"]}
+    for selection in (handle_type(store, data), plain, identity, data):
+        assert getter(selection) == data
+    for selection in (wrong, handle_type(foreign, data)):
+        with pytest.raises(ValueError, match="Store"):
+            getter(selection)
+    assert calls == [identity, plain, identity, identity]
+
+
+@pytest.mark.parametrize(("selection", "wire"), [
+    ({"name": "Sample"}, "Sample"), ("Sample", "Sample"), ({"id": "pattern"}, {"id": "pattern"}),
+])
+def test_pattern_getter_wire_selector(selection, wire):
+    store = make_store(Driver(lambda *_: pytest.fail("Unexpected checked read")))
+    data = {"id": "pattern", "name": "Sample", "namespaceId": "namespace"}
+    calls = []
+
+    def single(query, parameters):
+        assert "CALL deposit.get.patternPage(" in query
+        calls.append(parameters["selection"])
+        return {"data": data}
+
+    store._client._single = single
+    assert store.get_pattern(selection) == data
+    assert calls == [wire]
 
 
 def test_snapshot_and_object_iteration_fetch_only_missing_distinct_schemas():

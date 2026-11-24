@@ -139,6 +139,10 @@ class Protocol:
                 row = {"data": {"changed": True}}
             elif route == "deposit.create.object":
                 row = {"node": object_data()}
+            elif route == "deposit.set.pattern":
+                row = {"node": {"id": "pattern", "namespaceId": "namespace"}}
+            elif route == "deposit.delete.pattern":
+                row = {"data": {"changed": True}}
             elif route == "deposit.apply.batch":
                 row = {"data": {"results": {command["key"]: {} for command in parameters["a0"]}}}
             else:
@@ -174,6 +178,34 @@ class Protocol:
     @property
     def routes(self):
         return [route for route, *_ in self.calls]
+
+
+@pytest.mark.parametrize("method", ["set", "delete"])
+@pytest.mark.parametrize(("selection", "wire"), [
+    ({"name": "Sample"}, "Sample"), ("Sample", "Sample"), ({"id": "pattern"}, {"id": "pattern"}),
+])
+def test_pattern_mutation_wire_selector(monkeypatch, method, selection, wire):
+    protocol = Protocol()
+    store = protocol.make_store(monkeypatch)
+    procedure = f"deposit.{method}.pattern"
+    patch = {"comment": "Updated"} if method == "set" else {}
+    getattr(store, f"{method}_pattern")(selection, **patch)
+    assert protocol.routes == ["deposit.get.session", "deposit.action.begin", procedure]
+    assert protocol.registration["a3"] == ([wire, patch] if patch else [wire])
+    assert protocol.calls[-1][3]["a0"] == wire
+
+
+@pytest.mark.parametrize("selection", [
+    {}, {"name": ""}, {"name": 1}, {"name": "Sample", "id": "pattern"},
+    {"name": "Sample", "extra": True}, {"id": ""},
+])
+def test_malformed_pattern_selectors_do_not_request(monkeypatch, selection):
+    protocol = Protocol()
+    store = protocol.make_store(monkeypatch)
+    for call in (store.get_pattern, store.delete_pattern, lambda value: store.set_pattern(value, comment="Updated")):
+        with pytest.raises(TypeError, match="Pattern selector"):
+            call(selection)
+    assert protocol.calls == []
 
 
 def test_warm_descriptor_write_keeps_one_checked_post_commit_refresh(monkeypatch):
