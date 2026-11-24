@@ -38,6 +38,7 @@ class Batch:
         self._commands: list[dict[str, Any]] = []
         self._keys: dict[BatchReference, str] = {}
         self._pinned_revision: int | None = None
+        self._refresh_handles = ()
         self._results: dict[str, Any] | None = None
         self._entered = False
         self._closed = False
@@ -56,9 +57,8 @@ class Batch:
                 # submission. This also protects against accidental mutation of
                 # private collector state between individual calls.
                 commands = self._freeze_commands(self._commands)
-                self._results = self._store._submit_batch(
-                    commands, pinned_revision=self._pinned_revision
-                )
+                options = {"refresh_handles": self._refresh_handles} if self._refresh_handles else {}
+                self._results = self._store._submit_batch(commands, pinned_revision=self._pinned_revision, **options)
         finally:
             self._closed = True
             self._store._end_batch_collection(self)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import contextmanager, suppress
+from functools import cache
 from importlib.metadata import version as distribution_version
 from importlib.resources import files
 from threading import Condition, Lock
@@ -76,8 +77,9 @@ class Client:
         except Exception as exc:
             raise TransportError("Neo4j request failed") from exc
 
-    def discover(self) -> dict[str, Any]:
-        """Return discovery after checking the installed Neo4j Python driver."""
+    @staticmethod
+    @cache
+    def _check_driver_support() -> None:
         support = _manifest()["support"]
         driver_version = distribution_version("neo4j")
         try:
@@ -87,6 +89,10 @@ class Client:
             raise CompatibilityError(driver_version, support["neo4j_driver"], "Neo4j Python driver") from exc
         if driver_major != 6 or driver_minor < 1:
             raise CompatibilityError(driver_version, support["neo4j_driver"], "Neo4j Python driver")
+
+    def discover(self) -> dict[str, Any]:
+        """Return discovery after checking the installed Neo4j Python driver."""
+        self._check_driver_support()
         record = self._single("CYPHER 25 CALL deposit.get.info() YIELD data RETURN data")
         data = record.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("version"), str):
@@ -450,8 +456,8 @@ class Client:
         from ._exchange import ExchangeBundle, discard_package, package_for_target, stage_zip
         from ._paging import CloneResult
 
-        self.require_clone_capabilities()
         with self._operation_endpoint(token, "server") as endpoint:
+            endpoint._require_capabilities("fullNamespaceClone", "pagedImportResults")
             endpoint.require_exchange()
             endpoint.call("deposit.utils.refresh", "server")
             if isinstance(source, ExchangeBundle):

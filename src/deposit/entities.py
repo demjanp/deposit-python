@@ -174,6 +174,8 @@ class DNode(Mapping):
         if self._kind != "Object":
             raise TypeError("Only Object handles assign Descriptor values")
         self._ensure_current()
+        if not isinstance(name, str) or not name:
+            raise ValueError("Descriptor name must be a nonempty string")
         # Prepare (including Server-owned DGeometry resolution) before retaining
         # this as a pending edit. A type/value error is not unresolved intent.
         prepare = getattr(self._store, "_prepare_descriptor_payload", None)

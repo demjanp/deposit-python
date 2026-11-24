@@ -90,6 +90,10 @@ def test_snapshot_and_object_iteration_fetch_only_missing_distinct_schemas():
         if "AS classPage" in query:
             assert parameters["selection"] == {"id": "1"}
             return Result([{"entity": first, "schema": classes["a"]}], 4, 4)
+        if "deposit.get.objectClass" in query:
+            assert parameters["object"] == "1"
+            assert "deposit.utils.toData" in query
+            return Result([classes["a"]], 4, 4)
         if "deposit.get.classPage" in query:
             return Result([{"items": [classes["a"]], "nextCursor": None}], 4, 4)
         assert "deposit.get.objectPage" in query
@@ -107,17 +111,20 @@ def test_snapshot_and_object_iteration_fetch_only_missing_distinct_schemas():
 
     store._client._single = single
     assert store.get_class("First") == classes["a"]
-    assert store.get_object_handle({"id": "1"})["Collected"] == date(2026, 11, 24)
+    obj = store.get_object_handle({"id": "1"})
+    assert obj["Collected"] == date(2026, 11, 24)
     assert len(driver.calls) == 1
+    assert obj.get_class().declarations["Collected"]["type"] == "Date"
+    assert len(driver.calls) == 2
     assert list(store.classes())[0].declarations["Collected"]["type"] == "Date"
-    assert len(driver.calls) == 2
+    assert len(driver.calls) == 3
     rows = store.objects(page_size=2)
-    assert len(driver.calls) == 2
+    assert len(driver.calls) == 3
     assert next(rows)["Collected"] == date(2026, 11, 24)
-    assert len(driver.calls) == 4
-    assert [obj.id for obj in rows] == ["2", "3"]
     assert len(driver.calls) == 5
-    assert driver.finished == ["committed"] * 5
+    assert [obj.id for obj in rows] == ["2", "3"]
+    assert len(driver.calls) == 6
+    assert driver.finished == ["committed"] * 6
 
 
 def test_checked_pages_reject_changed_revisions_before_publishing():
