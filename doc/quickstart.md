@@ -69,7 +69,7 @@ Run it with the virtual environment’s interpreter:
 
 The Deposit query prints `S-01`, `S-02`, and `S-03`. The relationship lookup shows that `S-01` and `S-02` each point to `C-01` through `foundIn`. Each relationship dictionary gives the direction through its `sourceId` and `targetId`, which the script resolves to Object handles to display their `Code` values. [Relationship API](api.md#records-and-queries)
 
-The Neo4j credentials authenticate the Bolt connection. The Deposit credentials open the Namespace session. The context managers close each iterator after use and close the Store, Client, and driver when the script finishes.
+The Neo4j credentials authenticate the Bolt connection. The Deposit credentials open the Namespace session. The context managers close each iterator after use and close the Store, Client, and driver when the script finishes. To list available Namespaces before opening a Store, use `client.login()`, `client.get_namespaces(token)`, and `client.logout(token)`. [Token-based Client calls](api.md#token-based-client-calls)
 
 ## Read and edit data
 
@@ -82,6 +82,8 @@ with store.classes() as classes:
 ```
 
 Use `store.get_class("Specimen")` for a dictionary or `store.get_class_handle("Specimen")` for a `DClass` handle. Store and entity methods support ordinary edits. Use `store.transaction()` to collect related edits into one atomic batch. If a revision conflict occurs, refresh the affected handles and review your changes before resubmitting them. [Records, queries, and batches](api.md#records-and-queries)
+
+Use `store.descriptors(dobject)` to iterate over an Object's Descriptor names, values, and declared types. With editor or owner access, assign a value with `dobject[name] = value`. For a new Descriptor whose type needs to be explicit, pass a value such as `typed("Float", 2)` after importing `typed` from `deposit`. [Descriptor values](api.md#descriptor-values) · [Entity handles and revisions](api.md#entity-handles-and-revisions)
 
 ## Operation IDs
 
@@ -129,7 +131,7 @@ cannot establish the outcome, treat it as unknown and avoid blind replay.
 Use `store.cancel_operation(operation_id)` to request cancellation and check
 the returned state for confirmed rollback or commit. The Client equivalents
 take a token and the original `scope` (Namespace UUID or `"server"`).
-Only supported tracked calls accept an explicit operation ID. See the [Python API reference](api.md#tracked-operations) for the methods that accept it.
+Only supported tracked calls accept an explicit operation ID. To list or cancel active requests from another thread, use the Store's request controls. [Tracked operations](api.md#tracked-operations) · [Live request control](api.md#live-request-control)
 
 ## Transfer files
 
@@ -141,7 +143,7 @@ with resource.open(store) as reader:
     content = reader.read()
 ```
 
-Uploads and downloads verify content integrity. Uploading a file makes it available as a resource; assign it to a resource Descriptor to attach it to a record.
+Uploads and downloads verify content integrity. Assign the uploaded resource to a resource Descriptor to attach it to a record. You can also upload from a binary stream by supplying `stream=` and `filename=`. [Files and exchange](api.md#files-and-exchange)
 
 ## Import and export
 
@@ -170,7 +172,7 @@ if plan_id:
 
 An explicit import analysis ID identifies only analysis. Applying its plan is a separate tracked call with its own ID. Intermediate transfers also have separate IDs.
 
-The wrapper also supports imports from rows, dictionaries, subtrees, and NetworkX graphs. Use `store.import_inspect(plan_id)` in a context manager to review an import plan or `store.discard_import_plan(plan_id)` to discard it. A whole-Namespace export that includes retained history requires Namespace owner permissions.
+The wrapper also supports imports from rows, graph snapshots, Pattern form data, and NetworkX graphs. Use `store.import_inspect(plan_id)` in a context manager to review an import plan or `store.discard_import_plan(plan_id)` to discard it. A whole-Namespace export includes retained history when history mode is persistent and requires Namespace owner access in that case. Use `client.clone_namespace(token, source)` to create a separate Namespace from a complete package. [Import plans](api.md#import-plans) · [Pattern matching and form import](api.md#patterns-and-user-tools) · [Namespace cloning](api.md#files-and-exchange)
 
 ## Use NetworkX
 

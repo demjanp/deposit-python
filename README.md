@@ -4,12 +4,12 @@
 
 ## Features
 
-- **Connections and sessions.** `Client` uses a Neo4j driver to discover the server and open independently authenticated `Store` sessions. Each Store works in one Namespace.
+- **Connections and sessions.** `Client` uses a Neo4j driver to discover the server and open independently authenticated `Store` sessions. Each Store works in one Namespace. Client sessions also support Namespace discovery and administrative operations.
 - **Python records and values.** `DClass` and `DObject` represent Classes and Objects. `DGeometry` and `DResource` represent spatial values and attached files.
-- **Relationships.** Directed, labeled links connect Classes to Classes and Objects to Objects.
+- **Relationships.** Directed, labeled links connect Classes to Classes and Objects to Objects. Browse neighbors and compute graph layouts.
 - **Queries and edits.** Run Deposit Query Language queries, page through large results, and group related edits into atomic batches. Revision checks identify conflicting changes.
 - **Import and exchange.** Import data using Patterns, move portable packages between Stores, clone Namespaces, and convert graphs to and from NetworkX. Inspect import plans before applying changes.
-- **Files and tracked operations.** Transfer files through verified streams, inspect operation outcomes, and request cancellation. Use `Store.call()` to access additional server procedures.
+- **Files and tracked operations.** Transfer files through verified streams, inspect active requests and operation outcomes, and request cancellation. Use `Store.call()` to access available server procedures.
 
 ## Platform
 
