@@ -6,7 +6,7 @@
 
 - **Connections and sessions.** `Client` uses a Neo4j driver to discover the server and open independently authenticated `Store` sessions. Each Store works in one Namespace.
 - **Python records and values.** `DClass` and `DObject` represent Classes and Objects. `DGeometry` and `DResource` represent spatial values and attached files.
-- **Relationships.** Directed, labeled links connect Classes to Classes and Objects to Objects. Store methods return them as dictionaries with fields including `id`, `sourceId`, `targetId`, and `label`. In NetworkX exports, relationships are edges keyed by their IDs.
+- **Relationships.** Directed, labeled links connect Classes to Classes and Objects to Objects.
 - **Queries and edits.** Run Deposit Query Language queries, page through large results, and group related edits into atomic batches. Revision checks identify conflicting changes.
 - **Import and exchange.** Import data using Patterns, move portable packages between Stores, clone Namespaces, and convert graphs to and from NetworkX. Inspect import plans before applying changes.
 - **Files and tracked operations.** Transfer files through verified streams, inspect operation outcomes, and request cancellation. Use `Store.call()` to access additional server procedures.
