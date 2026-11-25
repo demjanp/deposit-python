@@ -50,6 +50,54 @@ with store.iter_query("SELECT Specimen.Code AS code") as rows:
 
 Common changes are available through Store and entity methods. Use `store.transaction()` to group related edits into one atomic operation. If another user has changed the data, refresh the affected records before deciding whether to reapply your changes.
 
+## Operation IDs
+
+With editor access and an existing `Specimen` class, use the ordinary
+convenience method:
+
+```python
+specimen = store.get_class_handle("Specimen")
+store.create_class_descriptor(specimen, "Color", "String")
+```
+
+For other allowlisted Store procedures, pass the domain arguments in order.
+For example, a domain-only call to create a different descriptor returns an
+iterable `StoreResult` whose row contains the portable node:
+
+```python
+with store.call("deposit.create.classDescriptor", "Specimen", "Finish", "String", {}) as result:
+    print(next(result)["node"]["id"])
+```
+
+The wrapper generates and registers an ID for each tracked call, including
+intermediate package and resource transfer steps. Supply a fresh UUIDv7 when
+you need a known identity before submission:
+
+```python
+operation_id = client.new_operation_id()
+with store.call("deposit.create.classDescriptor", "Specimen", "Texture", "String", {},
+                operation_id=operation_id) as result:
+    print(next(result)["node"]["id"])
+```
+
+To inspect that attempt, including after a lost response, use its exact ID:
+
+```python
+status = store.get_operation(operation_id)
+print(status["state"])
+```
+
+Lookup uses an authorized control connection in the Store's Namespace. If the
+original Store is unavailable, use another Store authenticated as the same
+actor in the same Namespace. A known-ID lookup can confirm commit even when
+the original result is unavailable. Access and retention still apply. If you
+cannot establish the outcome, treat it as unknown and avoid blind replay.
+
+Use `store.cancel_operation(operation_id)` to request cancellation and check
+the returned state for confirmed rollback or commit. The Client equivalents
+take a token and the original `scope` (Namespace UUID or `"server"`).
+Only tracked calls accept an explicit operation ID. Dry-run pruning rejects it.
+
 ## Transfer files
 
 ```python
@@ -79,6 +127,8 @@ with store.import_exchange("source.zip") as analysis:
         with store.import_apply(analysis.plan_id) as result:
             print(result.state)
 ```
+
+An explicit import analysis ID identifies only analysis. Applying its plan is a separate tracked call with its own ID. Intermediate transfers also have separate IDs.
 
 The wrapper also supports imports from rows, dictionaries, subtrees, and NetworkX graphs. Use `store.import_inspect(plan_id)` to review an import plan or `store.discard_import_plan(plan_id)` to discard it. A full export that includes retained history may require Namespace owner permissions.
 

@@ -264,7 +264,7 @@ class Client:
 
     @staticmethod
     def new_operation_id() -> str:
-        """Create a fresh public operation identity."""
+        """Create a fresh UUIDv7 for explicit tracking."""
         return str(uuid.uuid7())
 
     def get_operation(self, token: str, operation_id: str, *, scope: str = "server") -> Any:
@@ -352,7 +352,7 @@ class Client:
         return self._invoke_client_procedure("deposit.admin.pruneResourcesStatus", token, prune_id)
 
     def prune_resources(self, token: str, options: dict[str, Any], *, operation_id=None) -> Any:
-        """Inspect or start a Server-authorized resource collection job."""
+        """Preview resource collection or start a tracked prune with an optional ID."""
         if not isinstance(options, dict):
             raise TypeError("prune_resources options must be a dictionary")
         route = "deposit.admin.pruneResources"
@@ -454,7 +454,9 @@ class Client:
             raise
 
     def clone_namespace(self, token: str, source, *, operation_id=None):
-        """Create a Namespace atomically from a complete Exchange package."""
+        """Create a Namespace atomically from a complete Exchange package.
+
+        operation_id identifies the clone attempt. Upload steps use their own IDs."""
         from ._exchange import ExchangeBundle, discard_package, package_for_target, stage_zip
         from ._paging import CloneResult
 

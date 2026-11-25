@@ -778,7 +778,7 @@ class Store:
         rules: Mapping[str, Any] | None = None,
         *, operation_id=None,
     ):
-        """Submit form data for an ID-selected Pattern through the server workflow."""
+        """Analyze form data for an ID-selected Pattern with an optional analysis ID."""
         if not isinstance(pattern, Mapping) or not isinstance(values, Mapping):
             raise TypeError("Pattern must be an {id: UUID} selector and form values must be a mapping")
         if rules is not None and not isinstance(rules, Mapping):
@@ -836,12 +836,12 @@ class Store:
         ))
 
     def from_networkx(self, graph, *, resources=None, resource_source=None, rules=None, operation_id=None):
-        """Analyze a Deposit MultiDiGraph using Server-owned intake."""
+        """Analyze a Deposit MultiDiGraph with an optional analysis ID."""
         return self.from_dict(from_networkx(graph), resources=resources, resource_source=resource_source,
                               rules=rules, operation_id=operation_id)
 
     def import_rows(self, rows, relationships=None, *, targets=None, rules=None, operation_id=None):
-        """Analyze tabular input, leaving matching and plan validation to the Server."""
+        """Analyze tabular input on the Server with an optional analysis ID."""
         frozen_rows = _freeze_import_rows(rows)
         if relationships is None:
             frozen_relationships = []
@@ -861,12 +861,12 @@ class Store:
         ], operation_id=operation_id)
 
     def import_subtree(self, subtree, *, resources=None, resource_source=None, rules=None, operation_id=None):
-        """Analyze a public subgraph with optional resource content."""
+        """Analyze a public subgraph with optional resources and an optional analysis ID."""
         return self.from_dict(subtree, resources=resources, resource_source=resource_source,
                               rules=rules, operation_id=operation_id)
 
     def from_dict(self, data, *, resources=None, resource_source=None, rules=None, operation_id=None):
-        """Analyze a public graph and its resource providers without applying a plan."""
+        """Analyze a public graph and its resources with an optional analysis ID."""
         if not isinstance(data, Mapping):
             raise TypeError("Import snapshot must be a manifest/graph mapping")
         return self._analyze_package(
@@ -898,7 +898,7 @@ class Store:
         return selection, options
 
     def export_exchange(self, *, roots=None, max_hops=None, root_class_boundary=True, operation_id=None):
-        """Export a canonical Server package and return its owning bundle."""
+        """Export a Server package with an optional export ID and return its owning bundle."""
         self._assert_not_collecting_batch()
         selection, options = self._export_arguments(roots, max_hops, root_class_boundary)
         with self._serialized():
@@ -916,7 +916,7 @@ class Store:
                 raise
 
     def import_exchange(self, source, *, rules=None, operation_id=None):
-        """Analyze ZIP bytes or an authorized Exchange bundle for explicit apply."""
+        """Analyze ZIP bytes or an authorized Exchange bundle with an optional analysis ID."""
         if isinstance(source, ExchangeBundle):
             return self._analyze_package(lambda endpoint: package_for_target(source, endpoint),
                                          rules, operation_id=operation_id, source=source)
@@ -925,7 +925,9 @@ class Store:
 
     def import_from(self, source_store, *, roots=None, max_hops=None,
                     root_class_boundary=True, rules=None, operation_id=None):
-        """Analyze a source Store export using independently authenticated Stores."""
+        """Analyze an independently authenticated Store's export.
+
+        operation_id identifies analysis in the receiving Store."""
         if not isinstance(source_store, Store):
             raise TypeError("source_store must be an authenticated Store")
         _import_rules(rules)
@@ -1019,7 +1021,7 @@ class Store:
         raise failure
 
     def import_apply(self, plan_id: str, *, operation_id=None):
-        """Explicitly apply a ready plan in one Server transaction."""
+        """Apply a ready plan in one Server transaction with an optional apply ID."""
         _stable_id(plan_id)
         self._endpoint._require_capabilities("pagedImportResults")
         with self._serialized():
@@ -1102,7 +1104,12 @@ class Store:
             raise RuntimeError("Store is closed")
 
     def call(self, procedure: str, *arguments: Any, operation_id=None):
-        """Call an allowlisted Store procedure using its domain arguments."""
+        """Call an allowlisted Store procedure using its domain arguments.
+
+        For a tracked procedure, supply a fresh UUIDv7 as operation_id to
+        identify the attempt before submission. The wrapper otherwise
+        generates and registers an ID. For import analysis and apply, the ID
+        identifies that individual step."""
         self._assert_not_collecting_batch()
         entry = store_procedure(procedure)
         tracked = entry.get("tracked") == "always"
@@ -1193,7 +1200,7 @@ class Store:
         return self._operation_status(operation_id, cancel=False)
 
     def cancel_operation(self, operation_id: str) -> Any:
-        """Request cancellation in this Store's immutable Namespace."""
+        """Request cancellation and return the reported state in this Store's Namespace."""
         return self._operation_status(operation_id, cancel=True)
 
     def _operation_status(self, operation_id, *, cancel):
