@@ -1,6 +1,6 @@
 # deposit-python — Quickstart
 
-Install the `deposit` Python wrapper, connect to Deposit Server, and query the server’s sample data.
+Install the `deposit` Python wrapper, then query and explore relationships in the server’s sample data.
 
 ## Install
 
@@ -25,7 +25,7 @@ Once a 2.x wrapper release is published on PyPI, the corresponding command is:
 
 Pip installs the Neo4j Python driver (`>=6.1,<7`) and NetworkX (`>=3.4,<4`) for all three installation paths. If you also use the standalone `deposit` distribution, keep it in a separate Python environment because both distributions provide the `deposit` import.
 
-## Connect and run a query
+## Query records and follow relationships
 
 If you need a server, use the [Deposit Server 2.0.1 checkout instructions](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/installation.md#run-from-a-git-checkout). Follow the server’s [quickstart through step 4](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/quickstart.md#4-load-the-sample-graph) to set up a Deposit account, create the `Deposit sample` Namespace, and load the [sample graph](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/sample-data/seed.cypher).
 
@@ -46,9 +46,19 @@ with GraphDatabase.driver(
         username="deposit-admin",
         password=getpass("Deposit password: "),
     ) as store:
+        print("Specimens from a Deposit query")
         with store.iter_query("SELECT Specimen.Code AS code ORDER BY code") as rows:
             for row in rows:
                 print(row["values"]["code"])
+
+        print("\nSpecimen-to-Context relationships")
+        with store.relationships(label="foundIn") as rows:
+            relationships = list(rows)
+
+        for relationship in relationships:
+            source = store.get_object_handle({"id": relationship["sourceId"]})
+            target = store.get_object_handle({"id": relationship["targetId"]})
+            print(f"{source['Code']} -{relationship['label']}-> {target['Code']}")
 ```
 
 Run it with the virtual environment’s interpreter:
@@ -57,7 +67,9 @@ Run it with the virtual environment’s interpreter:
 .\.venv\Scripts\python.exe read_sample.py
 ```
 
-The sample prints `S-01`, `S-02`, and `S-03`. The Neo4j credentials authenticate the Bolt connection. The Deposit credentials open the Namespace session. The context managers close the row iterator, Store, Client, and driver in that order.
+The Deposit query prints `S-01`, `S-02`, and `S-03`. The relationship lookup shows that `S-01` and `S-02` each point to `C-01` through `foundIn`. Each relationship dictionary gives the direction through its `sourceId` and `targetId`, which the script resolves to Object handles to display their `Code` values. [Relationship API](api.md#records-and-queries)
+
+The Neo4j credentials authenticate the Bolt connection. The Deposit credentials open the Namespace session. The context managers close each iterator after use and close the Store, Client, and driver when the script finishes.
 
 ## Read and edit data
 
