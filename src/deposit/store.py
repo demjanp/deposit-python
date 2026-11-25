@@ -1101,18 +1101,21 @@ class Store:
         if self._closed or self._closing:
             raise RuntimeError("Store is closed")
 
-    def call(self, procedure: str, *arguments: Any):
+    def call(self, procedure: str, *arguments: Any, operation_id=None):
         """Call an allowlisted Store procedure using its domain arguments."""
         self._assert_not_collecting_batch()
         entry = store_procedure(procedure)
+        tracked = entry.get("tracked") == "always"
+        if operation_id is not None and not tracked:
+            raise ValueError("Procedure does not accept a tracked operation")
         if procedure == "deposit.import.apply":
-            return self.import_apply(*arguments)
+            return self.import_apply(*arguments, operation_id=operation_id)
         if procedure == "deposit.import.discardPlan":
             return self.discard_import_plan(*arguments)
-        if entry.get("tracked") == "always":
+        if tracked:
             if procedure in _IMPORT_RESULTS:
-                return self._analyze(procedure, arguments)
-            outcome = self._run_action(procedure, arguments)
+                return self._analyze(procedure, arguments, operation_id=operation_id)
+            outcome = self._run_action(procedure, arguments, operation_id=operation_id)
             columns = entry["columns"]
             row = {columns[0]: outcome} if len(columns) == 1 else outcome
             return detached_result(entry, row, self._token)

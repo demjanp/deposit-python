@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 
+from deposit._gateway import build_query, tracked_procedure
 from deposit.client import Client
 from deposit.entities import DClass, DObject
 from deposit.errors import CompatibilityError, DepositError
@@ -131,8 +132,17 @@ class Protocol:
             row = {"data": self.status("REGISTERED")}
             if self.replace_after_begin:
                 self.execution.connection = object()
-        elif route.startswith(("deposit.set.", "deposit.create.", "deposit.delete.")) or route == "deposit.apply.batch":
+        elif (route.startswith(("deposit.set.", "deposit.create.", "deposit.delete."))
+              or route in {"deposit.apply.batch", "deposit.import.analyze", "deposit.import.apply"}):
             assert transaction._connection is self.execution.connection
+            arguments = self.registration["a3"]
+            placeholders = [f"$a{index}" for index in range(len(arguments))]
+            placeholders.extend(("$token", f"$a{len(arguments)}"))
+            assert query.startswith(f"CYPHER 25 CALL {route}({', '.join(placeholders)}) YIELD ")
+            assert parameters == {
+                **{f"a{index}": value for index, value in enumerate((*arguments, self.registration["a0"]))},
+                "token": self.registration["token"],
+            }
             if route == "deposit.set.descriptor":
                 row = {"node": {"namespaceId": "namespace", "id": "descriptor", "value": parameters["a2"]}}
             elif route == "deposit.delete.descriptor":
@@ -145,6 +155,14 @@ class Protocol:
                 row = {"data": {"changed": True}}
             elif route == "deposit.apply.batch":
                 row = {"data": {"results": {command["key"]: {} for command in parameters["a0"]}}}
+            elif route in {"deposit.import.analyze", "deposit.import.apply"}:
+                applying = route == "deposit.import.apply"
+                row = {"data": {
+                    "format": "deposit.import-result", "resultId": "result", "leaseId": "lease",
+                    "leaseExpiresAt": 100, "expiresAt": 100, "operationId": self.registration["a0"],
+                    "kind": "apply" if applying else "analysis", "state": "APPLIED" if applying else "PLAN_READY",
+                    "namespaceId": "namespace", "planId": "plan", "revision": 4, "collections": {},
+                }}
             else:
                 row = {"value": True}
         elif route == "deposit.get.operation":
@@ -223,6 +241,86 @@ def test_warm_descriptor_write_keeps_one_checked_post_commit_refresh(monkeypatch
     assert begin[1]._connection is write[1]._connection
     assert sum(query.count("CALL deposit.") for _, _, query, _ in protocol.calls) == 8
     assert "deposit.utils.toData" in write[2] and checked[2].count("CALL deposit.get.revision") == 2
+
+
+def test_store_call_forwards_explicit_operation_id(monkeypatch):
+    protocol = Protocol()
+    store = protocol.make_store(monkeypatch)
+    operation_id = Client.new_operation_id()
+    arguments = ("Sample", {"comment": "Updated"})
+    with store.call("deposit.set.pattern", *arguments, operation_id=operation_id) as result:
+        assert next(result) == {"node": {"id": "pattern", "namespaceId": "namespace"}}
+    assert protocol.routes == ["deposit.get.session", "deposit.action.begin", "deposit.set.pattern"]
+    assert protocol.registration["a0"] == operation_id
+    assert protocol.registration["a3"] == list(arguments)
+
+
+def test_store_call_import_dispatch_preserves_operation_ids(monkeypatch):
+    protocol = Protocol()
+    store = protocol.make_store(monkeypatch)
+    analysis_id, apply_id = Client.new_operation_id(), Client.new_operation_id()
+    source = {"packageId": "package", "grant": "grant"}
+    with store.call("deposit.import.analyze", source, {}, operation_id=analysis_id) as analysis:
+        assert (analysis.operation_id, analysis.state) == (analysis_id, "PLAN_READY")
+        plan_id = analysis.plan_id
+        assert protocol.registration["a3"] == [source, {}]
+    with store.call("deposit.import.apply", plan_id, operation_id=apply_id) as applied:
+        assert (applied.operation_id, applied.state) == (apply_id, "APPLIED")
+        assert protocol.registration["a3"] == [plan_id]
+    assert protocol.routes == [
+        "deposit.get.session", "deposit.action.begin", "deposit.import.analyze",
+        "deposit.get.session", "deposit.action.begin", "deposit.import.apply",
+    ]
+    assert [parameters["a0"] for route, _, _, parameters in protocol.calls
+            if route == "deposit.action.begin"] == [analysis_id, apply_id]
+
+
+def test_store_call_rejects_operation_ids_for_untracked_routes(monkeypatch):
+    protocol = Protocol()
+    store = protocol.make_store(monkeypatch)
+    for procedure in ("deposit.get.importPlan", "deposit.import.discardPlan"):
+        with pytest.raises(ValueError, match="does not accept a tracked operation"):
+            store.call(procedure, "plan", operation_id=Client.new_operation_id())
+    assert protocol.calls == []
+
+
+def test_tracked_query_places_optional_operation_id_after_token():
+    entry = tracked_procedure("deposit.create.classDescriptor")
+    arguments = ("Specimen", "Color", "String", {})
+    query, params = build_query(entry, arguments, "token")
+    assert query == (
+        "CYPHER 25 CALL deposit.create.classDescriptor($a0, $a1, $a2, $a3, $token) YIELD node RETURN node"
+    )
+    assert params == {"a0": "Specimen", "a1": "Color", "a2": "String", "a3": {}, "token": "token"}
+
+    operation_id = Client.new_operation_id()
+    query, explicit_params = build_query(entry, (*arguments, operation_id), "token")
+    assert query == (
+        "CYPHER 25 CALL deposit.create.classDescriptor($a0, $a1, $a2, $a3, $token, $a4) YIELD node RETURN node"
+    )
+    assert explicit_params == {**params, "a4": operation_id}
+
+
+def test_client_prune_dry_run_omits_id_and_rejects_explicit_id(monkeypatch):
+    client = Client(None)
+    calls = []
+    monkeypatch.setattr(client, "discover", lambda: calls.append("discover"))
+
+    def single(query, parameters):
+        calls.append((query, parameters))
+        return {"data": {"dryRun": True}}
+
+    monkeypatch.setattr(client, "_single", single)
+    for options in ({}, {"dryRun": True}):
+        assert client.prune_resources("token", options) == {"dryRun": True}
+        assert calls == ["discover", (
+            "CYPHER 25 CALL deposit.admin.pruneResources($a0, $token) YIELD data RETURN data",
+            {"a0": options, "token": "token"},
+        )]
+        calls.clear()
+        with pytest.raises(ValueError, match="Dry-run pruning does not accept an operation ID"):
+            client.prune_resources("token", options, operation_id=Client.new_operation_id())
+        assert calls == []
 
 
 def test_descriptor_delete_preserves_selector_refresh_and_stale_guards(monkeypatch):

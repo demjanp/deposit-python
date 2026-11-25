@@ -359,7 +359,9 @@ class Client:
         entry = tracked_procedure(route)
         (options,) = bind_client_arguments(domain_arguments(entry), (options,))
         if options.get("dryRun") is not False:
-            query, parameters = build_query(entry, (options, None), token)
+            if operation_id is not None:
+                raise ValueError("Dry-run pruning does not accept an operation ID")
+            query, parameters = build_query(entry, (options,), token)
             self.discover()
             return self._single(query, parameters)["data"]
         scope = "server"
