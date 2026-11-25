@@ -1,11 +1,12 @@
 # deposit-python
 
-**deposit-python** is the synchronous Python wrapper for **Deposit**, distributed and imported as `deposit`. It gives Python applications access to the scientific records, relationships, and attached files managed by [deposit-server](https://github.com/demjanp/deposit-server).
+**deposit-python** is the synchronous Python wrapper for **Deposit**. The Python distribution is named `deposit-python` and the import is `deposit`. It gives Python applications access to the scientific records, relationships, and attached files managed by [deposit-server](https://github.com/demjanp/deposit-server).
 
 ## Features
 
 - **Connections and sessions.** `Client` uses a Neo4j driver to discover the server and open independently authenticated `Store` sessions. Each Store works in one Namespace.
 - **Python records and values.** `DClass` and `DObject` represent Classes and Objects. `DGeometry` and `DResource` represent spatial values and attached files.
+- **Relationships.** Directed, labeled links connect Classes to Classes and Objects to Objects. Store methods return them as dictionaries with fields including `id`, `sourceId`, `targetId`, and `label`. In NetworkX exports, relationships are edges keyed by their IDs.
 - **Queries and edits.** Run Deposit Query Language queries, page through large results, and group related edits into atomic batches. Revision checks identify conflicting changes.
 - **Import and exchange.** Import data using Patterns, move portable packages between Stores, clone Namespaces, and convert graphs to and from NetworkX. Inspect import plans before applying changes.
 - **Files and tracked operations.** Transfer files through verified streams, inspect operation outcomes, and request cancellation. Use `Store.call()` to access additional server procedures.
@@ -20,7 +21,7 @@ From a full Git checkout, follow the [quickstart](https://github.com/demjanp/dep
 
 For a local wheel or a published 2.x package, see the [quickstart installation options](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md#install). The wrapper generates operation IDs for tracked calls. See [operation IDs](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md#operation-ids) to choose an ID before submission and look up the outcome.
 
-See the [Python API reference](https://github.com/demjanp/deposit-python/blob/main/doc/api.md) for wrapper behavior and the [release notes](https://github.com/demjanp/deposit-python/blob/main/RELEASE_NOTES.md) for the transition from `deposit` 1.x.
+See the [Python API reference](https://github.com/demjanp/deposit-python/blob/main/doc/api.md) for wrapper behavior and the [release notes](https://github.com/demjanp/deposit-python/blob/main/RELEASE_NOTES.md) for compatibility and release details.
 
 ## Build the release wheel
 

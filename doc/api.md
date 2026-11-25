@@ -14,11 +14,14 @@ Use the [quickstart](quickstart.md) to install the wrapper and open a Store. Thi
 | --- | --- |
 | Read one record as a dictionary | `store.get_class(selection)`, `store.get_object(selection)` |
 | Read a record as a handle | `store.get_class_handle(selection)`, `store.get_object_handle(selection)` |
-| Browse records by page | `store.classes()`, `store.objects(class_name=...)`, `store.members(dclass)`, `store.relationships()` |
+| Browse records by page | `store.classes()`, `store.objects(class_name=...)`, `store.members(dclass)` |
+| Browse labeled relationships | `store.relationships()` for Objects, `store.class_relationships()` for Classes |
 | Iterate over query rows | `store.iter_query(query, parameters=..., page_size=200)` |
 | Control query paging | `store.get_query_page(query, parameters=..., page_size=..., cursor=...)` |
 
 Use a Class name or an explicit ID selector for Classes and an Object ID for Objects. Handles carry a Namespace and a revision baseline. They support edits through methods such as `store.set_descriptor(dobject, name, value)`. When a revision conflict occurs, call `handle.refresh()` to read the current record and review the intended change before reapplying it.
+
+Relationship dictionaries contain the relationship ID, label, and directed endpoint IDs in `id`, `label`, `sourceId`, and `targetId`. Pass source and target handles or a label to the paged methods to filter the results.
 
 Each query row contains `values` and `presence` dictionaries keyed by output column. Read `presence` to tell whether a value was present, including an explicit null. Query page sizes run from 1 to 1,000. For manual paging, pass the returned `nextCursor` with the same query and parameters until it is `None`. Close paged readers when finished. If the Namespace changes and invalidates a cursor, start a new query to read the new revision. [Deposit Query Language](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/query-language.md)
 

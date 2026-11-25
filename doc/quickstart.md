@@ -4,7 +4,7 @@ Install the `deposit` Python wrapper, connect to Deposit Server, and query the s
 
 ## Install
 
-The wrapper targets **Python 3.14 on Windows x64** with **Deposit Server 2.0.1**. Use PowerShell and the Windows Python launcher. From the root of a full Git checkout, create a virtual environment and install the wrapper:
+The wrapper targets **Python 3.14 on Windows x64** with **Deposit Server 2.0.1**. Install the `deposit-python` distribution and import it as `deposit`. Use PowerShell and the Windows Python launcher. From the root of a full Git checkout, create a virtual environment and install the wrapper:
 
 ```powershell
 py -3.14 -m venv .venv
@@ -14,16 +14,16 @@ py -3.14 -m venv .venv
 To install from a local wheel, create the same virtual environment and pass the path to your wheel:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install "C:\path\to\deposit-2.0.1-py3-none-any.whl"
+.\.venv\Scripts\python.exe -m pip install "C:\path\to\deposit_python-2.0.1-py3-none-any.whl"
 ```
 
 Once a 2.x wrapper release is published on PyPI, the corresponding command is:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install "deposit>=2,<3"
+.\.venv\Scripts\python.exe -m pip install "deposit-python>=2,<3"
 ```
 
-Pip installs the Neo4j Python driver and NetworkX for all three installation paths. If you use the earlier `deposit` 1.x product, keep it in a separate Python environment. [Release notes](../RELEASE_NOTES.md#moving-from-deposit-1x)
+Pip installs the Neo4j Python driver and NetworkX for all three installation paths. If you also use the standalone `deposit` distribution, keep it in a separate Python environment because both distributions provide the `deposit` import. [Release notes](../RELEASE_NOTES.md#distribution-name)
 
 ## Connect and run a query
 

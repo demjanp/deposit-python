@@ -11,5 +11,5 @@ from ._paging import CloneResult, ImportResult, LazyResultMapping, LazyResultSeq
 
 from importlib.metadata import version as _distribution_version
 
-__version__ = _distribution_version("deposit")
+__version__ = _distribution_version("deposit-python")
 __all__ = ["Client", "Store", "DClass", "DObject", "ImportResult", "CloneResult", "LazyResultMapping", "LazyResultSequence", "LazyText", "DepositError", "DepositCancelled", "OperationCommittedAfterCancel", "OutcomeUnknown", "CompatibilityError", "TransportError", "DType", "DDict", "DGeometry", "DResource", "TypedValue", "TypedList", "typed", "title", "date", "__version__"]
