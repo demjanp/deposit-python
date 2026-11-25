@@ -23,7 +23,7 @@ Once a 2.x wrapper release is published on PyPI, the corresponding command is:
 .\.venv\Scripts\python.exe -m pip install "deposit-python>=2,<3"
 ```
 
-Pip installs the Neo4j Python driver and NetworkX for all three installation paths. If you also use the standalone `deposit` distribution, keep it in a separate Python environment because both distributions provide the `deposit` import. [Release notes](../RELEASE_NOTES.md#distribution-name)
+Pip installs the Neo4j Python driver (`>=6.1,<7`) and NetworkX (`>=3.4,<4`) for all three installation paths. If you also use the standalone `deposit` distribution, keep it in a separate Python environment because both distributions provide the `deposit` import.
 
 ## Connect and run a query
 

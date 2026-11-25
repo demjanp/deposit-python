@@ -21,7 +21,7 @@ From a full Git checkout, follow the [quickstart](https://github.com/demjanp/dep
 
 For a local wheel or a published 2.x package, see the [quickstart installation options](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md#install). The wrapper generates operation IDs for tracked calls. See [operation IDs](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md#operation-ids) to choose an ID before submission and look up the outcome.
 
-See the [Python API reference](https://github.com/demjanp/deposit-python/blob/main/doc/api.md) for wrapper behavior and the [release notes](https://github.com/demjanp/deposit-python/blob/main/RELEASE_NOTES.md) for compatibility and release details.
+See the [Python API reference](https://github.com/demjanp/deposit-python/blob/main/doc/api.md) for wrapper behavior.
 
 ## Build the release wheel
 
