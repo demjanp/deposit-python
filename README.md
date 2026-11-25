@@ -25,7 +25,7 @@ See the [Python API reference](https://github.com/demjanp/deposit-python/blob/ma
 
 ## Build the release wheel
 
-On Windows x64, open PowerShell at the root of a clean, full Git checkout. Check out the release commit with its stable `vX.Y.Z` tag. Use a fresh build directory alongside the checkout.
+On Windows x64, open PowerShell at the root of a clean, full Git checkout. Check out the release commit with its stable `X.Y.Z` tag, such as `2.0.1`. Use a fresh build directory alongside the checkout.
 
 ```powershell
 py -3.14 -m venv ..\deposit-python-release\venv
