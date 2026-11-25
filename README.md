@@ -1,40 +1,55 @@
 # deposit-python
 
-**deposit-python** is the synchronous Python wrapper for [deposit-server](https://github.com/demjanp/deposit-server), distributed and imported as `deposit`. It lets Python applications work with Deposit through familiar objects and methods instead of calling database procedures directly.
+**deposit-python** is the synchronous Python wrapper for **Deposit**, distributed and imported as `deposit`. It gives Python applications access to the scientific records, relationships, and attached files managed by [deposit-server](https://github.com/demjanp/deposit-server).
 
 ## Features
 
-- **Connections and sessions.** `Client` handles connections, authentication, and server feature discovery. Each `Store` provides an independently authenticated working session in one Namespace.
-- **Python data objects.** `DClass` and `DObject` expose records and relationships; `DGeometry` and `DResource` represent spatial values and attached files.
-- **Reading and editing.** Python methods retrieve records, run Deposit Query Language queries, page through large results, and group related edits into atomic transactions. Revision checks identify conflicting changes.
-- **Import and exchange.** The wrapper supports Pattern-based imports, transfers between Stores, Namespace cloning, and conversion from dictionaries or NetworkX graphs. `ExchangeBundle` handles portable packages; import plans can be inspected before applying changes.
-- **Reliable operations.** Verified streams transfer files, while operation tracking, cancellation, and structured errors help applications recover from interrupted work. `Store.call()` provides access to additional server procedures.
-
-Persistent storage, permissions, validation, and history remain the responsibility of deposit-server; the wrapper provides the Python interface to these functions.
+- **Connections and sessions.** `Client` uses a Neo4j driver to discover the server and open independently authenticated `Store` sessions. Each Store works in one Namespace.
+- **Python records and values.** `DClass` and `DObject` represent Classes and Objects. `DGeometry` and `DResource` represent spatial values and attached files.
+- **Queries and edits.** Run Deposit Query Language queries, page through large results, and group related edits into atomic batches. Revision checks identify conflicting changes.
+- **Import and exchange.** Import data using Patterns, move portable packages between Stores, clone Namespaces, and convert graphs to and from NetworkX. Inspect import plans before applying changes.
+- **Files and tracked operations.** Transfer files through verified streams, inspect operation outcomes, and request cancellation. Use `Store.call()` to access additional server procedures.
 
 ## Platform
 
-The package requires Python 3.14 and currently supports Windows x64.
+The current support target is Python 3.14 on Windows x64 with Deposit Server 2.0.1. Pip installs the Neo4j Python driver and NetworkX as dependencies.
 
 ## Getting started
 
-See [Quickstart](doc/quickstart.md) for installation and first use. Further details are in the [Technical specification](https://github.com/demjanp/deposit-hub/blob/main/deposit-python.md) and [server API manifest](https://github.com/demjanp/deposit-server/blob/main/runtime/public-api.json).
+From a full Git checkout, follow the [quickstart](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md) to install the wrapper, open a Store, and query the Deposit Server sample data. If you need a server, follow the [Deposit Server 2.0.1 checkout instructions](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/installation.md#run-from-a-git-checkout).
 
-## Operation IDs
+For a local wheel or a published 2.x package, see the [quickstart installation options](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md#install). The wrapper generates operation IDs for tracked calls. See [operation IDs](https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md#operation-ids) to choose an ID before submission and look up the outcome.
 
-Use ordinary Store methods such as `store.create_class_descriptor(specimen, "Color", "String")`
-or pass only domain arguments to `Store.call`. The wrapper generates and
-registers an ID for each tracked operation, including intermediate transfers.
+See the [Python API reference](https://github.com/demjanp/deposit-python/blob/main/doc/api.md) for wrapper behavior and the [release notes](https://github.com/demjanp/deposit-python/blob/main/RELEASE_NOTES.md) for the transition from `deposit` 1.x.
 
-To keep an identity before submission, generate a fresh UUIDv7 with
-`Client.new_operation_id()` and pass it as `operation_id=` to a supported
-tracked call. Use `store.get_operation(operation_id)` to inspect the outcome
-and `store.cancel_operation(operation_id)` to request cancellation. The
-reported state tells you whether rollback or commit is confirmed.
-See the [quickstart examples and lost-response rules](doc/quickstart.md#operation-ids).
+## Build the release wheel
 
-## Copyright and license
+On Windows x64, open PowerShell at the root of a clean, full Git checkout. Check out the release commit with its stable `vX.Y.Z` tag. Use a fresh build directory alongside the checkout.
 
-Copyright © 2026 Peter Demján.
+```powershell
+py -3.14 -m venv ..\deposit-python-release\venv
+..\deposit-python-release\venv\Scripts\python.exe -m pip install build
+..\deposit-python-release\venv\Scripts\python.exe -m build --wheel --outdir ..\deposit-python-release\dist
+```
 
-Distributed under the MIT License.
+The builder writes the wheel to the sibling build directory. The wheel version comes from the Git tag. The wheel contains the wrapper and its procedure catalog, and pip resolves the runtime dependencies during installation.
+
+## Citation
+
+Please use this citation when referencing the software.
+
+> Demján, P. (2026). *deposit-python* [Computer software]. [GitHub repository](https://github.com/demjanp/deposit-python).
+
+## Acknowledgements
+
+Funding for the server component is listed in the [Deposit Server acknowledgements](https://github.com/demjanp/deposit-server#acknowledgements).
+
+## Contact
+
+Peter Demján ([peter.demjan@gmail.com](mailto:peter.demjan@gmail.com))
+
+Institute of Archaeology of the Czech Academy of Sciences, Prague, v.v.i.
+
+## License
+
+Distributed under the [MIT License](https://opensource.org/license/mit). See the repository’s [LICENSE](https://github.com/demjanp/deposit-python/blob/main/LICENSE) file.

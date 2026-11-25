@@ -1,58 +1,79 @@
 # deposit-python — Quickstart
 
-Practical installation and usage of the `deposit` Python wrapper.
+Install the `deposit` Python wrapper, connect to Deposit Server, and query the server’s sample data.
 
 ## Install
 
-deposit-python currently targets **Python 3.14 on Windows x64**. You also need a running [deposit-server](https://github.com/demjanp/deposit-server), a Deposit user account, and access to a Namespace (collection).
-
-Install from PyPI:
+The wrapper targets **Python 3.14 on Windows x64** with **Deposit Server 2.0.1**. Use PowerShell and the Windows Python launcher. From the root of a full Git checkout, create a virtual environment and install the wrapper:
 
 ```powershell
-python -m pip install "deposit>=2,<3"
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
 ```
 
-Alternatively, install a locally built wheel with `python -m pip install <wheel-path>`.
+To install from a local wheel, create the same virtual environment and pass the path to your wheel:
 
-## Connect to Deposit Server
+```powershell
+.\.venv\Scripts\python.exe -m pip install "C:\path\to\deposit-2.0.1-py3-none-any.whl"
+```
+
+Once a 2.x wrapper release is published on PyPI, the corresponding command is:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install "deposit>=2,<3"
+```
+
+Pip installs the Neo4j Python driver and NetworkX for all three installation paths. If you use the earlier `deposit` 1.x product, keep it in a separate Python environment. [Release notes](../RELEASE_NOTES.md#moving-from-deposit-1x)
+
+## Connect and run a query
+
+If you need a server, use the [Deposit Server 2.0.1 checkout instructions](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/installation.md#run-from-a-git-checkout). Follow the server’s [quickstart through step 4](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/quickstart.md#4-load-the-sample-graph) to set up a Deposit account, create the `Deposit sample` Namespace, and load the [sample graph](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/sample-data/seed.cypher).
+
+Save this example as `read_sample.py`. Replace the Bolt address and credentials with those for your server and use the Deposit account that can access the sample Namespace.
 
 ```python
+from getpass import getpass
+
 from neo4j import GraphDatabase
+
 from deposit import Client
 
-driver = GraphDatabase.driver(
-    "bolt://127.0.0.1:7687", auth=("neo4j", "<Neo4j password>")
-)
-client = Client(driver)
-store = client.open_store(
-    "Example Namespace", username="your-user", password="<Deposit password>"
-)
+with GraphDatabase.driver(
+    "bolt://127.0.0.1:7687", auth=("neo4j", getpass("Neo4j password: "))
+) as driver, Client(driver) as client:
+    with client.open_store(
+        "Deposit sample",
+        username="deposit-admin",
+        password=getpass("Deposit password: "),
+    ) as store:
+        with store.iter_query("SELECT Specimen.Code AS code ORDER BY code") as rows:
+            for row in rows:
+                print(row["values"]["code"])
 ```
 
-The example connects to a local Server. Replace the address, credentials, and Namespace name with your own. Neo4j authentication and Deposit user authentication are separate. See the [Server user guide](https://github.com/demjanp/deposit-server/blob/main/doc/README.md) for Server setup.
+Run it with the virtual environment’s interpreter:
 
-## Read and query data
+```powershell
+.\.venv\Scripts\python.exe read_sample.py
+```
 
-Use `Store` methods to work with Classes, Objects, Descriptors, and relationships. For example, list the available Classes:
+The sample prints `S-01`, `S-02`, and `S-03`. The Neo4j credentials authenticate the Bolt connection. The Deposit credentials open the Namespace session. The context managers close the row iterator, Store, Client, and driver in that order.
+
+## Read and edit data
+
+Run the remaining examples inside an open Store. To list Classes, use the paged iterator:
 
 ```python
-for dclass in store.classes():
-    print(dclass.name)
+with store.classes() as classes:
+    for dclass in classes:
+        print(dclass.name)
 ```
 
-Deposit queries can return results in pages. Replace `Specimen` and `Code` with names from your dataset:
-
-```python
-with store.iter_query("SELECT Specimen.Code AS code") as rows:
-    for row in rows:
-        print(row)
-```
-
-Common changes are available through Store and entity methods. Use `store.transaction()` to group related edits into one atomic operation. If another user has changed the data, refresh the affected records before deciding whether to reapply your changes.
+Use `store.get_class("Specimen")` for a dictionary or `store.get_class_handle("Specimen")` for a `DClass` handle. Store and entity methods support ordinary edits. Use `store.transaction()` to collect related edits into one atomic batch. If a revision conflict occurs, refresh the affected handles and review your changes before resubmitting them. [Records, queries, and batches](api.md#records-and-queries)
 
 ## Operation IDs
 
-With editor access and an existing `Specimen` class, use the ordinary
+With editor or owner access to the sample Namespace, use the ordinary
 convenience method:
 
 ```python
@@ -96,7 +117,7 @@ cannot establish the outcome, treat it as unknown and avoid blind replay.
 Use `store.cancel_operation(operation_id)` to request cancellation and check
 the returned state for confirmed rollback or commit. The Client equivalents
 take a token and the original `scope` (Namespace UUID or `"server"`).
-Only tracked calls accept an explicit operation ID. Dry-run pruning rejects it.
+Only supported tracked calls accept an explicit operation ID. See the [Python API reference](api.md#tracked-operations) for the methods that accept it.
 
 ## Transfer files
 
@@ -119,18 +140,25 @@ with store.export_exchange() as bundle:
     bundle.save("dataset.zip")
 ```
 
-Import an existing package into a receiving Store. Analysis creates a plan; **the data is not changed until that plan is applied**:
+Import an existing package into a receiving Store. Analysis creates a plan and applying it writes to the receiving Namespace. Review the analysis before choosing to apply it:
 
 ```python
 with store.import_exchange("source.zip") as analysis:
-    if analysis.plan_id:
-        with store.import_apply(analysis.plan_id) as result:
-            print(result.state)
+    plan_id = analysis.plan_id
+    print(analysis.state, plan_id)
+```
+
+After reviewing the analysis and deciding to proceed, apply the plan:
+
+```python
+if plan_id:
+    with store.import_apply(plan_id) as result:
+        print(result.state)
 ```
 
 An explicit import analysis ID identifies only analysis. Applying its plan is a separate tracked call with its own ID. Intermediate transfers also have separate IDs.
 
-The wrapper also supports imports from rows, dictionaries, subtrees, and NetworkX graphs. Use `store.import_inspect(plan_id)` to review an import plan or `store.discard_import_plan(plan_id)` to discard it. A full export that includes retained history may require Namespace owner permissions.
+The wrapper also supports imports from rows, dictionaries, subtrees, and NetworkX graphs. Use `store.import_inspect(plan_id)` in a context manager to review an import plan or `store.discard_import_plan(plan_id)` to discard it. A whole-Namespace export that includes retained history requires Namespace owner permissions.
 
 ## Use NetworkX
 
@@ -139,16 +167,6 @@ graph = store.to_networkx()  # directed multigraph
 print(graph.number_of_nodes())
 ```
 
-After editing a compatible NetworkX graph, use `store.from_networkx(graph)` to analyze an import and `store.import_apply(plan_id)` to apply it. The Server determines how imported records match existing records.
+Start with a graph returned by `store.to_networkx()` and preserve its Deposit metadata and entity identities when editing. Use `store.from_networkx(graph)` in a context manager to analyze an import, then apply the plan if you want to write the changes. The server determines how imported records match existing records. [NetworkX graph format](api.md#networkx)
 
-## Finish
-
-Close connections and readers when finished:
-
-```python
-store.close()
-client.close()
-driver.close()
-```
-
-For less common operations, including history functions and CSV/XLSX/GeoPackage import/export, use `store.call(...)` with the [Server procedure reference](https://github.com/demjanp/deposit-server/blob/main/runtime/public-api.json).
+For additional Store procedures, including history and tabular exchange, see [calling server procedures](api.md#calling-server-procedures) and the [Deposit Server 2.0.1 procedure reference](https://github.com/demjanp/deposit-server/blob/2.0.1/doc/procedures.md).

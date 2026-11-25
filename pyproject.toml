@@ -27,6 +27,9 @@ test = ["pytest>=8.3,<9", "build>=1.2,<2"]
 
 [project.urls]
 homepage = "https://github.com/demjanp/deposit-python"
+Documentation = "https://github.com/demjanp/deposit-python/blob/main/doc/quickstart.md"
+Issues = "https://github.com/demjanp/deposit-python/issues"
+Changelog = "https://github.com/demjanp/deposit-python/releases"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/contract", "tests/integration"]

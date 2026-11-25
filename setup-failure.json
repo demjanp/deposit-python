@@ -1,8 +1,0 @@
-{
-  "phase": "prepare-preflight",
-  "exit": 1,
-  "error": "FileNotFoundError: expected runner source under test_harness/deposit-python, but copied runner source is in fresh attempt directory",
-  "ownerLaunched": false,
-  "port7689Started": false,
-  "productOperationAttempted": false
-}
