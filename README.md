@@ -43,7 +43,7 @@ Please use this citation when referencing the software.
 
 ## Acknowledgements
 
-Funding for the server component is listed in the [Deposit Server acknowledgements](https://github.com/demjanp/deposit-server#acknowledgements).
+Development of this software was supported by OP RDE, MEYS, under the project "Ready for the Future: Understanding the Long-Term Resilience of Human Culture (RES-HUM)", Reg. No. CZ.02.01.01/00/22_008/0004593.
 
 ## Contact
 
